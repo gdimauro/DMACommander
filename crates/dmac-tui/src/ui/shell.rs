@@ -50,7 +50,7 @@ pub fn draw(frame: &mut Frame, area: Rect, shell: &Hosted, focused: bool, theme:
                 // ones; `contents()` gives the grapheme for the cell and an
                 // empty string for the continuation column of a wide character.
                 let text = cell.contents();
-                target.set_symbol(if text.is_empty() { " " } else { text.as_str() });
+                target.set_symbol(if text.is_empty() { " " } else { text });
                 target.set_style(style_of(cell));
             }
         }
