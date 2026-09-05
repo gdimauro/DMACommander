@@ -43,6 +43,10 @@ enum Update {
         panel: PanelId,
         message: String,
     },
+    /// A hosted shell changed what is on its screen. Carries nothing: the
+    /// message exists only to break the event loop out of its wait, and the
+    /// frame that follows reads the emulator directly.
+    ShellOutput,
 }
 
 /// Everything the application needs to start.
@@ -176,8 +180,18 @@ pub struct App {
     /// already gone, and contributes no timer either way.
     splash_until: Option<std::time::Instant>,
     should_quit: bool,
+    /// When the hosted shell was last painted, so a program flooding stdout is
+    /// throttled to a sane frame rate instead of redrawing as fast as the
+    /// reader thread can parse.
+    last_shell_frame: std::time::Instant,
     tx: mpsc::UnboundedSender<Update>,
 }
+
+/// The shortest gap between two frames of a hosted shell.
+///
+/// It bounds a flood, never a first response: the frame that answers a wake-up
+/// is drawn immediately, and this only decides when the *next* one may follow.
+const SHELL_FRAME_FLOOR: std::time::Duration = std::time::Duration::from_millis(16);
 
 impl App {
     /// Private: `Update` is an internal message type, so the only supported
@@ -218,6 +232,7 @@ impl App {
             splash_until: splash
                 .then(|| std::time::Instant::now() + std::time::Duration::from_millis(1800)),
             should_quit: false,
+            last_shell_frame: std::time::Instant::now(),
             tx,
         }
     }
@@ -400,6 +415,9 @@ impl App {
                     p.resort();
                 }
             }
+            // Nothing to apply: arriving here already cost the redraw that the
+            // hosted program was asking for.
+            Update::ShellOutput => {}
             Update::Error {
                 session,
                 panel,
@@ -794,6 +812,54 @@ impl App {
         }
     }
 
+    /// A callback a hosted shell can use to ask for a repaint.
+    ///
+    /// This is the whole reason a hosted program is live rather than a picture
+    /// that updates when you type: without it `ping`, `tail -f` or a running
+    /// build produce output that nothing is waiting for.
+    fn waker(&self) -> Option<dmac_pty::Waker> {
+        let tx = self.tx.clone();
+        Some(Arc::new(move || {
+            let _ = tx.send(Update::ShellOutput);
+        }))
+    }
+
+    /// Bookkeeping immediately before a frame is drawn.
+    ///
+    /// The flag is cleared *before* the screen is read, never after. Clearing it
+    /// afterwards loses whatever the child printed while the frame was being
+    /// composed: that output is already marked as shown but was never on it, and
+    /// since the reader only wakes on the clean-to-dirty edge, nothing would ask
+    /// again. The last line of a finished build would sit there invisible.
+    /// Clearing first can only cost one redundant frame, which is the cheap
+    /// direction to be wrong in.
+    ///
+    /// It is also the throttle: while the flag stays set the reader thread stays
+    /// quiet, because a repaint has been asked for and not yet given.
+    pub(crate) fn before_frame(&mut self) {
+        if self.ses().view != View::Shell || self.last_shell_frame.elapsed() < SHELL_FRAME_FLOOR {
+            return;
+        }
+        self.last_shell_frame = std::time::Instant::now();
+        if let Some(s) = self.ses().hosted() {
+            s.mark_drawn();
+        }
+    }
+
+    /// When the hosted shell is owed a frame it has not been given yet.
+    ///
+    /// Only ever set while output is outstanding, so an idle shell costs no
+    /// timer — the pane sits there for free until the child says something.
+    fn shell_deadline(&self) -> Option<std::time::Instant> {
+        if self.ses().view != View::Shell {
+            return None;
+        }
+        self.ses()
+            .hosted()
+            .is_some_and(|s| s.dirty())
+            .then(|| self.last_shell_frame + SHELL_FRAME_FLOOR)
+    }
+
     /// Show the shell, or go back to the panels.
     fn toggle_shell(&mut self) {
         if self.ses().view == View::Shell {
@@ -802,7 +868,8 @@ impl App {
             return;
         }
         let (cols, rows) = self.shell_size();
-        match self.ses_mut().shell(cols, rows) {
+        let waker = self.waker();
+        match self.ses_mut().shell(cols, rows, waker) {
             Ok(_) => {
                 self.ses_mut().view = View::Shell;
                 self.status.clear();
@@ -824,7 +891,8 @@ impl App {
         }
 
         let (cols, rows) = self.shell_size();
-        match self.ses_mut().shell(cols, rows) {
+        let waker = self.waker();
+        match self.ses_mut().shell(cols, rows, waker) {
             Ok(shell) => match shell.run(&line) {
                 Ok(()) => {
                     self.ses_mut().command_line.clear();
@@ -1103,7 +1171,8 @@ impl App {
             return;
         };
         let (cols, rows) = self.shell_size();
-        match self.ses_mut().shell(cols, rows) {
+        let waker = self.waker();
+        match self.ses_mut().shell(cols, rows, waker) {
             Ok(shell) => {
                 if let Err(e) = shell.write(&bytes) {
                     // The shell exited under us. Say so and go back to the
@@ -1564,6 +1633,7 @@ pub async fn run(mut start: Startup) -> anyhow::Result<()> {
     });
 
     loop {
+        app.before_frame();
         guard.terminal().draw(|f| ui::draw(f, &mut app))?;
 
         // Re-assert the cursor shape, but only on frames that actually show a
@@ -1587,6 +1657,7 @@ pub async fn run(mut start: Startup) -> anyhow::Result<()> {
             app.splash_until,
             app.screensaver.deadline(),
             app.cursor_deadline(),
+            app.shell_deadline(),
             save_due,
         ]
         .into_iter()

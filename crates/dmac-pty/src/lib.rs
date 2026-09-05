@@ -35,6 +35,15 @@ pub enum PtyError {
 
 pub type Result<T> = std::result::Result<T, PtyError>;
 
+/// Called from the reader thread when the hosted screen has changed.
+///
+/// A hosted program speaks whenever it likes, and nothing else in the
+/// application is listening: without this the pane only repainted when the user
+/// happened to press a key, so `ping`, a build, or anything with a delay sat
+/// invisible until it was nudged. The waker is how the child gets to say
+/// "there is something new to look at".
+pub type Waker = Arc<dyn Fn() + Send + Sync>;
+
 /// A rectangle of terminal cells produced by a hosted program, as understood by
 /// a real terminal emulator.
 ///
@@ -55,6 +64,11 @@ pub struct Hosted {
     parser: Arc<Mutex<vt100::Parser>>,
     /// Set by the reader thread when the process closes its end.
     finished: Arc<AtomicBool>,
+    /// Set by the reader thread when the screen has changed and cleared by the
+    /// renderer once it has drawn it. Not a queue: an arbitrary amount of
+    /// output collapses into one "needs repainting", which is what keeps a
+    /// program flooding stdout from driving one frame per buffer.
+    dirty: Arc<AtomicBool>,
     cols: u16,
     rows: u16,
     program: String,
@@ -62,6 +76,10 @@ pub struct Hosted {
 
 impl Hosted {
     /// Spawn `program` on a PTY of the given size, in `cwd`.
+    ///
+    /// `waker` is called whenever the child changes the screen. Passing `None`
+    /// gives a shell whose output is still parsed correctly but which nothing
+    /// will repaint on its own — only tests want that.
     pub fn spawn(
         program: &str,
         args: &[String],
@@ -69,6 +87,7 @@ impl Hosted {
         cols: u16,
         rows: u16,
         scrollback: usize,
+        waker: Option<Waker>,
     ) -> Result<Self> {
         let (cols, rows) = (cols.max(2), rows.max(2));
 
@@ -115,10 +134,12 @@ impl Hosted {
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, scrollback)));
         let finished = Arc::new(AtomicBool::new(false));
+        let dirty = Arc::new(AtomicBool::new(false));
 
         {
             let parser = Arc::clone(&parser);
             let finished = Arc::clone(&finished);
+            let dirty = Arc::clone(&dirty);
             std::thread::spawn(move || {
                 let mut buf = [0u8; 8192];
                 loop {
@@ -131,10 +152,25 @@ impl Hosted {
                             if let Ok(mut p) = parser.lock() {
                                 p.process(&buf[..n]);
                             }
+                            // Wake only on the clean-to-dirty edge. While a
+                            // repaint is still owed, further output changes
+                            // nothing that has not already been asked for, so
+                            // `yes` costs the UI exactly as much as `echo`.
+                            if !dirty.swap(true, Ordering::AcqRel)
+                                && let Some(w) = &waker
+                            {
+                                w();
+                            }
                         }
                     }
                 }
                 finished.store(true, Ordering::Relaxed);
+                // Exiting is itself a visible change — the title gains
+                // "(exited)" — so it needs a repaint like any other.
+                dirty.store(true, Ordering::Release);
+                if let Some(w) = &waker {
+                    w();
+                }
             });
         }
 
@@ -144,6 +180,7 @@ impl Hosted {
             child,
             parser,
             finished,
+            dirty,
             cols,
             rows,
             program: program.to_string(),
@@ -151,7 +188,7 @@ impl Hosted {
     }
 
     /// Spawn the user's login shell, interactively.
-    pub fn shell(cwd: Option<&Path>, cols: u16, rows: u16) -> Result<Self> {
+    pub fn shell(cwd: Option<&Path>, cols: u16, rows: u16, waker: Option<Waker>) -> Result<Self> {
         let shell = default_shell();
         // `-i` so rc files load and the prompt appears: a shell without them is
         // not the shell the user configured, and they notice immediately.
@@ -160,7 +197,7 @@ impl Hosted {
         } else {
             vec!["-i".to_string()]
         };
-        Self::spawn(&shell, &args, cwd, cols, rows, 2000)
+        Self::spawn(&shell, &args, cwd, cols, rows, 2000, waker)
     }
 
     pub fn program(&self) -> &str {
@@ -182,6 +219,20 @@ impl Hosted {
 
     pub fn size(&self) -> (u16, u16) {
         (self.cols, self.rows)
+    }
+
+    /// Whether the screen has changed since the last `mark_drawn`.
+    pub fn dirty(&self) -> bool {
+        self.dirty.load(Ordering::Acquire)
+    }
+
+    /// Say the current screen has been drawn, which re-arms the waker.
+    ///
+    /// Deliberately the renderer's job and not the reader's: leaving the flag
+    /// set is how a caller throttles itself, because the reader stays silent
+    /// for as long as a repaint is already owed.
+    pub fn mark_drawn(&self) {
+        self.dirty.store(false, Ordering::Release);
     }
 
     /// Tell the child the window changed size.
@@ -297,6 +348,7 @@ mod tests {
             40,
             10,
             100,
+            None,
         )
         .expect("spawn");
         let text = wait_for(&h, 3.0, |t| t.contains("hello-from-pty"));
@@ -307,7 +359,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn input_reaches_the_child_and_its_reply_comes_back() {
-        let mut h = Hosted::spawn("/bin/sh", &[], None, 60, 12, 100).expect("spawn");
+        let mut h = Hosted::spawn("/bin/sh", &[], None, 60, 12, 100, None).expect("spawn");
         h.run("echo round-trip-ok").expect("write");
         let text = wait_for(&h, 3.0, |t| t.contains("round-trip-ok"));
         assert!(text.contains("round-trip-ok"), "got: {text:?}");
@@ -328,7 +380,7 @@ mod tests {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "tmp".into());
 
-        let mut h = Hosted::spawn("/bin/sh", &[], Some(&dir), 200, 10, 100).expect("spawn");
+        let mut h = Hosted::spawn("/bin/sh", &[], Some(&dir), 200, 10, 100, None).expect("spawn");
         h.run("pwd").expect("write");
         let text = wait_for(&h, 3.0, |t| t.contains(&leaf));
         assert!(text.contains(&leaf), "expected {leaf:?} in: {text:?}");
@@ -340,8 +392,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_exiting_child_is_noticed() {
-        let h = Hosted::spawn("/bin/sh", &["-c".into(), "true".into()], None, 20, 5, 10)
-            .expect("spawn");
+        let h = Hosted::spawn(
+            "/bin/sh",
+            &["-c".into(), "true".into()],
+            None,
+            20,
+            5,
+            10,
+            None,
+        )
+        .expect("spawn");
         let deadline = Instant::now() + Duration::from_secs(3);
         while !h.finished() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
@@ -352,8 +412,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn writing_to_a_dead_child_reports_it_rather_than_hanging() {
-        let mut h = Hosted::spawn("/bin/sh", &["-c".into(), "true".into()], None, 20, 5, 10)
-            .expect("spawn");
+        let mut h = Hosted::spawn(
+            "/bin/sh",
+            &["-c".into(), "true".into()],
+            None,
+            20,
+            5,
+            10,
+            None,
+        )
+        .expect("spawn");
         let deadline = Instant::now() + Duration::from_secs(3);
         while !h.finished() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
@@ -364,7 +432,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn resizing_is_reflected_in_the_emulated_screen() {
-        let mut h = Hosted::spawn("/bin/sh", &[], None, 40, 10, 100).expect("spawn");
+        let mut h = Hosted::spawn("/bin/sh", &[], None, 40, 10, 100, None).expect("spawn");
         h.resize(100, 30).expect("resize");
         let (cols, rows) = h.size();
         assert_eq!((cols, rows), (100, 30));
@@ -375,17 +443,140 @@ mod tests {
 
     #[test]
     fn spawning_something_that_does_not_exist_is_an_error_not_a_panic() {
-        let r = Hosted::spawn("definitely-not-a-real-program-xyz", &[], None, 20, 5, 10);
+        let r = Hosted::spawn(
+            "definitely-not-a-real-program-xyz",
+            &[],
+            None,
+            20,
+            5,
+            10,
+            None,
+        );
         assert!(r.is_err());
     }
 
     #[test]
     fn a_degenerate_size_is_clamped_rather_than_rejected() {
         // A terminal really does report 0 columns mid-resize.
-        let h = Hosted::spawn(&default_shell(), &[], None, 0, 0, 10);
+        let h = Hosted::spawn(&default_shell(), &[], None, 0, 0, 10, None);
         if let Ok(mut h) = h {
             assert_eq!(h.size(), (2, 2));
             h.kill();
         }
+    }
+
+    /// The bug this whole mechanism exists for: output that arrives while
+    /// nobody is typing has to announce itself, or the pane silently freezes
+    /// until the user presses a key.
+    #[cfg(unix)]
+    #[test]
+    fn output_wakes_the_caller_without_any_input() {
+        let woken = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&woken);
+        let h = Hosted::spawn(
+            "/bin/sh",
+            &["-c".into(), "sleep 0.2; echo late".into()],
+            None,
+            40,
+            10,
+            100,
+            Some(Arc::new(move || flag.store(true, Ordering::Relaxed))),
+        )
+        .expect("spawn");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !woken.load(Ordering::Relaxed) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            woken.load(Ordering::Relaxed),
+            "the child produced output and nothing was told about it"
+        );
+        assert!(h.dirty(), "the screen changed but was not marked dirty");
+    }
+
+    /// A program flooding stdout must not queue one wake-up per buffer: while a
+    /// repaint is still owed there is nothing new to ask for.
+    #[cfg(unix)]
+    #[test]
+    fn a_flood_of_output_does_not_produce_a_flood_of_wake_ups() {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = Arc::clone(&count);
+        let h = Hosted::spawn(
+            "/bin/sh",
+            &["-c".into(), "i=0; while [ $i -lt 4000 ]; do echo flooding-the-terminal-with-output; i=$((i+1)); done".into()],
+            None,
+            80,
+            24,
+            100,
+            Some(Arc::new(move || {
+                c.fetch_add(1, Ordering::Relaxed);
+            })),
+        )
+        .expect("spawn");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !h.finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // One for the first buffer, one for the exit. Never one per buffer:
+        // the child writes hundreds of them and we never drew in between.
+        let n = count.load(Ordering::Relaxed);
+        assert!(n <= 2, "expected the flood to coalesce, got {n} wake-ups");
+    }
+
+    /// After drawing, the next output has to wake us again — otherwise the
+    /// throttle turns into a permanent freeze.
+    #[cfg(unix)]
+    #[test]
+    fn marking_drawn_re_arms_the_waker() {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = Arc::clone(&count);
+        let mut h = Hosted::spawn(
+            "/bin/sh",
+            &[],
+            None,
+            60,
+            12,
+            100,
+            Some(Arc::new(move || {
+                c.fetch_add(1, Ordering::Relaxed);
+            })),
+        )
+        .expect("spawn");
+
+        wait_for(&h, 3.0, |_| h.dirty());
+        h.mark_drawn();
+        let before = count.load(Ordering::Relaxed);
+
+        h.run("echo second-round").expect("write");
+        let text = wait_for(&h, 3.0, |t| t.contains("second-round"));
+        assert!(text.contains("second-round"), "got: {text:?}");
+        assert!(
+            count.load(Ordering::Relaxed) > before,
+            "output after a repaint never woke anyone"
+        );
+        h.kill();
+    }
+
+    /// The child going away is a visible change too: the pane's title says so.
+    #[cfg(unix)]
+    #[test]
+    fn an_exit_asks_for_a_repaint() {
+        let h = Hosted::spawn(
+            "/bin/sh",
+            &["-c".into(), "true".into()],
+            None,
+            20,
+            5,
+            10,
+            None,
+        )
+        .expect("spawn");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !h.finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(h.dirty(), "an exited child left nothing to redraw");
     }
 }

@@ -9,7 +9,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-cargo build --release --quiet
+cargo build --release -F gpu  # --quiet
 
 # exec, so the process replaces this script: Ctrl-C and the exit status behave
 # exactly as if you had run the binary yourself, and there is no stray shell

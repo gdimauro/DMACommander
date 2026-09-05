@@ -147,7 +147,17 @@ impl Session {
     /// Errors are returned rather than swallowed: a shell that failed to start
     /// must say so, because the alternative is a blank pane the user cannot
     /// explain.
-    pub fn shell(&mut self, cols: u16, rows: u16) -> dmac_pty::Result<&mut Hosted> {
+    /// The session's shell, started on first use.
+    ///
+    /// `waker` is handed to a shell that is being created, so its output can
+    /// ask to be repainted. A caller that does not pass one gets a pane that
+    /// only updates when something else happens to redraw it.
+    pub fn shell(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        waker: Option<dmac_pty::Waker>,
+    ) -> dmac_pty::Result<&mut Hosted> {
         // A shell whose process has gone is replaced, not reused: typing into a
         // dead shell forever is worse than starting a new one.
         if self.shell.as_ref().is_some_and(|s| s.finished()) {
@@ -156,7 +166,7 @@ impl Session {
         if self.shell.is_none() {
             let cwd = self.cwd[Self::index_of(self.active)].clone();
             let dir = cwd.is_local().then(|| cwd.as_path().to_path_buf());
-            self.shell = Some(Hosted::shell(dir.as_deref(), cols, rows)?);
+            self.shell = Some(Hosted::shell(dir.as_deref(), cols, rows, waker)?);
         }
         match self.shell.as_mut() {
             Some(s) => {
@@ -168,6 +178,11 @@ impl Session {
     }
 
     /// Whether a shell has been started and is still alive.
+    /// The session's shell if it has one, without starting one.
+    pub fn hosted(&self) -> Option<&Hosted> {
+        self.shell.as_ref()
+    }
+
     pub fn shell_running(&self) -> bool {
         self.shell.as_ref().is_some_and(|s| !s.finished())
     }
