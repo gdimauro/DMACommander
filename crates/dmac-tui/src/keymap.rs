@@ -59,6 +59,21 @@ pub fn resolve(key: KeyEvent, focus: Focus) -> Option<Action> {
         (KeyCode::Home, false, false) => Action::GoTop,
         (KeyCode::End, false, false) => Action::GoBottom,
 
+        // --- Sessions ---
+        (BackTab, _, _) => Action::ToggleRail,
+        (Tab, _, _) if shift => Action::ToggleRail,
+        // Alt+1..9. Digits, not F-keys: they are the numbers shown in the rail.
+        (Char(c @ '1'..='9'), false, true) => {
+            Action::SwitchSession(c.to_digit(10).unwrap_or(1) as usize - 1)
+        }
+        (Char('n'), true, false) => Action::NewSession,
+        // Ctrl-W closes a session, not Ctrl-X: Ctrl-X is `cut`, and a key that
+        // sometimes cuts a file and sometimes closes a workspace will eventually
+        // close the wrong thing. See docs/PLAN.md, M4.
+        (Char('w'), true, false) => Action::CloseSession,
+        (PageUp, true, false) => Action::CycleSession(-1),
+        (PageDown, true, false) => Action::CycleSession(1),
+
         // --- Focus. Tab cycles all three stops; Esc jumps between the current
         //     panel and the command line, ignoring the other panel. ---
         (Tab, _, _) => Action::FocusNext,

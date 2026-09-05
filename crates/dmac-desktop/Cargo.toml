@@ -1,0 +1,14 @@
+[package]
+name         = "dmac-desktop"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description  = "Launching, finding and raising external GUI windows, bound to sessions."
+
+[lints]
+workspace = true
+
+[dependencies]

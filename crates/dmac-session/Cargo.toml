@@ -12,3 +12,6 @@ description  = "Named sessions: persistent workspaces and reattachable agent ses
 workspace = true
 
 [dependencies]
+dmac-core = { version = "0.1.0", path = "../dmac-core" }
+dmac-vfs = { version = "0.1.0", path = "../dmac-vfs" }
+thiserror = "2.0.20"

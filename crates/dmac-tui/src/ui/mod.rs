@@ -6,6 +6,7 @@ mod fkeybar;
 pub(crate) mod menu;
 mod panel;
 pub(crate) mod picker;
+pub(crate) mod rail;
 mod screen;
 mod splash;
 
@@ -41,26 +42,39 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ])
         .split(area);
 
-    // Split the borrow: the panels are drawn mutably (they record their viewport
-    // height) while the theme is read. Destructuring is what keeps both legal.
+    // The rail pushes the panels rather than covering them, so both stay
+    // readable and a file can eventually be dragged from a panel onto a session.
+    let rail_open = app.rail_open;
+    let rail_w = rail::width(rail_open, rows[0].width);
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(rail_w), Constraint::Min(0)])
+        .split(rows[0]);
+
+    // The rail reads *every* session, so it is drawn first, from a shared
+    // borrow — before the current session is borrowed mutably below.
+    app.layout.rail = rail::draw(frame, body[0], &app.sessions, rail_open, &app.theme);
+
+    // Split the borrow: the current session's panels are drawn mutably (they
+    // record their viewport height) while the theme is read.
     let App {
-        panels,
-        active,
+        sessions,
         theme,
-        panels_hidden,
         layout,
-        focus,
         ..
     } = app;
+    let session = sessions.current_mut();
+    let (active, focus, panels_hidden) = (session.active, session.focus, session.panels_hidden);
+    let panels = &mut session.panels;
 
     layout.fkeys = rows[2];
     layout.command = rows[1];
 
-    if !*panels_hidden {
+    if !panels_hidden {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(rows[0]);
+            .split(body[1]);
 
         for (i, id) in [dmac_core::PanelId::Left, dmac_core::PanelId::Right]
             .into_iter()
@@ -69,13 +83,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             // Record the *interior* rect so a click maps straight to a row with
             // no border arithmetic at the call site.
             layout.panels[i] = inner(cols[i]);
-            let is_active = *active == id;
+            let is_active = active == id;
             panel::draw(
                 frame,
                 cols[i],
                 &mut panels[i],
                 is_active,
-                is_active && *focus == crate::app::Focus::Panel,
+                is_active && focus == crate::app::Focus::Panel,
                 theme,
             );
         }
@@ -120,9 +134,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 /// always means "text goes here", with no exceptions to remember.
 fn draw_command_line(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     let theme = &app.theme;
-    let focused = app.focus == crate::app::Focus::CommandLine;
+    let focused = app.ses().focus == crate::app::Focus::CommandLine;
 
-    let prompt = format!("{}> ", short_path(&app.cwd_display(app.active)));
+    let prompt = format!("{}> ", short_path(&app.cwd_display(app.ses().active)));
     let mut spans = vec![
         Span::styled(
             prompt.clone(),
@@ -136,7 +150,7 @@ fn draw_command_line(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
                 Style::default().fg(theme.status_fg)
             },
         ),
-        Span::raw(app.command_line.as_str()),
+        Span::raw(app.ses().command_line.as_str()),
     ];
 
     if !app.status.is_empty() {
@@ -152,9 +166,22 @@ fn draw_command_line(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
     if focused {
         // Width in columns, not bytes: a multi-byte or wide character typed into
         // the command line must not push the cursor off its own text.
-        let col = prompt.width() + app.command_line.width();
-        let x = area.x.saturating_add(col.min(u16::MAX as usize) as u16);
-        frame.set_cursor_position((x.min(area.x + area.width.saturating_sub(1)), area.y));
+        let col = prompt.width() + app.ses().command_line.width();
+        let x = area
+            .x
+            .saturating_add(col.min(u16::MAX as usize) as u16)
+            .min(area.x + area.width.saturating_sub(1));
+
+        if app.cursor_style.is_software() {
+            // Drawn as an inverted cell rather than asked of the terminal. Works
+            // everywhere, including terminals that ignore DECSCUSR or override
+            // it with their own cursor preference.
+            if app.software_cursor_on() {
+                frame.buffer_mut()[(x, area.y)].set_style(theme.cursor());
+            }
+        } else {
+            frame.set_cursor_position((x, area.y));
+        }
     }
 }
 

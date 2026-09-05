@@ -56,6 +56,12 @@ struct Cli {
     #[arg(long)]
     no_splash: bool,
 
+    /// Text cursor on the command line. Use `software` when your terminal
+    /// ignores the cursor shape the application asks for — DMACommander then
+    /// draws and blinks the cursor itself, which works everywhere.
+    #[arg(long, value_name = "STYLE", default_value = "blinking-block")]
+    cursor: String,
+
     /// Print the full build identity and exit. The first thing to paste into a
     /// bug report.
     #[arg(long)]
@@ -64,6 +70,14 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    let Some(cursor) = dmac_tui::terminal::CursorStyle::parse(&cli.cursor) else {
+        anyhow::bail!(
+            "unknown cursor style {:?}; available: {}",
+            cli.cursor,
+            dmac_tui::terminal::CursorStyle::NAMES.join(", ")
+        );
+    };
 
     if cli.build_info {
         print!("{}", dmac_config::build_info::long());
@@ -127,13 +141,21 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
 
+    // Several sessions can be live at once; this names the first one. Persisting
+    // them across runs is still to come, so a named session that does not exist
+    // yet is simply created rather than restored.
+    let session_name = session.unwrap_or_else(|| "main".to_string());
+
     runtime.block_on(async move {
-        if let Some(name) = &session {
-            // Sessions are not persisted yet; say so rather than pretending the
-            // flag worked and silently losing the user's workspace.
-            eprintln!("session {name:?} requested — persistence is not implemented yet");
-        }
-        dmac_tui::run(left, right, screensaver, !cli.no_splash).await
+        dmac_tui::run(
+            session_name,
+            left,
+            right,
+            screensaver,
+            !cli.no_splash,
+            cursor,
+        )
+        .await
     })
 }
 

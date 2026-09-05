@@ -124,6 +124,8 @@ clipboard, so a file copied here pastes into Finder or Explorer, and vice versa.
 | **Per-session view mode**: a session shows either its hosted process fullscreen, or the commander panels for navigating and copying | `tui-engineer` |
 | **Cross-session clipboard**, files included: copy in one session, paste in another | `fileops-engineer` + `session-engineer` |
 | **`dmac-pty`**: spawn a child in a PTY (`portable-pty`, ConPTY on Windows), emulate with `vt100`, render the grid | `tui-engineer` |
+| **`dmac-desktop`**: launch, enumerate and *raise* external GUI windows; bind them to sessions (ADR 0003) | `tui-engineer` |
+| **Per-window Alt-Tab that macOS does not have**: pick a session, its VS Code window comes forward | `session-engineer` + `ux-keeper` |
 | **Host anything from inside**: a shell, `claude`, `plank`, an editor — launched from the panel or the command line | `tui-engineer` |
 | **Foreground toggle**: one key brings the commander forward over a running hosted process, and back again | `tui-engineer` + `ux-keeper` |
 | **Contextual F10**: returns to the hosted session when there is one to return to; quits when there is not. The F-key bar says which | `ux-keeper` |
@@ -354,10 +356,14 @@ The next action is **M1, starting with `dmac-config`** — every other item is
 waiting on it to stop hardcoding paths and keys. In parallel, **Track R sets up
 CI**, because the cost of adding Windows later grows every week.
 
-Two things settled along the way, both recorded as ADRs: the core owns the state
+Three things settled along the way, all recorded as ADRs: the core owns the state
 and every UI is a renderer (ADR 0001), and hosting happens through a PTY rather
 than by embedding other programs' windows (ADR 0002) — window reparenting is
-unavailable on macOS and on Wayland, so it was never a cross-platform option.
+unavailable on macOS and on Wayland, so it was never a cross-platform option —
+and external GUI applications are driven by *switching* their windows rather
+than embedding them (ADR 0003), which is available on macOS, Windows and X11 and
+is what actually delivers "many VS Code windows, switchable from the session
+list".
 
 One caveat worth stating plainly: M2's hosting work is the most technically
 uncertain thing in this plan. Terminal emulation is a deep well — a child program

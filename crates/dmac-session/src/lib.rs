@@ -1,7 +1,392 @@
-//! Named sessions: persistent workspaces and reattachable agent sessions.
+//! Named sessions: several live workspaces at once.
 //!
-//! Owned by the `dmac-session` agent (see `.claude/agents/`).
-
+//! Owned by the `session-engineer` agent.
+//!
+//! A session is not "which directories were open" — it is *what you were doing*.
+//! It owns its panels, its focus, its command line, and (later) the processes it
+//! hosts and the external windows it launched.
+//!
+//! The important property is that sessions are **live, not swapped**. Switching
+//! does not save one and load another; every session stays in memory with its
+//! listings intact, so switching is instant and nothing reloads. That is what
+//! makes the session rail usable as a window switcher.
 // Tests assert; `unwrap`/`expect` there are how a failure is reported.
 // In non-test code the workspace lints still forbid them.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
+use dmac_core::{Panel, PanelId};
+use dmac_vfs::VfsPath;
+
+/// Where the keyboard is within a session. Two places, never ambiguous.
+///
+/// Session state rather than application state: each session remembers whether
+/// you were typing a command or moving around, and switching back restores it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Panel,
+    CommandLine,
+}
+
+/// Stable within a run. Not persisted — the on-disk identity is the name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SessionId(pub u64);
+
+/// The colour dot in the rail. Assigned on creation and cycled, so two adjacent
+/// sessions are never the same colour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionColor {
+    Cyan,
+    Green,
+    Yellow,
+    Magenta,
+    Blue,
+    Red,
+}
+
+impl SessionColor {
+    const ALL: [SessionColor; 6] = [
+        SessionColor::Cyan,
+        SessionColor::Green,
+        SessionColor::Yellow,
+        SessionColor::Magenta,
+        SessionColor::Blue,
+        SessionColor::Red,
+    ];
+
+    fn nth(i: usize) -> Self {
+        Self::ALL[i % Self::ALL.len()]
+    }
+}
+
+/// One live workspace.
+pub struct Session {
+    pub id: SessionId,
+    pub name: String,
+    pub color: SessionColor,
+    pub panels: [Panel; 2],
+    pub cwd: [VfsPath; 2],
+    /// Bumped on every navigation so results from an abandoned listing are
+    /// dropped instead of painted into the wrong directory.
+    pub generation: [u64; 2],
+    pub active: PanelId,
+    pub focus: Focus,
+    pub command_line: String,
+    pub panels_hidden: bool,
+    pub last_used: std::time::Instant,
+}
+
+impl Session {
+    pub fn new(id: SessionId, name: impl Into<String>, left: VfsPath, right: VfsPath) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            color: SessionColor::nth(id.0 as usize),
+            panels: [Panel::new(left.display()), Panel::new(right.display())],
+            cwd: [left, right],
+            generation: [0, 0],
+            active: PanelId::Left,
+            focus: Focus::Panel,
+            command_line: String::new(),
+            panels_hidden: false,
+            last_used: std::time::Instant::now(),
+        }
+    }
+
+    pub fn index_of(id: PanelId) -> usize {
+        match id {
+            PanelId::Left => 0,
+            PanelId::Right => 1,
+        }
+    }
+
+    pub fn panel(&self, id: PanelId) -> &Panel {
+        &self.panels[Self::index_of(id)]
+    }
+
+    pub fn panel_mut(&mut self, id: PanelId) -> &mut Panel {
+        &mut self.panels[Self::index_of(id)]
+    }
+
+    pub fn active_panel(&self) -> &Panel {
+        self.panel(self.active)
+    }
+
+    pub fn active_panel_mut(&mut self) -> &mut Panel {
+        let id = self.active;
+        self.panel_mut(id)
+    }
+
+    pub fn active_cwd(&self) -> &VfsPath {
+        &self.cwd[Self::index_of(self.active)]
+    }
+
+    /// One line for the rail: what this session is looking at.
+    pub fn subtitle(&self) -> String {
+        abbreviate_home(&self.cwd[Self::index_of(self.active)].display())
+    }
+}
+
+/// Every live session, and which one is on screen.
+///
+/// There is always at least one: closing the last session is refused rather
+/// than leaving the application with nothing to render.
+pub struct SessionManager {
+    sessions: Vec<Session>,
+    current: usize,
+    next_id: u64,
+}
+
+impl SessionManager {
+    pub fn new(name: impl Into<String>, left: VfsPath, right: VfsPath) -> Self {
+        let first = Session::new(SessionId(0), name, left, right);
+        Self {
+            sessions: vec![first],
+            current: 0,
+            next_id: 1,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.sessions.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        false // there is always at least one
+    }
+
+    pub fn current_index(&self) -> usize {
+        self.current
+    }
+
+    pub fn current(&self) -> &Session {
+        // `current` is kept in range by every mutator, and there is always at
+        // least one session; the fallback keeps the lint rules satisfied without
+        // an unwrap on a path that cannot be reached.
+        self.sessions.get(self.current).unwrap_or(&self.sessions[0])
+    }
+
+    pub fn current_mut(&mut self) -> &mut Session {
+        let i = self.current.min(self.sessions.len() - 1);
+        &mut self.sessions[i]
+    }
+
+    pub fn all(&self) -> &[Session] {
+        &self.sessions
+    }
+
+    pub fn get(&self, index: usize) -> Option<&Session> {
+        self.sessions.get(index)
+    }
+
+    /// Switch by position. Out-of-range is ignored rather than clamped: a stray
+    /// `Alt-7` with three sessions open should do nothing, not jump to the last.
+    pub fn switch_to(&mut self, index: usize) -> bool {
+        if index >= self.sessions.len() || index == self.current {
+            return false;
+        }
+        self.current = index;
+        self.sessions[index].last_used = std::time::Instant::now();
+        true
+    }
+
+    pub fn cycle(&mut self, step: isize) {
+        let n = self.sessions.len() as isize;
+        let next = (self.current as isize + step).rem_euclid(n) as usize;
+        self.switch_to(next);
+    }
+
+    /// Create a session and switch to it. Returns its index.
+    pub fn create(&mut self, name: impl Into<String>, left: VfsPath, right: VfsPath) -> usize {
+        let id = SessionId(self.next_id);
+        self.next_id += 1;
+        self.sessions.push(Session::new(id, name, left, right));
+        self.current = self.sessions.len() - 1;
+        self.current
+    }
+
+    /// Close a session. Refuses to close the last one — an application with no
+    /// session has nothing to draw, and "quit" is a different action with a
+    /// different confirmation.
+    pub fn close(&mut self, index: usize) -> Result<(), CloseError> {
+        if self.sessions.len() == 1 {
+            return Err(CloseError::LastSession);
+        }
+        if index >= self.sessions.len() {
+            return Err(CloseError::NoSuchSession);
+        }
+        self.sessions.remove(index);
+        // Keep looking at the same session where possible; otherwise step back
+        // so closing the last one in the list does not wrap to the first.
+        if self.current > index || self.current >= self.sessions.len() {
+            self.current = self.current.saturating_sub(1);
+        }
+        Ok(())
+    }
+
+    /// A name not already taken, for a session created without one.
+    pub fn unused_name(&self) -> String {
+        for n in 1..=999 {
+            let candidate = format!("session {n}");
+            if !self.sessions.iter().any(|s| s.name == candidate) {
+                return candidate;
+            }
+        }
+        format!("session {}", self.next_id)
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum CloseError {
+    #[error("cannot close the last session")]
+    LastSession,
+    #[error("no such session")]
+    NoSuchSession,
+}
+
+/// `/Users/x/prj/dmac` -> `~/prj/dmac`. The rail is narrow and the home prefix
+/// is the least informative part of any path in it.
+fn abbreviate_home(path: &str) -> String {
+    let home = if cfg!(windows) {
+        std::env::var("USERPROFILE").ok()
+    } else {
+        std::env::var("HOME").ok()
+    };
+    match home {
+        Some(h) if !h.is_empty() && path.starts_with(&h) => format!("~{}", &path[h.len()..]),
+        _ => path.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mgr() -> SessionManager {
+        SessionManager::new("work", VfsPath::local("/a"), VfsPath::local("/b"))
+    }
+
+    #[test]
+    fn there_is_always_exactly_one_session_to_start_with() {
+        let m = mgr();
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.current().name, "work");
+    }
+
+    /// The property that makes the rail worth having: switching does not reload.
+    #[test]
+    fn switching_preserves_each_sessions_state() {
+        let mut m = mgr();
+        m.current_mut().command_line.push_str("first");
+        m.create("second", VfsPath::local("/c"), VfsPath::local("/d"));
+        m.current_mut().command_line.push_str("second");
+
+        m.switch_to(0);
+        assert_eq!(m.current().command_line, "first");
+        m.switch_to(1);
+        assert_eq!(
+            m.current().command_line,
+            "second",
+            "state must survive a switch"
+        );
+    }
+
+    #[test]
+    fn creating_a_session_switches_to_it() {
+        let mut m = mgr();
+        let i = m.create("other", VfsPath::local("/c"), VfsPath::local("/d"));
+        assert_eq!(m.current_index(), i);
+        assert_eq!(m.current().name, "other");
+    }
+
+    #[test]
+    fn cycling_wraps_in_both_directions() {
+        let mut m = mgr();
+        m.create("b", VfsPath::local("/"), VfsPath::local("/"));
+        m.create("c", VfsPath::local("/"), VfsPath::local("/"));
+        m.switch_to(0);
+        m.cycle(-1);
+        assert_eq!(m.current().name, "c");
+        m.cycle(1);
+        assert_eq!(m.current().name, "work");
+    }
+
+    /// A stray Alt-7 with three sessions open must do nothing, not jump to the
+    /// last one — silently acting on the wrong session is worse than ignoring it.
+    #[test]
+    fn switching_out_of_range_is_ignored_not_clamped() {
+        let mut m = mgr();
+        m.create("b", VfsPath::local("/"), VfsPath::local("/"));
+        m.switch_to(0);
+        assert!(!m.switch_to(9));
+        assert_eq!(m.current_index(), 0);
+    }
+
+    #[test]
+    fn the_last_session_cannot_be_closed() {
+        let mut m = mgr();
+        assert_eq!(m.close(0), Err(CloseError::LastSession));
+        assert_eq!(
+            m.len(),
+            1,
+            "the application must always have something to draw"
+        );
+    }
+
+    #[test]
+    fn closing_before_the_current_one_keeps_you_on_the_same_session() {
+        let mut m = mgr();
+        m.create("b", VfsPath::local("/"), VfsPath::local("/"));
+        m.create("c", VfsPath::local("/"), VfsPath::local("/"));
+        m.switch_to(2);
+        m.close(0).expect("closable");
+        assert_eq!(m.current().name, "c", "the view must not jump elsewhere");
+    }
+
+    #[test]
+    fn closing_the_current_last_session_steps_back() {
+        let mut m = mgr();
+        m.create("b", VfsPath::local("/"), VfsPath::local("/"));
+        m.switch_to(1);
+        m.close(1).expect("closable");
+        assert_eq!(m.current().name, "work");
+        assert_eq!(m.current_index(), 0);
+    }
+
+    #[test]
+    fn closing_a_session_that_does_not_exist_is_an_error_not_a_panic() {
+        let mut m = mgr();
+        m.create("b", VfsPath::local("/"), VfsPath::local("/"));
+        assert_eq!(m.close(9), Err(CloseError::NoSuchSession));
+    }
+
+    #[test]
+    fn generated_names_do_not_collide() {
+        let mut m = mgr();
+        for _ in 0..5 {
+            let name = m.unused_name();
+            m.create(name, VfsPath::local("/"), VfsPath::local("/"));
+        }
+        let mut names: Vec<&str> = m.all().iter().map(|s| s.name.as_str()).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(names.len(), before, "duplicate session names");
+    }
+
+    #[test]
+    fn adjacent_sessions_get_different_colours() {
+        let mut m = mgr();
+        m.create("b", VfsPath::local("/"), VfsPath::local("/"));
+        assert_ne!(m.all()[0].color, m.all()[1].color);
+    }
+
+    #[test]
+    fn the_home_prefix_is_abbreviated_in_the_rail() {
+        // Only meaningful when HOME is set, which it is everywhere we run.
+        if let Ok(home) = std::env::var("HOME") {
+            let p = format!("{home}/prj/dmac");
+            assert_eq!(abbreviate_home(&p), "~/prj/dmac");
+        }
+        assert_eq!(abbreviate_home("/etc/hosts"), "/etc/hosts");
+    }
+}

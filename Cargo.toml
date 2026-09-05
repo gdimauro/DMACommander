@@ -4,6 +4,7 @@ members = [
     "crates/dmac",
     "crates/dmac-config",
     "crates/dmac-core",
+    "crates/dmac-desktop",
     "crates/dmac-vfs",
     "crates/dmac-session",
     "crates/dmac-search",

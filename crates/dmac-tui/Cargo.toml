@@ -16,9 +16,13 @@ anyhow = "1.0.104"
 dmac-config = { version = "0.1.0", path = "../dmac-config" }
 dmac-core = { version = "0.1.0", path = "../dmac-core" }
 dmac-fx = { version = "0.1.0", path = "../dmac-fx" }
+dmac-session = { version = "0.1.0", path = "../dmac-session" }
 dmac-vfs = { version = "0.1.0", path = "../dmac-vfs" }
 jiff = "0.2.35"
 ratatui = "0.30.2"
 tokio = { version = "1.53.1", features = ["rt", "sync", "macros", "time"] }
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.2"
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["rt", "macros"] }

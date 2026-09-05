@@ -472,6 +472,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "dmac-desktop"
+version = "0.1.0"
+
+[[package]]
 name = "dmac-fx"
 version = "0.1.0"
 dependencies = [
@@ -497,6 +501,11 @@ version = "0.1.0"
 [[package]]
 name = "dmac-session"
 version = "0.1.0"
+dependencies = [
+ "dmac-core",
+ "dmac-vfs",
+ "thiserror 2.0.20",
+]
 
 [[package]]
 name = "dmac-tui"
@@ -506,6 +515,7 @@ dependencies = [
  "dmac-config",
  "dmac-core",
  "dmac-fx",
+ "dmac-session",
  "dmac-vfs",
  "jiff",
  "ratatui",

@@ -6,6 +6,24 @@ Notable changes, newest first. Versions follow the policy in
 ## Unreleased
 
 ### Added
+- **Multiple live sessions.** `dmac-session` holds several workspaces at once,
+  each with its own panels, focus, command line and current directory. They are
+  live, not swapped: switching does not save one and load another, so nothing
+  reloads and each session keeps the listing and cursor position it had. This is
+  what lets the rail stand in for a window switcher rather than being a bookmark
+  list.
+- **Session rail** down the left edge. Collapsed it is three columns of coloured
+  dots, so you can always see how many sessions exist and which one you are in;
+  `Shift-Tab` expands it to names, positions and paths. It *pushes* the panels
+  rather than covering them — both stay readable, and a file can eventually be
+  dragged from a panel onto a session, which is the natural route to the
+  cross-session clipboard.
+  `Alt+1..9` jumps by position, `Ctrl-N` opens a session on the current
+  directory, `Ctrl-W` closes one, `Ctrl-PageUp/PageDown` cycles, and clicking a
+  row in the rail switches to it. Closing the last session is refused and points
+  at F10 rather than quietly becoming a way to quit.
+- `--cursor <style>` — `blinking-block` (default), `blinking-bar`,
+  `blinking-underline`, `steady-block`, or `software`. See *Fixed* below.
 - Startup splash showing version, build number, commit, build time, rustc and
   target. Drawn over the panels rather than instead of them, so the app never
   looks like it is still loading when it is already usable. Any key dismisses it,
@@ -17,6 +35,13 @@ Notable changes, newest first. Versions follow the policy in
 - `docs/VERSIONING.md` and this changelog.
 
 ### Fixed
+- **The command-line cursor did not blink** in some terminals. The shape was
+  asked for once at startup with DECSCUSR, and a terminal that resets it — or
+  overrides it with its own cursor preference — left the cursor steady with
+  nothing to explain why. It is now re-asserted on every frame that actually
+  shows a cursor. Where the terminal ignores the request entirely,
+  `--cursor software` stops asking and draws the cursor as an inverted cell,
+  blinking on a 530ms phase, which works everywhere.
 - **Startup took 2.0 seconds** in any terminal without the kitty keyboard
   protocol. `supports_keyboard_enhancement()` queries the terminal and waits for
   a reply that such terminals never send, burning the full 2s timeout in exactly

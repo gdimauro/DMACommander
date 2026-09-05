@@ -5,11 +5,13 @@
 //! that is the rule that keeps the UI responsive while 100k files are copying.
 
 use crate::action::Action;
-use crate::terminal::TerminalGuard;
+use crate::terminal::{CursorStyle, TerminalGuard};
 use crate::theme::Theme;
 use crate::{keymap, ui};
 use dmac_core::{Panel, PanelId, SortOrder};
 use dmac_fx::{Canvas, EffectKey, Screensaver, ScreensaverConfig, Wake};
+pub use dmac_session::Focus;
+use dmac_session::{Session, SessionManager};
 use dmac_vfs::{BackendRef, ListChunk, VfsPath, local::LocalBackend};
 use ratatui::crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
@@ -32,18 +34,6 @@ enum Update {
         panel: PanelId,
         message: String,
     },
-}
-
-/// Where the keyboard is. Exactly two places, never ambiguous.
-///
-/// This is deliberately explicit rather than the orthodox "typing always falls
-/// through to the command line": with focus modelled, a letter typed on a panel
-/// can mean incremental search, and the cursor can be shown only where text is
-/// actually being edited.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Focus {
-    Panel,
-    CommandLine,
 }
 
 /// Which overlay, if any, owns the keyboard.
@@ -80,6 +70,8 @@ pub(crate) struct LayoutCache {
     pub panels: [Rect; 2],
     pub fkeys: Rect,
     pub command: Rect,
+    /// Interior of the session rail.
+    pub rail: Rect,
     /// Interior of the context menu while it is open.
     pub menu: Rect,
     /// Interior of the screensaver picker while it is open.
@@ -87,18 +79,20 @@ pub(crate) struct LayoutCache {
 }
 
 pub struct App {
-    pub(crate) panels: [Panel; 2],
-    cwd: [VfsPath; 2],
-    /// Bumped on every navigation so results from an abandoned listing are dropped.
-    generation: [u64; 2],
-    pub(crate) active: PanelId,
+    /// Every live session. Switching between them does not save and reload —
+    /// they all stay in memory with their listings intact, which is what makes
+    /// the rail instant and what lets it stand in for a window switcher.
+    pub(crate) sessions: SessionManager,
+    /// Whether the session rail is expanded. Collapsed it is a narrow strip, so
+    /// you can always see how many sessions you have without opening anything.
+    pub(crate) rail_open: bool,
+    pub(crate) cursor_style: CursorStyle,
+    /// When the software cursor last flipped. Only used in `Software` mode.
+    cursor_phase: std::time::Instant,
     pub(crate) theme: Theme,
-    pub(crate) command_line: String,
     pub(crate) status: String,
-    pub(crate) panels_hidden: bool,
     backend: BackendRef,
     screensaver: Screensaver,
-    pub(crate) focus: Focus,
     pub(crate) mode: Mode,
     pub(crate) layout: LayoutCache,
     /// Incremental-search buffer, filled while a panel has focus. Cleared after
@@ -126,24 +120,23 @@ impl App {
     /// Private: `Update` is an internal message type, so the only supported
     /// entry point is [`run`].
     fn new(
+        session_name: String,
         left: VfsPath,
         right: VfsPath,
         screensaver: ScreensaverConfig,
         splash: bool,
+        cursor: CursorStyle,
         tx: mpsc::UnboundedSender<Update>,
     ) -> Self {
         Self {
-            panels: [Panel::new(left.display()), Panel::new(right.display())],
-            cwd: [left, right],
-            generation: [0, 0],
-            active: PanelId::Left,
+            sessions: SessionManager::new(session_name, left, right),
+            rail_open: false,
+            cursor_style: cursor,
+            cursor_phase: std::time::Instant::now(),
             theme: Theme::default(),
-            command_line: String::new(),
             status: String::new(),
-            panels_hidden: false,
             backend: Arc::new(LocalBackend::new()),
             screensaver: Screensaver::new(screensaver),
-            focus: Focus::Panel,
             mode: Mode::Normal,
             layout: LayoutCache::default(),
             quick_search: String::new(),
@@ -159,16 +152,57 @@ impl App {
         }
     }
 
+    /// The session currently on screen. Every panel operation goes through here,
+    /// so nothing can accidentally act on a session the user is not looking at.
+    pub(crate) fn ses(&self) -> &Session {
+        self.sessions.current()
+    }
+
+    fn ses_mut(&mut self) -> &mut Session {
+        self.sessions.current_mut()
+    }
+
     fn idx(id: PanelId) -> usize {
-        match id {
-            PanelId::Left => 0,
-            PanelId::Right => 1,
-        }
+        Session::index_of(id)
     }
 
     fn active_panel_mut(&mut self) -> &mut Panel {
-        let i = Self::idx(self.active);
-        &mut self.panels[i]
+        self.ses_mut().active_panel_mut()
+    }
+
+    /// Whether a text cursor is on screen at all: only when the command line has
+    /// focus, nothing is overlaying it, and the terminal is drawing it for us.
+    fn shows_text_cursor(&self) -> bool {
+        !self.cursor_style.is_software()
+            && self.ses().focus == Focus::CommandLine
+            && self.mode == Mode::Normal
+            && !self.screensaver.is_active()
+            && !self.splash_visible()
+    }
+
+    /// Whether the software cursor is in its visible half. The classic terminal
+    /// blink is about 530ms, which is slow enough not to be distracting and fast
+    /// enough to read as "here".
+    pub(crate) fn software_cursor_on(&self) -> bool {
+        const PERIOD_MS: u128 = 530;
+        (self.cursor_phase.elapsed().as_millis() / PERIOD_MS).is_multiple_of(2)
+    }
+
+    /// When the software cursor next needs redrawing, if it is in use and
+    /// visible. `None` costs no timer, which is the usual case.
+    fn cursor_deadline(&self) -> Option<std::time::Instant> {
+        if !self.cursor_style.is_software()
+            || self.ses().focus != Focus::CommandLine
+            || self.mode != Mode::Normal
+            || self.screensaver.is_active()
+            || self.splash_visible()
+        {
+            return None;
+        }
+        const PERIOD: std::time::Duration = std::time::Duration::from_millis(530);
+        let elapsed = self.cursor_phase.elapsed();
+        let next = PERIOD * ((elapsed.as_millis() / PERIOD.as_millis()) as u32 + 1);
+        Some(self.cursor_phase + next)
     }
 
     /// Whether the splash is still on screen. Expiry is checked here rather than
@@ -197,21 +231,21 @@ impl App {
     }
 
     pub(crate) fn cwd_display(&self, id: PanelId) -> String {
-        self.cwd[Self::idx(id)].display()
+        self.ses().cwd[Self::idx(id)].display()
     }
 
     /// Kick off a listing for one panel. Returns immediately; entries arrive as
     /// [`Update::Entries`] messages, so a slow or hung backend never blocks the loop.
     fn reload(&mut self, id: PanelId) {
         let i = Self::idx(id);
-        self.generation[i] += 1;
-        let generation = self.generation[i];
-        let path = self.cwd[i].clone();
+        self.ses_mut().generation[i] += 1;
+        let generation = self.ses().generation[i];
+        let path = self.ses().cwd[i].clone();
         let backend = Arc::clone(&self.backend);
         let tx = self.tx.clone();
 
-        self.panels[i].location = path.display();
-        self.panels[i].set_entries(Vec::new());
+        self.ses_mut().panels[i].location = path.display();
+        self.ses_mut().panels[i].set_entries(Vec::new());
 
         tokio::spawn(async move {
             // Bounded: if the UI falls behind, the walk waits instead of buffering
@@ -264,10 +298,10 @@ impl App {
             } => {
                 let i = Self::idx(panel);
                 // Stale result from a directory the user already left.
-                if generation != self.generation[i] {
+                if generation != self.ses().generation[i] {
                     return;
                 }
-                let p = &mut self.panels[i];
+                let p = &mut self.ses_mut().panels[i];
                 p.entries.extend(chunk.entries);
                 if chunk.complete {
                     p.resort();
@@ -305,12 +339,12 @@ impl App {
             // fast two-way toggle that replaces it.
             FocusNext => {
                 self.clear_quick_search();
-                match (self.focus, self.active) {
-                    (Focus::Panel, PanelId::Left) => self.active = PanelId::Right,
-                    (Focus::Panel, PanelId::Right) => self.focus = Focus::CommandLine,
+                match (self.ses().focus, self.ses().active) {
+                    (Focus::Panel, PanelId::Left) => self.ses_mut().active = PanelId::Right,
+                    (Focus::Panel, PanelId::Right) => self.ses_mut().focus = Focus::CommandLine,
                     (Focus::CommandLine, _) => {
-                        self.focus = Focus::Panel;
-                        self.active = PanelId::Left;
+                        self.ses_mut().focus = Focus::Panel;
+                        self.ses_mut().active = PanelId::Left;
                     }
                 }
             }
@@ -319,20 +353,76 @@ impl App {
             // of having it alongside Tab.
             FocusToggle => {
                 self.clear_quick_search();
-                self.focus = match self.focus {
+                self.ses_mut().focus = match self.ses().focus {
                     Focus::Panel => Focus::CommandLine,
                     Focus::CommandLine => Focus::Panel,
                 };
             }
 
-            SwitchPanel => self.active = self.active.other(),
-            SwapPanels => {
-                self.panels.swap(0, 1);
-                self.cwd.swap(0, 1);
-                self.generation.swap(0, 1);
+            // --- sessions ---
+            ToggleRail => self.rail_open = !self.rail_open,
+
+            SwitchSession(index) => {
+                if self.sessions.switch_to(index) {
+                    self.after_session_switch();
+                } else if index >= self.sessions.len() {
+                    // Say why nothing happened. A silently ignored shortcut is
+                    // indistinguishable from a broken one.
+                    self.status =
+                        format!("no session {} — {} open", index + 1, self.sessions.len());
+                }
             }
-            TogglePanels => self.panels_hidden = !self.panels_hidden,
-            Refresh => self.reload(self.active),
+
+            CycleSession(step) => {
+                self.sessions.cycle(step);
+                self.after_session_switch();
+            }
+
+            NewSession => {
+                // Opens on the directory you are standing in: a new session is
+                // almost always "the same place, a different task".
+                let left = self.ses().cwd[0].clone();
+                let right = self.ses().cwd[1].clone();
+                let name = self.sessions.unused_name();
+                self.sessions.create(name, left, right);
+                self.reload(PanelId::Left);
+                self.reload(PanelId::Right);
+                self.rail_open = true;
+                self.status = format!(
+                    "session {} of {}",
+                    self.sessions.current_index() + 1,
+                    self.sessions.len()
+                );
+            }
+
+            CloseSession => {
+                let i = self.sessions.current_index();
+                match self.sessions.close(i) {
+                    Ok(()) => {
+                        self.after_session_switch();
+                        self.status = format!("session closed — {} left", self.sessions.len());
+                    }
+                    // Quitting is a different action with a different
+                    // confirmation; do not silently turn one into the other.
+                    Err(e) => self.status = format!("{e} (F10 quits)"),
+                }
+            }
+
+            SwitchPanel => {
+                let other = self.ses().active.other();
+                self.ses_mut().active = other;
+            }
+            SwapPanels => {
+                let s = self.ses_mut();
+                s.panels.swap(0, 1);
+                s.cwd.swap(0, 1);
+                s.generation.swap(0, 1);
+            }
+            TogglePanels => {
+                let hidden = self.ses().panels_hidden;
+                self.ses_mut().panels_hidden = !hidden;
+            }
+            Refresh => self.reload(self.ses().active),
 
             ToggleSelection => self.active_panel_mut().toggle_selection(),
             InvertSelection => self.active_panel_mut().invert_selection(),
@@ -361,7 +451,7 @@ impl App {
             ToggleHidden => {
                 let p = self.active_panel_mut();
                 p.show_hidden = !p.show_hidden;
-                self.reload(self.active);
+                self.reload(self.ses().active);
             }
 
             ScreensaverMenu => self.mode = Mode::Picker { selected: 0 },
@@ -369,25 +459,26 @@ impl App {
             ContextMenu => {
                 // Anchored on the cursor row, so the keyboard route opens the
                 // menu next to what it acts on rather than in a corner.
-                let i = Self::idx(self.active);
+                let i = Self::idx(self.ses().active);
                 let area = self.layout.panels[i];
-                let row = (self.panels[i]
+                let row = (self.ses().panels[i]
                     .cursor()
-                    .saturating_sub(self.panels[i].offset())) as u16;
+                    .saturating_sub(self.ses().panels[i].offset()))
+                    as u16;
                 self.open_context_menu((area.x + 2, area.y.saturating_add(row).saturating_add(1)));
             }
 
             Quit => self.should_quit = true,
 
-            CommandChar(c) => self.command_line.push(c),
+            CommandChar(c) => self.ses_mut().command_line.push(c),
             CommandBackspace => {
-                self.command_line.pop();
+                self.ses_mut().command_line.pop();
             }
-            CommandClear => self.command_line.clear(),
+            CommandClear => self.ses_mut().command_line.clear(),
             CommandSubmit => {
-                if !self.command_line.is_empty() {
-                    self.status = format!("shell not wired up yet: {}", self.command_line);
-                    self.command_line.clear();
+                if !self.ses().command_line.is_empty() {
+                    self.status = format!("shell not wired up yet: {}", self.ses().command_line);
+                    self.ses_mut().command_line.clear();
                 }
             }
 
@@ -417,13 +508,31 @@ impl App {
         }
     }
 
+    /// Settle the UI after the visible session changes.
+    ///
+    /// Nothing is reloaded: every session keeps its listings, which is the whole
+    /// point of holding them all live. Only the transient, per-view state that
+    /// belonged to the session we just left is cleared.
+    fn after_session_switch(&mut self) {
+        self.quick_search.clear();
+        self.mode = Mode::Normal;
+        self.drag = None;
+        self.last_click = None;
+        self.status = format!(
+            "{} ({} of {})",
+            self.ses().name,
+            self.sessions.current_index() + 1,
+            self.sessions.len()
+        );
+    }
+
     /// The contextual commands for the current entry.
     ///
     /// Built fresh each time rather than filtered from a fixed list: a menu that
     /// offers Delete on `..` is a menu that will eventually delete the wrong thing.
     pub(crate) fn context_items(&self) -> Vec<crate::ui::menu::Item> {
         use crate::ui::menu::Item;
-        let Some(entry) = self.panels[Self::idx(self.active)].current() else {
+        let Some(entry) = self.ses().active_panel().current() else {
             return vec![Item::new("Refresh", "Ctrl-R")];
         };
 
@@ -489,8 +598,10 @@ impl App {
             "Select" => self.handle(Action::ToggleSelection),
             "Refresh" => self.handle(Action::Refresh),
             "Copy path" => {
-                let path = self.cwd_display(self.active);
-                let name = self.panels[Self::idx(self.active)]
+                let path = self.cwd_display(self.ses().active);
+                let name = self
+                    .ses()
+                    .active_panel()
                     .current()
                     .map(|e| e.name.clone())
                     .unwrap_or_default();
@@ -520,15 +631,15 @@ impl App {
     fn seek(&mut self, needle: &str) {
         // Search from the top so extending the buffer narrows the same result
         // rather than skipping to the next match of the longer string.
-        let i = Self::idx(self.active);
-        let found = self.panels[i]
+        let i = Self::idx(self.ses().active);
+        let found = self.ses().panels[i]
             .entries
             .iter()
             .position(|e| e.name.to_lowercase().starts_with(&needle.to_lowercase()));
 
         match found {
             Some(index) => {
-                self.panels[i].move_to(index);
+                self.ses_mut().panels[i].move_to(index);
                 self.status = format!("search: {needle}");
             }
             None => self.status = format!("search: {needle}  (no match)"),
@@ -545,7 +656,7 @@ impl App {
     /// Report what an unimplemented operation *would* act on. Even before the
     /// engine exists, this proves the selection model is right.
     fn pending_op(&self, label: &str) -> String {
-        let p = &self.panels[Self::idx(self.active)];
+        let p = self.ses().active_panel();
         let n = p.operands().len();
         format!("{label}: {n} item(s) selected — engine not implemented yet")
     }
@@ -586,7 +697,7 @@ impl App {
             Mode::Normal => {}
         }
 
-        if let Some(action) = keymap::resolve(k, self.focus) {
+        if let Some(action) = keymap::resolve(k, self.ses().focus) {
             self.handle(action);
         }
     }
@@ -685,8 +796,8 @@ impl App {
                 && row >= area.y
                 && row < area.y + area.height
             {
-                let index = self.panels[i].offset() + (row - area.y) as usize;
-                return Some((id, (index < self.panels[i].len()).then_some(index)));
+                let index = self.ses().panels[i].offset() + (row - area.y) as usize;
+                return Some((id, (index < self.ses().panels[i].len()).then_some(index)));
             }
         }
         None
@@ -708,11 +819,22 @@ impl App {
 
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                // The rail is to the left of the panels, so it is checked first.
+                let rail = self.layout.rail;
+                if rail.width > 0 && m.column >= rail.x && m.column < rail.x + rail.width {
+                    if let Some(i) =
+                        crate::ui::rail::session_at_row(&self.sessions, rail, self.rail_open, m.row)
+                        && self.sessions.switch_to(i)
+                    {
+                        self.after_session_switch();
+                    }
+                    return;
+                }
                 match self.hit_test(m.column, m.row) {
                     Some((id, row)) => {
                         // Focus first, whether or not a row was hit.
-                        self.active = id;
-                        self.focus = Focus::Panel;
+                        self.ses_mut().active = id;
+                        self.ses_mut().focus = Focus::Panel;
                         self.clear_quick_search();
                         let Some(index) = row else { return };
 
@@ -741,7 +863,7 @@ impl App {
                         } else if m.row == self.layout.command.y && self.layout.command.height > 0 {
                             // Clicking the command line is the mouse equivalent
                             // of Esc, and must put the cursor there.
-                            self.focus = Focus::CommandLine;
+                            self.ses_mut().focus = Focus::CommandLine;
                         }
                     }
                 }
@@ -750,7 +872,8 @@ impl App {
             // Right button sweeps the selection, as in Total Commander.
             MouseEventKind::Down(MouseButton::Right) => {
                 if let Some((id, Some(index))) = self.hit_test(m.column, m.row) {
-                    self.active = id;
+                    self.ses_mut().active = id;
+                    self.ses_mut().focus = Focus::Panel;
                     self.active_panel_mut().move_to(index);
                     self.active_panel_mut().toggle_selection();
                     // `toggle_selection` steps down; put the cursor back where
@@ -802,7 +925,7 @@ impl App {
             (current, drag.anchor)
         };
 
-        let panel = &mut self.panels[i];
+        let panel = &mut self.ses_mut().panels[i];
         for index in lo..=hi.min(panel.len().saturating_sub(1)) {
             if let Some(e) = panel.entries.get_mut(index)
                 && e.kind != dmac_core::EntryKind::Parent
@@ -869,7 +992,7 @@ impl App {
     }
 
     fn panel_at(&mut self, id: PanelId) -> &mut Panel {
-        &mut self.panels[Self::idx(id)]
+        self.ses_mut().panel_mut(id)
     }
 
     /// The F-key bar is clickable: each label occupies an equal share of the width.
@@ -947,8 +1070,8 @@ impl App {
     }
 
     fn activate(&mut self) {
-        let i = Self::idx(self.active);
-        let Some(entry) = self.panels[i].current() else {
+        let i = Self::idx(self.ses().active);
+        let Some(entry) = self.ses().panels[i].current() else {
             return;
         };
 
@@ -957,9 +1080,9 @@ impl App {
             dmac_core::EntryKind::Dir => {
                 // `join` rejects traversal, so a hostile listing entry named
                 // `../..` cannot walk us out of the tree.
-                if let Some(next) = self.cwd[i].join(&entry.name) {
-                    self.cwd[i] = next;
-                    self.reload(self.active);
+                if let Some(next) = self.ses().cwd[i].join(&entry.name) {
+                    self.ses_mut().cwd[i] = next;
+                    self.reload(self.ses().active);
                 } else {
                     self.status = format!("refusing to enter suspicious name: {}", entry.name);
                 }
@@ -971,10 +1094,10 @@ impl App {
     }
 
     fn go_parent(&mut self) {
-        let i = Self::idx(self.active);
-        if let Some(parent) = self.cwd[i].parent() {
-            self.cwd[i] = parent;
-            self.reload(self.active);
+        let i = Self::idx(self.ses().active);
+        if let Some(parent) = self.ses().cwd[i].parent() {
+            self.ses_mut().cwd[i] = parent;
+            self.reload(self.ses().active);
         }
     }
 }
@@ -999,15 +1122,25 @@ fn effect_key(k: KeyEvent) -> EffectKey {
 
 /// Run the application until the user quits.
 pub async fn run(
+    session_name: String,
     left: VfsPath,
     right: VfsPath,
     screensaver: ScreensaverConfig,
     splash: bool,
+    cursor: CursorStyle,
 ) -> anyhow::Result<()> {
-    let mut guard = TerminalGuard::enter()?;
+    let mut guard = TerminalGuard::enter(cursor)?;
 
     let (update_tx, mut update_rx) = mpsc::unbounded_channel();
-    let mut app = App::new(left, right, screensaver, splash, update_tx);
+    let mut app = App::new(
+        session_name,
+        left,
+        right,
+        screensaver,
+        splash,
+        cursor,
+        update_tx,
+    );
     app.reload(PanelId::Left);
     app.reload(PanelId::Right);
 
@@ -1026,15 +1159,28 @@ pub async fn run(
     loop {
         guard.terminal().draw(|f| ui::draw(f, &mut app))?;
 
+        // Re-assert the cursor shape, but only on frames that actually show a
+        // cursor. Terminals reset DECSCUSR for reasons outside our control, and
+        // setting it once at startup is why a blinking cursor silently stops
+        // blinking — while emitting it on every frame would spray the sequence
+        // at terminals that do not understand it.
+        if app.shows_text_cursor() {
+            crate::terminal::apply_cursor_style(app.cursor_style);
+        }
+
         // Exactly one timer, and only when something actually needs waking:
         // the idle deadline, or the next animation frame. `None` means we block
         // on input alone and cost nothing at all.
         // One timer for everything that needs waking: the splash expiry and the
         // screensaver, whichever comes first. Still `None` when neither wants one.
-        let wake = match (app.splash_until, app.screensaver.deadline()) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
+        let wake = [
+            app.splash_until,
+            app.screensaver.deadline(),
+            app.cursor_deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         let sleep = async {
             match wake {
                 Some(at) => tokio::time::sleep_until(at.into()).await,
@@ -1079,6 +1225,7 @@ mod tests {
     fn fixture() -> App {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = App::new(
+            "test".to_string(),
             VfsPath::local("/left"),
             VfsPath::local("/right"),
             // Tests must never have a screensaver appear mid-assertion.
@@ -1087,6 +1234,7 @@ mod tests {
                 ..Default::default()
             },
             false, // no splash: it would swallow the first key of every test
+            CursorStyle::default(),
             tx,
         );
         let mk = |name: &str, kind| dmac_core::Entry {
@@ -1098,7 +1246,7 @@ mod tests {
             selected: false,
         };
         use dmac_core::EntryKind::*;
-        app.panels[0].set_entries(vec![
+        app.ses_mut().panels[0].set_entries(vec![
             dmac_core::Entry::parent(),
             mk("src", Dir),
             mk("Cargo.toml", File),
@@ -1173,9 +1321,9 @@ mod tests {
     #[test]
     fn tab_switches_the_active_panel() {
         let mut app = fixture();
-        assert_eq!(app.active, PanelId::Left);
+        assert_eq!(app.ses().active, PanelId::Left);
         app.handle(Action::SwitchPanel);
-        assert_eq!(app.active, PanelId::Right);
+        assert_eq!(app.ses().active, PanelId::Right);
     }
 
     // ---- mouse ----
@@ -1204,8 +1352,8 @@ mod tests {
         };
         // A real draw reports the viewport; without it the panel thinks it is
         // one row tall and every scroll offset is wrong.
-        app.panels[0].set_viewport(10);
-        app.panels[1].set_viewport(10);
+        app.ses_mut().panels[0].set_viewport(10);
+        app.ses_mut().panels[1].set_viewport(10);
         app
     }
 
@@ -1231,8 +1379,8 @@ mod tests {
     fn a_click_moves_the_cursor_to_the_clicked_row() {
         let mut app = with_layout(fixture());
         app.on_mouse(click(MouseButton::Left, 5, 3)); // interior row 2
-        assert_eq!(app.active, PanelId::Left);
-        assert_eq!(app.panels[0].cursor(), 2);
+        assert_eq!(app.ses().active, PanelId::Left);
+        assert_eq!(app.ses_mut().panels[0].cursor(), 2);
     }
 
     /// Clicking the inactive panel must focus it — otherwise the click acts on
@@ -1242,27 +1390,27 @@ mod tests {
     #[test]
     fn clicking_the_other_panel_activates_it_even_when_empty() {
         let mut app = with_layout(fixture());
-        assert_eq!(app.active, PanelId::Left);
-        assert!(app.panels[1].is_empty());
+        assert_eq!(app.ses().active, PanelId::Left);
+        assert!(app.ses_mut().panels[1].is_empty());
         app.on_mouse(click(MouseButton::Left, 45, 2));
-        assert_eq!(app.active, PanelId::Right);
+        assert_eq!(app.ses().active, PanelId::Right);
     }
 
     #[test]
     fn clicking_past_the_last_entry_does_nothing() {
         let mut app = with_layout(fixture());
-        app.panels[0].move_to(1);
+        app.ses_mut().panels[0].move_to(1);
         app.on_mouse(click(MouseButton::Left, 5, 9)); // below the 5 entries
-        assert_eq!(app.panels[0].cursor(), 1, "cursor must not move");
+        assert_eq!(app.ses_mut().panels[0].cursor(), 1, "cursor must not move");
     }
 
     #[test]
     fn a_right_click_toggles_selection_and_leaves_the_cursor_put() {
         let mut app = with_layout(fixture());
         app.on_mouse(click(MouseButton::Right, 5, 3));
-        assert!(app.panels[0].entries[2].selected);
+        assert!(app.ses_mut().panels[0].entries[2].selected);
         assert_eq!(
-            app.panels[0].cursor(),
+            app.ses_mut().panels[0].cursor(),
             2,
             "the cursor must stay where clicked"
         );
@@ -1276,7 +1424,10 @@ mod tests {
         app.on_mouse(click(MouseButton::Left, 5, 2)); // row 1
         app.on_mouse(drag_to(5, 5)); // straight to row 4, skipping 2 and 3
         for i in 1..=4 {
-            assert!(app.panels[0].entries[i].selected, "row {i} was skipped");
+            assert!(
+                app.ses_mut().panels[0].entries[i].selected,
+                "row {i} was skipped"
+            );
         }
     }
 
@@ -1286,7 +1437,10 @@ mod tests {
         app.on_mouse(click(MouseButton::Left, 5, 5)); // row 4
         app.on_mouse(drag_to(5, 2)); // back up to row 1
         for i in 1..=4 {
-            assert!(app.panels[0].entries[i].selected, "row {i} was skipped");
+            assert!(
+                app.ses_mut().panels[0].entries[i].selected,
+                "row {i} was skipped"
+            );
         }
     }
 
@@ -1296,7 +1450,7 @@ mod tests {
         app.on_mouse(click(MouseButton::Left, 5, 5));
         app.on_mouse(drag_to(5, 1)); // sweeps across `..`
         assert!(
-            !app.panels[0].entries[0].selected,
+            !app.ses_mut().panels[0].entries[0].selected,
             "`..` must never be selectable"
         );
     }
@@ -1307,7 +1461,7 @@ mod tests {
         app.on_mouse(click(MouseButton::Left, 5, 2));
         app.on_mouse(drag_to(45, 5)); // pointer crosses into the right panel
         assert!(
-            app.panels[1].entries.iter().all(|e| !e.selected),
+            app.ses_mut().panels[1].entries.iter().all(|e| !e.selected),
             "a drag started in one panel must not select in the other"
         );
     }
@@ -1324,7 +1478,7 @@ mod tests {
         });
         app.on_mouse(drag_to(5, 5));
         assert!(
-            !app.panels[0].entries[4].selected,
+            !app.ses_mut().panels[0].entries[4].selected,
             "the drag should be over"
         );
     }
@@ -1343,8 +1497,8 @@ mod tests {
                 selected: false,
             })
             .collect();
-        app.panels[1].set_entries(many);
-        app.panels[1].set_viewport(10);
+        app.ses_mut().panels[1].set_entries(many);
+        app.ses_mut().panels[1].set_viewport(10);
 
         app.on_mouse(MouseEvent {
             kind: MouseEventKind::ScrollDown,
@@ -1352,9 +1506,16 @@ mod tests {
             row: 5,
             modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
         });
-        assert_eq!(app.active, PanelId::Left, "scrolling must not steal focus");
-        assert!(app.panels[1].cursor() > 0, "the hovered panel must scroll");
-        assert_eq!(app.panels[0].cursor(), 0);
+        assert_eq!(
+            app.ses().active,
+            PanelId::Left,
+            "scrolling must not steal focus"
+        );
+        assert!(
+            app.ses_mut().panels[1].cursor() > 0,
+            "the hovered panel must scroll"
+        );
+        assert_eq!(app.ses_mut().panels[0].cursor(), 0);
     }
 
     #[test]
@@ -1369,6 +1530,130 @@ mod tests {
         let mut app = with_layout(fixture());
         app.on_mouse(click(MouseButton::Left, 36, 23)); // 36/8 = cell 4 -> F5
         assert!(app.status.contains("F5 copy"), "got {:?}", app.status);
+    }
+
+    // ---- sessions ----
+
+    // Creating a session spawns its directory listing, so this needs a runtime.
+    #[tokio::test]
+    async fn a_new_session_opens_on_the_current_directory() {
+        let mut app = fixture();
+        let before = app.ses().cwd[0].clone();
+        app.handle(Action::NewSession);
+        assert_eq!(app.sessions.len(), 2);
+        assert_eq!(
+            app.ses().cwd[0],
+            before,
+            "a new session starts where you are"
+        );
+    }
+
+    /// The property that makes the rail worth having: switching does not reload,
+    /// so each session keeps the listing and cursor it had.
+    // Creating a session spawns its directory listing, so this needs a runtime.
+    #[tokio::test]
+    async fn switching_sessions_preserves_each_ones_listing_and_cursor() {
+        let mut app = fixture();
+        app.ses_mut().active_panel_mut().move_to(3);
+        app.handle(Action::NewSession);
+        app.ses_mut().panels[0].set_entries(vec![dmac_core::Entry::parent()]);
+
+        app.handle(Action::SwitchSession(0));
+        assert_eq!(app.ses().active_panel().cursor(), 3, "cursor must survive");
+        assert_eq!(app.ses().panels[0].len(), 5, "listing must survive");
+
+        app.handle(Action::SwitchSession(1));
+        assert_eq!(app.ses().panels[0].len(), 1);
+    }
+
+    #[test]
+    fn the_rail_toggles_and_starts_closed() {
+        let mut app = fixture();
+        assert!(!app.rail_open);
+        app.handle(Action::ToggleRail);
+        assert!(app.rail_open);
+        app.handle(Action::ToggleRail);
+        assert!(!app.rail_open);
+    }
+
+    /// A shortcut that does nothing must say why, or it is indistinguishable
+    /// from a broken binding.
+    #[test]
+    fn switching_to_a_session_that_does_not_exist_explains_itself() {
+        let mut app = fixture();
+        app.handle(Action::SwitchSession(6));
+        assert_eq!(app.sessions.current_index(), 0);
+        assert!(app.status.contains("no session 7"), "got {:?}", app.status);
+    }
+
+    // Creating a session spawns its directory listing, so this needs a runtime.
+    #[tokio::test]
+    async fn cycling_sessions_wraps() {
+        let mut app = fixture();
+        app.handle(Action::NewSession);
+        app.handle(Action::NewSession);
+        app.handle(Action::SwitchSession(0));
+        app.handle(Action::CycleSession(-1));
+        assert_eq!(app.sessions.current_index(), 2);
+        app.handle(Action::CycleSession(1));
+        assert_eq!(app.sessions.current_index(), 0);
+    }
+
+    /// Closing the last session must not become a way to quit by accident.
+    // Creating a session spawns its directory listing, so this needs a runtime.
+    #[tokio::test]
+    async fn closing_the_last_session_is_refused_and_points_at_f10() {
+        let mut app = fixture();
+        app.handle(Action::CloseSession);
+        assert_eq!(app.sessions.len(), 1);
+        assert!(!app.should_quit, "closing a session must never quit");
+        assert!(app.status.contains("F10"), "got {:?}", app.status);
+    }
+
+    // Creating a session spawns its directory listing, so this needs a runtime.
+    #[tokio::test]
+    async fn closing_a_session_leaves_the_others_intact() {
+        let mut app = fixture();
+        app.handle(Action::NewSession);
+        app.handle(Action::NewSession);
+        assert_eq!(app.sessions.len(), 3);
+        app.handle(Action::CloseSession);
+        assert_eq!(app.sessions.len(), 2);
+        assert!(app.sessions.current_index() < 2);
+    }
+
+    /// Transient per-view state belongs to the view, not to the next session.
+    // Creating a session spawns its directory listing, so this needs a runtime.
+    #[tokio::test]
+    async fn switching_sessions_clears_the_open_menu_and_any_drag() {
+        let mut app = fixture();
+        app.handle(Action::NewSession);
+        app.handle(Action::ScreensaverMenu);
+        assert_ne!(app.mode, Mode::Normal);
+        app.handle(Action::SwitchSession(0));
+        assert_eq!(
+            app.mode,
+            Mode::Normal,
+            "an overlay must not follow you across"
+        );
+    }
+
+    // Creating a session spawns its directory listing, so this needs a runtime.
+    #[tokio::test]
+    async fn each_session_remembers_its_own_focus_and_command_line() {
+        let mut app = fixture();
+        app.handle(Action::CommandChar('a'));
+        app.handle(Action::FocusToggle);
+        let focus_a = app.ses().focus;
+
+        app.handle(Action::NewSession);
+        app.handle(Action::CommandChar('b'));
+
+        app.handle(Action::SwitchSession(0));
+        assert_eq!(app.ses().command_line, "a");
+        assert_eq!(app.ses().focus, focus_a);
+        app.handle(Action::SwitchSession(1));
+        assert_eq!(app.ses().command_line, "b");
     }
 
     // ---- the picker ----
@@ -1420,12 +1705,16 @@ mod tests {
         let mut app = fixture();
         app.screensaver
             .start_with(dmac_fx::build("snake").expect("snake"), 60, 20);
-        let before = app.panels[0].cursor();
+        let before = app.ses_mut().panels[0].cursor();
         app.on_key(KeyEvent::new(
             KeyCode::Down,
             ratatui::crossterm::event::KeyModifiers::NONE,
         ));
-        assert_eq!(app.panels[0].cursor(), before, "the game must keep the key");
+        assert_eq!(
+            app.ses_mut().panels[0].cursor(),
+            before,
+            "the game must keep the key"
+        );
         assert!(app.screensaver.is_active());
     }
 
@@ -1435,14 +1724,14 @@ mod tests {
         let mut app = fixture();
         app.screensaver
             .start_with(dmac_fx::build("matrix").expect("matrix"), 60, 20);
-        let before = app.panels[0].cursor();
+        let before = app.ses_mut().panels[0].cursor();
         app.on_key(KeyEvent::new(
             KeyCode::Down,
             ratatui::crossterm::event::KeyModifiers::NONE,
         ));
         assert!(!app.screensaver.is_active(), "it must be dismissed");
         assert_eq!(
-            app.panels[0].cursor(),
+            app.ses_mut().panels[0].cursor(),
             before,
             "and the key must be swallowed"
         );
@@ -1454,8 +1743,8 @@ mod tests {
     fn repeating_a_sort_key_reverses_it() {
         let mut app = fixture();
         app.handle(Action::SortBy(dmac_core::SortKey::Size));
-        assert_eq!(app.panels[0].sort_order, SortOrder::Ascending);
+        assert_eq!(app.ses_mut().panels[0].sort_order, SortOrder::Ascending);
         app.handle(Action::SortBy(dmac_core::SortKey::Size));
-        assert_eq!(app.panels[0].sort_order, SortOrder::Descending);
+        assert_eq!(app.ses_mut().panels[0].sort_order, SortOrder::Descending);
     }
 }

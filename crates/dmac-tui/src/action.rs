@@ -25,6 +25,18 @@ pub enum Action {
     /// without disturbing which panel is current.
     FocusToggle,
 
+    // Sessions. Several are live at once; switching does not reload anything.
+    /// Shift-Tab: show or hide the session rail.
+    ToggleRail,
+    /// Alt+1..9: jump straight to a session by position.
+    SwitchSession(usize),
+    /// Ctrl-N: a new session on the current directory.
+    NewSession,
+    /// Ctrl-W: close the current session. Refused when it is the last one.
+    CloseSession,
+    /// Ctrl-PageUp / Ctrl-PageDown: previous / next session.
+    CycleSession(isize),
+
     // Panels
     SwitchPanel,
     SwapPanels,
