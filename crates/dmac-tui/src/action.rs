@@ -49,6 +49,12 @@ pub enum Action {
     /// [`Action::Copy`], which is F5 and moves files: one puts bytes on a
     /// clipboard, the other writes them to disk, and a key that sometimes did
     /// each would eventually do the wrong one.
+    /// Shift+Left/Right/Home/End on the command line: grow or shrink an
+    /// anchored selection over what is typed there.
+    ExtendCommandSelection(isize),
+    ExtendCommandSelectionToStart,
+    ExtendCommandSelectionToEnd,
+
     ClipboardCopy,
     /// Paste the system clipboard into the hosted shell.
     ClipboardPaste,

@@ -183,6 +183,12 @@ pub struct App {
     /// row are not the same thing and sharing the field would make a click in
     /// one look like a second click in the other.
     last_shell_click: Option<(std::time::Instant, u16, u16)>,
+    /// Text selected on the command line, as char offsets (anchor, head).
+    ///
+    /// Characters, not bytes: every consumer wants to slice the string at these
+    /// positions, and a byte offset in the middle of a multi-byte character
+    /// panics rather than misbehaving quietly.
+    pub(crate) command_selection: Option<(usize, usize)>,
     /// Text selected in the hosted shell, if any.
     pub(crate) shell_selection: Option<crate::ui::shell::Selection>,
     /// Whether the left button is still down on that selection. A drag in
@@ -385,6 +391,7 @@ impl App {
             completion_gen: 0,
             pending_terminal_write: String::new(),
             last_shell_click: None,
+            command_selection: None,
             shell_selection: None,
             selecting: false,
             last_shell_frame: std::time::Instant::now(),
@@ -756,6 +763,12 @@ impl App {
                     selected: crate::ui::menu::first_selectable(&crate::utilities::items()),
                 };
             }
+            ExtendCommandSelection(delta) => self.extend_command_selection(delta),
+            ExtendCommandSelectionToStart => self.set_command_selection_head(0),
+            ExtendCommandSelectionToEnd => {
+                let end = self.ses().command_line.chars().count();
+                self.set_command_selection_head(end);
+            }
             ClipboardCopy => self.copy_selection(),
             ClipboardPaste => self.paste_into_shell(),
             Refresh => self.reload(self.ses().active),
@@ -806,11 +819,22 @@ impl App {
 
             Quit => self.should_quit = true,
 
-            CommandChar(c) => self.ses_mut().command_line.push(c),
+            // Typing replaces a selection the way every editor does, rather
+            // than appending past it and leaving a highlight over stale text.
+            CommandChar(c) => {
+                self.take_command_selection();
+                self.ses_mut().command_line.push(c);
+            }
+            CommandBackspace if self.command_selection.is_some() => {
+                self.take_command_selection();
+            }
             CommandBackspace => {
                 self.ses_mut().command_line.pop();
             }
-            CommandClear => self.ses_mut().command_line.clear(),
+            CommandClear => {
+                self.command_selection = None;
+                self.ses_mut().command_line.clear();
+            }
             CommandSubmit => self.run_command(),
 
             QuickSearch(c) => self.quick_search(c),
@@ -1171,18 +1195,74 @@ impl App {
         }
     }
 
+    /// Remove the selected text from the command line, if any, and forget the
+    /// selection. Returns whether anything was removed.
+    fn take_command_selection(&mut self) -> bool {
+        let Some((lo, hi)) = self.command_selection_span() else {
+            return false;
+        };
+        let line = &self.ses().command_line;
+        let kept: String = line
+            .chars()
+            .enumerate()
+            .filter(|(i, _)| *i < lo || *i >= hi)
+            .map(|(_, c)| c)
+            .collect();
+        self.ses_mut().command_line = kept;
+        self.command_selection = None;
+        true
+    }
+
+    /// Grow or shrink the command-line selection by characters.
+    fn extend_command_selection(&mut self, delta: isize) {
+        let len = self.ses().command_line.chars().count();
+        let head = match self.command_selection {
+            Some((_, head)) => head,
+            // No gesture yet: the caret sits at the end of what is typed, which
+            // is the only place it can be — there is nowhere else to put it.
+            None => len,
+        };
+        let next = head.saturating_add_signed(delta).min(len);
+        self.set_command_selection_head(next);
+    }
+
+    fn set_command_selection_head(&mut self, head: usize) {
+        let len = self.ses().command_line.chars().count();
+        let head = head.min(len);
+        let anchor = self.command_selection.map_or(len, |(a, _)| a).min(len);
+        // Back at the anchor is no selection at all, rather than an empty one:
+        // an empty selection would make Copy replace the clipboard with nothing.
+        self.command_selection = (anchor != head).then_some((anchor, head));
+    }
+
+    /// The selected text on the command line, in reading order.
+    pub(crate) fn command_selection_text(&self) -> Option<String> {
+        let (a, b) = self.command_selection?;
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        let line = &self.ses().command_line;
+        Some(line.chars().skip(lo).take(hi - lo).collect())
+    }
+
+    /// The selected span as char offsets, low first, for the renderer.
+    pub(crate) fn command_selection_span(&self) -> Option<(usize, usize)> {
+        let (a, b) = self.command_selection?;
+        Some(if a <= b { (a, b) } else { (b, a) })
+    }
+
     /// Put the selection on the clipboard — the shell's, or the command line.
     fn copy_selection(&mut self) {
+        // A deliberate selection first, whichever it is, then the whole command
+        // line as the obvious fallback.
         let text = match self.shell_selection.zip(self.ses().hosted()) {
             Some((sel, sh)) => sel.text(sh),
-            // Nothing selected on a shell screen: the command line is the other
-            // thing on screen worth copying, and copying it is more useful than
-            // saying no.
-            None if !self.ses().command_line.is_empty() => self.ses().command_line.clone(),
-            None => {
-                self.status = "nothing to copy".into();
-                return;
-            }
+            None => match self.command_selection_text() {
+                Some(t) => t,
+                None if !self.ses().command_line.is_empty() => self.ses().command_line.clone(),
+                None => {
+                    self.status = "nothing to copy".into();
+                    return;
+                }
+            },
         };
         if text.trim().is_empty() {
             self.status = "nothing selected".into();
@@ -3264,6 +3344,137 @@ mod tests {
             app.sessions.current().id,
             before,
             "Ctrl-Tab did not leave the session"
+        );
+    }
+
+    /// A selection you cannot see is one you cannot trust, and this one decides
+    /// what Copy puts on the clipboard.
+    #[test]
+    fn the_command_line_selection_is_drawn_inverted() {
+        let mut app = fixture();
+        app.ses_mut().focus = Focus::CommandLine;
+        for c in "echo ciao".chars() {
+            app.handle(Action::CommandChar(c));
+        }
+        for _ in 0..4 {
+            app.handle(Action::ExtendCommandSelection(-1));
+        }
+        assert_eq!(app.command_selection_text().as_deref(), Some("ciao"));
+
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let inverted: String = (0..80)
+            .map(|x| buf[(x, 22)].clone())
+            .filter(|c| {
+                c.style()
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::REVERSED)
+            })
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert_eq!(inverted, "ciao", "the highlight is on the wrong characters");
+    }
+
+    /// Shift+Left then Shift+Right lands back where it started, and back at the
+    /// anchor is no selection rather than an empty one — an empty selection
+    /// would make Copy replace the clipboard with nothing.
+    #[test]
+    fn coming_back_to_the_anchor_clears_the_selection() {
+        let mut app = fixture();
+        app.ses_mut().focus = Focus::CommandLine;
+        for c in "abc".chars() {
+            app.handle(Action::CommandChar(c));
+        }
+        app.handle(Action::ExtendCommandSelection(-1));
+        assert_eq!(app.command_selection_text().as_deref(), Some("c"));
+        app.handle(Action::ExtendCommandSelection(1));
+        assert!(app.command_selection.is_none());
+        assert!(app.command_selection_text().is_none());
+    }
+
+    #[test]
+    fn selecting_to_the_start_takes_the_whole_line() {
+        let mut app = fixture();
+        app.ses_mut().focus = Focus::CommandLine;
+        for c in "ls -la".chars() {
+            app.handle(Action::CommandChar(c));
+        }
+        app.handle(Action::ExtendCommandSelectionToStart);
+        assert_eq!(app.command_selection_text().as_deref(), Some("ls -la"));
+    }
+
+    /// Typing over a selection replaces it, as in every editor. Appending past
+    /// it would leave a highlight sitting over text that is no longer selected.
+    #[test]
+    fn typing_replaces_what_was_selected() {
+        let mut app = fixture();
+        app.ses_mut().focus = Focus::CommandLine;
+        for c in "echo ciao".chars() {
+            app.handle(Action::CommandChar(c));
+        }
+        for _ in 0..4 {
+            app.handle(Action::ExtendCommandSelection(-1));
+        }
+        app.handle(Action::CommandChar('x'));
+        assert_eq!(app.ses().command_line, "echo x");
+        assert!(app.command_selection.is_none());
+    }
+
+    /// Backspace on a selection deletes the selection, not the character before
+    /// it — deleting one character out of five the user asked to remove is the
+    /// kind of wrong that is only noticed afterwards.
+    #[test]
+    fn backspace_deletes_the_selection() {
+        let mut app = fixture();
+        app.ses_mut().focus = Focus::CommandLine;
+        for c in "rm -rf tmp".chars() {
+            app.handle(Action::CommandChar(c));
+        }
+        for _ in 0..3 {
+            app.handle(Action::ExtendCommandSelection(-1));
+        }
+        app.handle(Action::CommandBackspace);
+        assert_eq!(app.ses().command_line, "rm -rf ");
+    }
+
+    /// Char offsets, not byte offsets: slicing a multi-byte character down the
+    /// middle panics rather than misbehaving quietly.
+    #[test]
+    fn selection_offsets_survive_multibyte_text() {
+        let mut app = fixture();
+        app.ses_mut().focus = Focus::CommandLine;
+        for c in "echo 日本語".chars() {
+            app.handle(Action::CommandChar(c));
+        }
+        for _ in 0..3 {
+            app.handle(Action::ExtendCommandSelection(-1));
+        }
+        assert_eq!(app.command_selection_text().as_deref(), Some("日本語"));
+        app.handle(Action::CommandBackspace);
+        assert_eq!(app.ses().command_line, "echo ");
+    }
+
+    /// Shift+Left has to mean the command line, not the panel selection.
+    #[test]
+    fn shift_left_and_right_are_the_command_line_selection() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        for (code, want) in [
+            (KeyCode::Left, Action::ExtendCommandSelection(-1)),
+            (KeyCode::Right, Action::ExtendCommandSelection(1)),
+        ] {
+            assert_eq!(
+                keymap::resolve(KeyEvent::new(code, KeyModifiers::SHIFT), Focus::CommandLine),
+                Some(want)
+            );
+        }
+        // Shift+Home still belongs to the panel when a panel has the keyboard.
+        assert_eq!(
+            keymap::resolve(
+                KeyEvent::new(KeyCode::Home, KeyModifiers::SHIFT),
+                Focus::Panel
+            ),
+            Some(Action::ExtendSelectionToTop)
         );
     }
 }

@@ -224,21 +224,41 @@ fn draw_command_line(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) 
     let focused = app.ses().focus == crate::app::Focus::CommandLine;
 
     let prompt = format!("{}> ", short_path(&app.cwd_display(app.ses().active)));
-    let mut spans = vec![
-        Span::styled(
-            prompt.clone(),
-            if focused {
-                // The prompt brightens when it has the keyboard: a second cue
-                // for anyone who cannot see the cursor blink.
-                Style::default()
-                    .fg(theme.selected_fg)
-                    .add_modifier(ratatui::style::Modifier::BOLD)
-            } else {
-                Style::default().fg(theme.status_fg)
-            },
-        ),
-        Span::raw(app.ses().command_line.as_str()),
-    ];
+    let mut spans = vec![Span::styled(
+        prompt.clone(),
+        if focused {
+            // The prompt brightens when it has the keyboard: a second cue
+            // for anyone who cannot see the cursor blink.
+            Style::default()
+                .fg(theme.selected_fg)
+                .add_modifier(ratatui::style::Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.status_fg)
+        },
+    )];
+
+    // Split the typed text around the selection so it is visible for what it
+    // is. A selection you cannot see is one you cannot trust, and this one
+    // decides what Copy puts on the clipboard.
+    let line = app.ses().command_line.as_str();
+    match app.command_selection_span() {
+        Some((lo, hi)) => {
+            let take = |from: usize, to: usize| -> String {
+                line.chars()
+                    .skip(from)
+                    .take(to.saturating_sub(from))
+                    .collect()
+            };
+            let end = line.chars().count();
+            spans.push(Span::raw(take(0, lo)));
+            spans.push(Span::styled(
+                take(lo, hi),
+                Style::default().add_modifier(ratatui::style::Modifier::REVERSED),
+            ));
+            spans.push(Span::raw(take(hi, end)));
+        }
+        None => spans.push(Span::raw(line.to_string())),
+    }
 
     if !app.status.is_empty() {
         spans.push(Span::raw("  "));

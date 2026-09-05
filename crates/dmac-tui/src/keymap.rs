@@ -51,6 +51,18 @@ pub fn resolve(key: KeyEvent, focus: Focus) -> Option<Action> {
         (F(9), _, _) => Action::Menu,
         (F(10), _, _) => Action::Quit,
 
+        // --- Shift+cursor on the command line selects text there. Left and
+        //     Right are free everywhere else, so only Home and End have to ask
+        //     where the keyboard is. ---
+        (Left, false, false) if shift => Action::ExtendCommandSelection(-1),
+        (Right, false, false) if shift => Action::ExtendCommandSelection(1),
+        (KeyCode::Home, false, false) if shift && focus == Focus::CommandLine => {
+            Action::ExtendCommandSelectionToStart
+        }
+        (KeyCode::End, false, false) if shift && focus == Focus::CommandLine => {
+            Action::ExtendCommandSelectionToEnd
+        }
+
         // --- Shift+cursor: anchored multi-selection. Must precede the plain
         //     navigation arms below, or they shadow it. ---
         (Up, false, false) if shift => Action::ExtendSelection(-1),
