@@ -141,6 +141,19 @@ pub fn resolve(key: KeyEvent, focus: Focus) -> Option<Action> {
         //     two send plain Ctrl-C, which goes to the child, as it must.
         (Char(c), true, false) if shift && c.eq_ignore_ascii_case(&'c') => Action::ClipboardCopy,
         (Char(c), true, false) if shift && c.eq_ignore_ascii_case(&'v') => Action::ClipboardPaste,
+        // Cmd-C and Cmd-V, for terminals that forward the Command key rather
+        // than keeping it. Most keep it — and when they do, their own paste
+        // arrives as a bracketed paste event instead, which is handled too.
+        (Char(c), _, _)
+            if key.modifiers.contains(KeyModifiers::SUPER) && c.eq_ignore_ascii_case(&'c') =>
+        {
+            Action::ClipboardCopy
+        }
+        (Char(c), _, _)
+            if key.modifiers.contains(KeyModifiers::SUPER) && c.eq_ignore_ascii_case(&'v') =>
+        {
+            Action::ClipboardPaste
+        }
         (Insert, true, false) => Action::ClipboardCopy,
         (Insert, false, false) if shift => Action::ClipboardPaste,
 

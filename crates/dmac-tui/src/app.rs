@@ -1347,13 +1347,28 @@ impl App {
 
     /// Paste the clipboard wherever the keyboard is.
     fn paste_into_shell(&mut self) {
-        let text = match dmac_core::clipboard::text() {
-            Ok(t) => t,
-            Err(e) => {
-                self.status = format!("nothing to paste: {e}");
-                return;
-            }
-        };
+        match dmac_core::clipboard::text() {
+            Ok(t) => self.paste_text(&t),
+            Err(e) => self.status = format!("nothing to paste: {e}"),
+        }
+    }
+
+    /// Put `text` wherever the keyboard is.
+    ///
+    /// Shared by the binding and by the terminal's own paste, so both land in
+    /// the same place and behave the same way — a paste that meant something
+    /// different depending on which key produced it would be worse than one
+    /// that only worked sometimes.
+    fn paste_text(&mut self, text: &str) {
+        let text = text.to_string();
+        if text.is_empty() {
+            return;
+        }
+        // A screensaver or a menu is not a place to paste into; the keystroke
+        // that woke it has already been consumed by dismissing it.
+        if self.screensaver.is_active() || self.mode != Mode::Normal {
+            return;
+        }
         // On the panels there is no child to send bytes to, so it goes on the
         // command line — which is where you were about to type it anyway.
         // Refusing to paste unless a shell happens to be showing is not a
@@ -1677,6 +1692,13 @@ impl App {
         match ev {
             Event::Key(k) if k.kind == KeyEventKind::Press => self.on_key(k),
             Event::Mouse(m) => self.on_mouse(m),
+            // The terminal's own paste. DMACommander asks for bracketed paste
+            // at startup, so Cmd-V, Ctrl-Shift-V and a middle click all arrive
+            // here as one event rather than as a burst of keystrokes — and
+            // dropping it, which is what used to happen, is the whole of "paste
+            // does not work": the user presses the key their terminal handles,
+            // and nothing at all comes out.
+            Event::Paste(text) => self.paste_text(&text),
             // A resize is picked up by the next draw; a focus change counts as
             // activity so the screensaver does not start under a window the user
             // is actively looking at.
@@ -3586,6 +3608,65 @@ mod tests {
                 Focus::Panel
             ),
             Some(Action::ExtendSelectionToTop)
+        );
+    }
+
+    /// The terminal's own paste — Cmd-V in most terminals — arrives as one
+    /// event, not as keystrokes. Dropping it, which is what used to happen, is
+    /// the whole of "paste does not work": the key the terminal handles
+    /// produces nothing at all.
+    #[test]
+    fn the_terminals_own_paste_reaches_the_command_line() {
+        use ratatui::crossterm::event::Event;
+        let mut app = fixture();
+        app.ses_mut().focus = Focus::CommandLine;
+        app.on_input(Event::Paste("echo pasted".into()));
+        assert_eq!(app.ses().command_line, "echo pasted");
+    }
+
+    /// A paste is text, not a decision to run three commands.
+    #[test]
+    fn a_multi_line_paste_arrives_as_one_line() {
+        use ratatui::crossterm::event::Event;
+        let mut app = fixture();
+        app.ses_mut().focus = Focus::CommandLine;
+        app.on_input(Event::Paste("one\ntwo\r\nthree\n".into()));
+        assert_eq!(app.ses().command_line, "one two three");
+        assert!(!app.ses().command_line.contains('\n'));
+    }
+
+    /// A menu is not a place to paste into, and the keystroke that opened it
+    /// has already been spent.
+    #[test]
+    fn a_paste_into_a_menu_is_ignored() {
+        use ratatui::crossterm::event::Event;
+        let mut app = fixture();
+        app.handle(Action::UtilitiesMenu);
+        app.on_input(Event::Paste("nonsense".into()));
+        assert_eq!(app.ses().command_line, "");
+    }
+
+    /// Cmd-C and Cmd-V for terminals that forward the Command key rather than
+    /// keeping it — which is most of what people press on a Mac.
+    #[test]
+    fn the_command_key_copies_and_pastes() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let cmd = KeyModifiers::SUPER;
+        assert_eq!(
+            keymap::resolve(KeyEvent::new(KeyCode::Char('c'), cmd), Focus::CommandLine),
+            Some(Action::ClipboardCopy)
+        );
+        assert_eq!(
+            keymap::resolve(KeyEvent::new(KeyCode::Char('v'), cmd), Focus::CommandLine),
+            Some(Action::ClipboardPaste)
+        );
+        // Without the Command key, `v` is still just a character to type.
+        assert_eq!(
+            keymap::resolve(
+                KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+                Focus::CommandLine
+            ),
+            Some(Action::CommandChar('v'))
         );
     }
 }

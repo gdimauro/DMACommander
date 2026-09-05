@@ -257,7 +257,7 @@ fn shim_script(a: &Attach, real: &Path, conversation: &str, marker: &Path) -> St
         r#"#!/bin/sh
 # Written by DMACommander. Every `{program}` started from this session joins the
 # same conversation, so closing DMACommander and coming back reopens it where it
-# was. Delete this file's marker to start a fresh conversation:
+# was. To start a fresh conversation instead:
 #   rm '{marker}'
 #
 # An explicit choice on the command line always wins; this only fills in a gap.
@@ -266,7 +266,13 @@ for arg in "$@"; do
     {explicit}) exec '{real}' "$@" ;;
   esac
 done
-if [ -e '{marker}' ]; then
+# Ask {program}'s own store whether this conversation exists, and fall back to
+# our marker only if that store is not where we expect. Trusting the marker
+# alone is what produces "Session ID ... is already in use": the conversation
+# outlives the marker whenever the marker is cleaned up, moved, or never
+# written because the first run was killed before it got that far.
+existing=$(ls "$HOME"/.claude/projects/*/'{conversation}'.jsonl 2>/dev/null | head -1)
+if [ -n "$existing" ] || [ -e '{marker}' ]; then
   exec '{real}' {resume_flag} '{conversation}' "$@"
 fi
 : > '{marker}'
@@ -355,6 +361,24 @@ mod tests {
         );
         assert!(s.contains("'/opt/my tools/claude'"), "{s}");
         assert!(s.contains("'/tmp/my markers/m'"), "{s}");
+    }
+
+    /// The conversation outlives our marker — it is cleaned up, moved, or never
+    /// written because a first run was killed early — and asking for it with
+    /// --session-id then fails with "already in use". The agent's own store is
+    /// the thing that actually knows.
+    #[test]
+    fn the_shim_asks_the_agent_store_not_just_its_own_marker() {
+        let s = shim_script(
+            claude(),
+            Path::new("/usr/local/bin/claude"),
+            "abcd-1234",
+            Path::new("/tmp/m"),
+        );
+        assert!(s.contains(".claude/projects/"), "{s}");
+        assert!(s.contains("'abcd-1234'.jsonl"), "{s}");
+        // And the marker is still consulted, for a store that is not there.
+        assert!(s.contains("[ -e '/tmp/m' ]"), "{s}");
     }
 
     #[test]
