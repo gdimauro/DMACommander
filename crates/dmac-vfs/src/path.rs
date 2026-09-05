@@ -82,10 +82,19 @@ impl VfsPath {
 
     /// Go up one level. `None` at the root, which is how the panel knows not to
     /// show a `..` row.
+    ///
+    /// A relative path with a single component has an *empty* parent according
+    /// to `Path`, and an empty path is not a directory anyone can list. Treating
+    /// that as "no parent" is what stops `..` from navigating into nothing —
+    /// which it did, leaving a blank panel with no way back.
     pub fn parent(&self) -> Option<Self> {
-        self.inner.parent().map(|p| Self {
+        let parent = self.inner.parent()?;
+        if parent.as_os_str().is_empty() {
+            return None;
+        }
+        Some(Self {
             scheme: self.scheme.clone(),
-            inner: p.to_path_buf(),
+            inner: parent.to_path_buf(),
         })
     }
 
@@ -142,6 +151,16 @@ mod tests {
         p = p.parent().unwrap();
         assert_eq!(p.as_path(), Path::new("/"));
         assert!(p.parent().is_none(), "root has no parent");
+    }
+
+    /// `Path::parent` of a one-component relative path is the empty path, which
+    /// is not a directory. Navigating there left a blank panel with no way out.
+    #[test]
+    fn a_relative_path_does_not_have_an_empty_parent() {
+        assert!(VfsPath::local("docs").parent().is_none());
+        assert!(VfsPath::local("a").parent().is_none());
+        let nested = VfsPath::local("a/b");
+        assert_eq!(nested.parent().unwrap().as_path(), Path::new("a"));
     }
 
     #[test]

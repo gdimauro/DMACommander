@@ -11,10 +11,10 @@ use crate::{keymap, ui};
 use dmac_core::{Panel, PanelId, SortOrder};
 use dmac_fx::{Canvas, EffectKey, Screensaver, ScreensaverConfig, Wake};
 pub use dmac_session::Focus;
-use dmac_session::{Session, SessionManager, View};
+use dmac_session::{Session, SessionId, SessionManager, View};
 use dmac_vfs::{BackendRef, ListChunk, VfsPath, local::LocalBackend};
 use ratatui::crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::Rect;
 use std::sync::Arc;
@@ -24,6 +24,13 @@ use tokio::sync::mpsc;
 enum Update {
     /// A slice of a directory listing arrived.
     Entries {
+        /// Which session asked for it.
+        ///
+        /// Routing by panel alone is not enough: sessions each have their own
+        /// generation counter, so a stale result from one session can carry a
+        /// generation that happens to match another's and be painted into the
+        /// wrong workspace. This was doing exactly that.
+        session: SessionId,
         panel: PanelId,
         /// Discarded if it does not match the panel's current generation — the
         /// user may have navigated away while the walk was in flight.
@@ -31,6 +38,7 @@ enum Update {
         chunk: ListChunk,
     },
     Error {
+        session: SessionId,
         panel: PanelId,
         message: String,
     },
@@ -49,6 +57,31 @@ pub(crate) enum Mode {
         selected: usize,
         anchor: (u16, u16),
     },
+    /// The session rail has the keyboard: it is a manager, not just a display.
+    Rail {
+        selected: usize,
+    },
+    /// A single-line text prompt.
+    Prompt {
+        intent: PromptIntent,
+    },
+}
+
+/// What a prompt is collecting. The value itself lives on `App`, because a
+/// `Mode` is `Copy` and a growing string is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptIntent {
+    RenameSession(usize),
+    NewSession,
+}
+
+impl PromptIntent {
+    pub(crate) fn title(self) -> &'static str {
+        match self {
+            PromptIntent::RenameSession(_) => " Rename session ",
+            PromptIntent::NewSession => " New session ",
+        }
+    }
 }
 
 /// A left-button drag in progress: the row it started on, so the swept range is
@@ -88,6 +121,8 @@ pub struct App {
     /// Whether the session rail is expanded. Collapsed it is a narrow strip, so
     /// you can always see how many sessions you have without opening anything.
     pub(crate) rail_open: bool,
+    /// Text being typed into the current prompt.
+    pub(crate) prompt_value: String,
     pub(crate) cursor_style: CursorStyle,
     /// When the software cursor last flipped. Only used in `Software` mode.
     cursor_phase: std::time::Instant,
@@ -133,6 +168,7 @@ impl App {
         Self {
             sessions: SessionManager::new(session_name, left, right),
             rail_open: false,
+            prompt_value: String::new(),
             cursor_style: cursor,
             cursor_phase: std::time::Instant::now(),
             theme: Theme::default(),
@@ -243,6 +279,7 @@ impl App {
         self.ses_mut().generation[i] += 1;
         let generation = self.ses().generation[i];
         let path = self.ses().cwd[i].clone();
+        let session = self.ses().id;
         let backend = Arc::clone(&self.backend);
         let tx = self.tx.clone();
 
@@ -263,6 +300,7 @@ impl App {
                         Ok(chunk) => {
                             if tx
                                 .send(Update::Entries {
+                                    session,
                                     panel: id,
                                     generation,
                                     chunk,
@@ -274,6 +312,7 @@ impl App {
                         }
                         Err(e) => {
                             let _ = tx.send(Update::Error {
+                                session,
                                 panel: id,
                                 message: e.to_string(),
                             });
@@ -284,6 +323,7 @@ impl App {
             let (walk_result, ()) = tokio::join!(walk, pump);
             if let Err(e) = walk_result {
                 let _ = tx.send(Update::Error {
+                    session,
                     panel: id,
                     message: e.to_string(),
                 });
@@ -294,22 +334,36 @@ impl App {
     fn apply(&mut self, update: Update) {
         match update {
             Update::Entries {
+                session,
                 panel,
                 generation,
                 chunk,
             } => {
+                // Deliver to the session that asked, wherever it is in the list —
+                // not to whichever session happens to be on screen now.
+                let Some(target) = self.sessions.index_of_id(session) else {
+                    return; // its session was closed while the walk was running
+                };
                 let i = Self::idx(panel);
-                // Stale result from a directory the user already left.
-                if generation != self.ses().generation[i] {
+                // Stale result from a directory that session already left.
+                if generation != self.sessions.all()[target].generation[i] {
                     return;
                 }
-                let p = &mut self.ses_mut().panels[i];
+                let p = &mut self.sessions.at_mut(target).panels[i];
                 p.entries.extend(chunk.entries);
                 if chunk.complete {
                     p.resort();
                 }
             }
-            Update::Error { panel, message } => {
+            Update::Error {
+                session,
+                panel,
+                message,
+            } => {
+                // Only worth reporting if the user can see that session.
+                if self.ses().id != session {
+                    return;
+                }
                 // Name the panel: with two of them, "permission denied" alone
                 // leaves the user guessing which side failed.
                 let side = match panel {
@@ -372,7 +426,20 @@ impl App {
             }
 
             // --- sessions ---
-            ToggleRail => self.rail_open = !self.rail_open,
+            // Opening the rail hands it the keyboard: a list you can see but
+            // not drive is a worse version of one you cannot see.
+            ToggleRail => {
+                if self.rail_open {
+                    self.close_rail();
+                } else {
+                    self.rail_open = true;
+                    self.mode = Mode::Rail {
+                        selected: self.sessions.current_index(),
+                    };
+                    self.status =
+                        "sessions: enter switch \u{b7} n new \u{b7} r rename \u{b7} d close".into();
+                }
+            }
 
             SwitchSession(index) => {
                 if self.sessions.switch_to(index) {
@@ -512,6 +579,125 @@ impl App {
         }
     }
 
+    fn close_rail(&mut self) {
+        self.rail_open = false;
+        if matches!(self.mode, Mode::Rail { .. }) {
+            self.mode = Mode::Normal;
+        }
+        self.status.clear();
+    }
+
+    /// The rail as a manager: navigate, switch, create, rename, close.
+    fn rail_key(&mut self, k: KeyEvent, selected: usize) {
+        let n = self.sessions.len();
+        match k.code {
+            KeyCode::Esc => self.close_rail(),
+            KeyCode::Up => {
+                self.mode = Mode::Rail {
+                    selected: (selected + n - 1) % n,
+                }
+            }
+            KeyCode::Down => {
+                self.mode = Mode::Rail {
+                    selected: (selected + 1) % n,
+                }
+            }
+            KeyCode::Enter => {
+                if self.sessions.switch_to(selected) {
+                    self.after_session_switch();
+                }
+                self.close_rail();
+            }
+            KeyCode::Char('n') => self.open_prompt(PromptIntent::NewSession, String::new()),
+            KeyCode::Char('r') => {
+                let current = self
+                    .sessions
+                    .get(selected)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_default();
+                self.open_prompt(PromptIntent::RenameSession(selected), current);
+            }
+            KeyCode::Char('d') | KeyCode::Delete => match self.sessions.close(selected) {
+                Ok(()) => {
+                    let keep = selected.min(self.sessions.len() - 1);
+                    self.mode = Mode::Rail { selected: keep };
+                    self.after_session_switch();
+                    self.status = format!("session closed \u{2014} {} left", self.sessions.len());
+                }
+                // Quitting is a different action with a different confirmation.
+                Err(e) => self.status = format!("{e} (F10 quits)"),
+            },
+            // Bare digits while the rail has focus: the numbers are on screen
+            // right there, so demanding a modifier would be perverse.
+            KeyCode::Char(c @ '1'..='9') => {
+                let i = c.to_digit(10).unwrap_or(1) as usize - 1;
+                if self.sessions.switch_to(i) {
+                    self.after_session_switch();
+                }
+                self.close_rail();
+            }
+            _ => {}
+        }
+    }
+
+    fn open_prompt(&mut self, intent: PromptIntent, initial: String) {
+        self.prompt_value = initial;
+        self.mode = Mode::Prompt { intent };
+    }
+
+    fn prompt_key(&mut self, k: KeyEvent, intent: PromptIntent) {
+        match k.code {
+            KeyCode::Esc => {
+                self.prompt_value.clear();
+                // Back to the rail, not out to the panels: the prompt was opened
+                // from there, and Esc means one level back.
+                self.mode = Mode::Rail {
+                    selected: self.sessions.current_index(),
+                };
+            }
+            KeyCode::Backspace => {
+                self.prompt_value.pop();
+            }
+            KeyCode::Enter => self.submit_prompt(intent),
+            KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.prompt_value.push(c)
+            }
+            _ => {}
+        }
+    }
+
+    fn submit_prompt(&mut self, intent: PromptIntent) {
+        let value = std::mem::take(&mut self.prompt_value);
+        match intent {
+            PromptIntent::RenameSession(index) => match self.sessions.rename(index, &value) {
+                Ok(()) => {
+                    self.mode = Mode::Rail { selected: index };
+                    self.status = format!("renamed to {}", value.trim());
+                }
+                // Stay in the prompt with the text intact, so a rejected name can
+                // be corrected rather than retyped.
+                Err(e) => {
+                    self.prompt_value = value;
+                    self.status = e.to_string();
+                }
+            },
+            PromptIntent::NewSession => {
+                let name = if value.trim().is_empty() {
+                    self.sessions.unused_name()
+                } else {
+                    value.trim().to_string()
+                };
+                let left = self.ses().cwd[0].clone();
+                let right = self.ses().cwd[1].clone();
+                let i = self.sessions.create(name, left, right);
+                self.reload(PanelId::Left);
+                self.reload(PanelId::Right);
+                self.mode = Mode::Rail { selected: i };
+                self.after_session_switch();
+            }
+        }
+    }
+
     /// The area the shell is drawn in, in cells. Recorded by the renderer, so
     /// the PTY is always exactly the size of what the user can see.
     fn shell_size(&self) -> (u16, u16) {
@@ -593,7 +779,13 @@ impl App {
     /// belonged to the session we just left is cleared.
     fn after_session_switch(&mut self) {
         self.quick_search.clear();
-        self.mode = Mode::Normal;
+        // Close an overlay that belonged to the session we left — but not the
+        // rail, which is how you got here and where you still are. Clobbering it
+        // silently dropped the keyboard back to the panels, so the next
+        // keystrokes landed on files instead of on the session list.
+        if !matches!(self.mode, Mode::Rail { .. } | Mode::Prompt { .. }) {
+            self.mode = Mode::Normal;
+        }
         self.drag = None;
         self.last_click = None;
         self.status = format!(
@@ -772,6 +964,8 @@ impl App {
         match self.mode {
             Mode::Picker { selected } => return self.picker_key(k, selected),
             Mode::Context { selected, anchor } => return self.context_key(k, selected, anchor),
+            Mode::Rail { selected } => return self.rail_key(k, selected),
+            Mode::Prompt { intent } => return self.prompt_key(k, intent),
             Mode::Normal => {}
         }
 

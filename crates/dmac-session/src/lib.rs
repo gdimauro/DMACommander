@@ -228,6 +228,19 @@ impl SessionManager {
         self.sessions.get(index)
     }
 
+    /// Where a session lives now. Positions shift as sessions are closed, so
+    /// anything holding on to a session across time must go through its id.
+    pub fn index_of_id(&self, id: SessionId) -> Option<usize> {
+        self.sessions.iter().position(|s| s.id == id)
+    }
+
+    /// Mutable access by position, for delivering work to a session that is not
+    /// the one on screen.
+    pub fn at_mut(&mut self, index: usize) -> &mut Session {
+        let i = index.min(self.sessions.len() - 1);
+        &mut self.sessions[i]
+    }
+
     /// Switch by position. Out-of-range is ignored rather than clamped: a stray
     /// `Alt-7` with three sessions open should do nothing, not jump to the last.
     pub fn switch_to(&mut self, index: usize) -> bool {
@@ -273,6 +286,30 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Rename a session. An empty or duplicate name is refused rather than
+    /// accepted, because the rail identifies sessions by name.
+    pub fn rename(&mut self, index: usize, name: &str) -> Result<(), RenameError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(RenameError::Empty);
+        }
+        if self
+            .sessions
+            .iter()
+            .enumerate()
+            .any(|(i, s)| i != index && s.name == name)
+        {
+            return Err(RenameError::Taken);
+        }
+        match self.sessions.get_mut(index) {
+            Some(s) => {
+                s.name = name.to_string();
+                Ok(())
+            }
+            None => Err(RenameError::NoSuchSession),
+        }
+    }
+
     /// A name not already taken, for a session created without one.
     pub fn unused_name(&self) -> String {
         for n in 1..=999 {
@@ -283,6 +320,16 @@ impl SessionManager {
         }
         format!("session {}", self.next_id)
     }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum RenameError {
+    #[error("a session needs a name")]
+    Empty,
+    #[error("another session already has that name")]
+    Taken,
+    #[error("no such session")]
+    NoSuchSession,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -407,6 +454,52 @@ mod tests {
         let mut m = mgr();
         m.create("b", VfsPath::local("/"), VfsPath::local("/"));
         assert_eq!(m.close(9), Err(CloseError::NoSuchSession));
+    }
+
+    /// Positions shift when a session closes, so anything held across time has
+    /// to be an id.
+    #[test]
+    fn a_session_is_found_by_id_after_the_list_shifts() {
+        let mut m = mgr();
+        m.create("b", VfsPath::local("/"), VfsPath::local("/"));
+        m.create("c", VfsPath::local("/"), VfsPath::local("/"));
+        let id_c = m.all()[2].id;
+        assert_eq!(m.index_of_id(id_c), Some(2));
+        m.close(0).expect("closable");
+        assert_eq!(
+            m.index_of_id(id_c),
+            Some(1),
+            "the id must survive the shift"
+        );
+    }
+
+    #[test]
+    fn an_id_from_a_closed_session_resolves_to_nothing() {
+        let mut m = mgr();
+        m.create("b", VfsPath::local("/"), VfsPath::local("/"));
+        let id = m.all()[1].id;
+        m.close(1).expect("closable");
+        assert_eq!(m.index_of_id(id), None);
+    }
+
+    #[test]
+    fn renaming_rejects_empty_and_duplicate_names() {
+        let mut m = mgr();
+        m.create("other", VfsPath::local("/"), VfsPath::local("/"));
+        assert_eq!(m.rename(1, "   "), Err(RenameError::Empty));
+        assert_eq!(m.rename(1, "work"), Err(RenameError::Taken));
+        assert_eq!(m.rename(1, "  build  "), Ok(()));
+        assert_eq!(m.all()[1].name, "build", "the name is trimmed");
+    }
+
+    #[test]
+    fn a_session_can_keep_its_own_name() {
+        let mut m = mgr();
+        assert_eq!(
+            m.rename(0, "work"),
+            Ok(()),
+            "renaming to itself is not a clash"
+        );
     }
 
     #[test]

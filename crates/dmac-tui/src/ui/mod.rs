@@ -6,6 +6,7 @@ mod fkeybar;
 pub(crate) mod menu;
 mod panel;
 pub(crate) mod picker;
+pub(crate) mod prompt;
 pub(crate) mod rail;
 mod screen;
 pub(crate) mod shell;
@@ -54,7 +55,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     // The rail reads *every* session, so it is drawn first, from a shared
     // borrow — before the current session is borrowed mutably below.
-    app.layout.rail = rail::draw(frame, body[0], &app.sessions, rail_open, &app.theme);
+    // While the rail is being driven, the highlight is where the keyboard is —
+    // which may be a session you have not switched to yet.
+    let rail_cursor = match app.mode {
+        crate::app::Mode::Rail { selected } => Some(selected),
+        _ => None,
+    };
+    app.layout.rail = rail::draw(
+        frame,
+        body[0],
+        &app.sessions,
+        rail_open,
+        rail_cursor,
+        &app.theme,
+    );
 
     // Split the borrow: the current session's panels are drawn mutably (they
     // record their viewport height) while the theme is read.
@@ -117,7 +131,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             let items = app.context_items();
             app.layout.menu = menu::draw(frame, area, anchor, &items, selected, &app.theme);
         }
-        crate::app::Mode::Normal => {
+        crate::app::Mode::Prompt { intent } => {
+            prompt::draw(frame, area, intent.title(), &app.prompt_value, &app.theme);
+        }
+        crate::app::Mode::Rail { .. } | crate::app::Mode::Normal => {
             app.layout.picker = ratatui::layout::Rect::default();
             app.layout.menu = ratatui::layout::Rect::default();
         }

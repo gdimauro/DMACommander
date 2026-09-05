@@ -82,11 +82,15 @@ fn scroll_offset(sessions: &SessionManager, height: u16, open: bool) -> usize {
     }
 }
 
+/// `highlight` is the row the keyboard is on while the rail is being driven,
+/// which is not the same as the session on screen — you can move the cursor
+/// over a session without switching to it, exactly as in any list.
 pub fn draw(
     frame: &mut Frame,
     area: Rect,
     sessions: &SessionManager,
     open: bool,
+    highlight: Option<usize>,
     theme: &Theme,
 ) -> Rect {
     if area.width == 0 || area.height == 0 {
@@ -129,7 +133,10 @@ pub fn draw(
             continue;
         }
 
-        let name_style = if is_current {
+        let on_cursor = highlight == Some(i);
+        let name_style = if on_cursor {
+            theme.cursor()
+        } else if is_current {
             Style::default()
                 .fg(theme.selected_fg)
                 .bg(theme.panel_bg)
@@ -278,6 +285,30 @@ mod tests {
         assert_eq!(session_at_row(&m, area, true, 99), None);
     }
 
+    /// The keyboard highlight is independent of which session is on screen:
+    /// you move over a session before deciding to switch to it.
+    #[test]
+    fn the_highlight_is_independent_of_the_live_session() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        // `create` switches to the new session, so start from a known place.
+        let mut m = mgr(4);
+        m.switch_to(0);
+        let theme = Theme::norton();
+        let mut term = Terminal::new(TestBackend::new(EXPANDED_WIDTH, 14)).unwrap();
+        term.draw(|f| {
+            let a = Rect {
+                x: 0,
+                y: 0,
+                width: EXPANDED_WIDTH,
+                height: 14,
+            };
+            draw(f, a, &m, true, Some(3), &theme);
+        })
+        .unwrap();
+        assert_eq!(m.current_index(), 0, "drawing must not switch sessions");
+    }
+
     #[test]
     fn the_collapsed_rail_is_one_row_per_session() {
         let m = mgr(4);
@@ -314,8 +345,8 @@ mod tests {
                     width: w,
                     height: h,
                 };
-                draw(f, a, &m, true, &theme);
-                draw(f, a, &m, false, &theme);
+                draw(f, a, &m, true, Some(2), &theme);
+                draw(f, a, &m, false, None, &theme);
             })
             .unwrap_or_else(|e| panic!("rail failed at {w}x{h}: {e}"));
         }

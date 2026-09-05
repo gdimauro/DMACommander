@@ -10,7 +10,7 @@
 use anyhow::Result;
 use clap::Parser;
 use dmac_vfs::VfsPath;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -133,8 +133,8 @@ fn main() -> Result<()> {
     };
 
     let cwd = std::env::current_dir()?;
-    let left = VfsPath::local(cli.left.unwrap_or_else(|| cwd.clone()));
-    let right = VfsPath::local(cli.right.unwrap_or_else(|| home_dir().unwrap_or(cwd)));
+    let left = start_dir(cli.left, &cwd, cwd.clone());
+    let right = start_dir(cli.right, &cwd, home_dir().unwrap_or_else(|| cwd.clone()));
 
     // Multi-threaded on purpose: directory walks, hashing and network VFS all
     // want to run while the UI keeps drawing.
@@ -158,6 +158,27 @@ fn main() -> Result<()> {
         )
         .await
     })
+}
+
+/// Resolve a starting directory to an absolute path.
+///
+/// `dmac docs` must behave the same as `dmac /full/path/to/docs`. A relative
+/// path has no parent that `Path` will admit to, so a panel opened on one had no
+/// `..` row and no way to navigate upwards — you could go down and never come
+/// back. Absolute from the start avoids the whole class of problem, and it is
+/// what a file manager should be showing anyway.
+fn start_dir(arg: Option<PathBuf>, cwd: &Path, fallback: PathBuf) -> VfsPath {
+    let raw = arg.unwrap_or(fallback);
+    let joined = if raw.is_absolute() {
+        raw
+    } else {
+        cwd.join(raw)
+    };
+    // Canonicalise where possible, so `.` and `..` in the argument are resolved
+    // and symlinks are followed once, up front. A path that does not exist is
+    // left as given: the listing will report why, which is more useful than
+    // refusing to start.
+    VfsPath::local(joined.canonicalize().unwrap_or(joined))
 }
 
 /// The user's home directory, without pulling in a dependency for one lookup.

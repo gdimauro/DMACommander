@@ -6,6 +6,13 @@ Notable changes, newest first. Versions follow the policy in
 ## Unreleased
 
 ### Added
+- **The session rail is a manager, not just a display.** `Shift-Tab` or `F11`
+  opens it *and* hands it the keyboard: `↑↓` move the highlight without switching
+  (you look before you leap), `Enter` switches, `n` creates, `r` renames, `d`
+  closes, and a bare digit jumps — the numbers are on screen right there, so
+  demanding a modifier would be perverse. `Alt+1..9` still works from the panels.
+  Renaming refuses an empty or duplicate name and keeps the text so it can be
+  corrected rather than retyped.
 - **A real shell in every session.** `dmac-pty` hosts a child on a pseudo-terminal
   (`portable-pty`, so ConPTY on Windows) and interprets its output with a proper
   terminal emulator (`vt100`). `Ctrl-O` swaps between the panels and the shell —
@@ -68,6 +75,16 @@ Notable changes, newest first. Versions follow the policy in
 - `docs/VERSIONING.md` and this changelog.
 
 ### Fixed
+- **Directory listings could land in the wrong session.** Results were routed by
+  panel alone, and each session has its own generation counter — so a stale
+  result from one session could carry a generation that happened to match
+  another's and be painted into a workspace that never asked for it. Updates now
+  carry the session id, and a result whose session has been closed is dropped.
+- **A panel opened on a relative path had no `..` row.** `Path::parent` of a
+  one-component relative path is the empty path, so `dmac docs` gave a panel you
+  could descend from but never climb out of. Starting directories are now made
+  absolute and canonical up front, which is what a file manager should be showing
+  anyway, and an empty parent is treated as no parent.
 - **Typing `-`, `+` or `*` on the command line did nothing.** They were bound to
   the Norton selection-mask actions before focus was consulted, so every hyphen
   in a command was silently eaten — `uname -s` arrived as `uname s`. They are now
