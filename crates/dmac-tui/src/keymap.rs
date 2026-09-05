@@ -105,6 +105,20 @@ pub fn resolve(key: KeyEvent, focus: Focus) -> Option<Action> {
         // Backspace edits the quick-search buffer while a panel has focus.
         (Backspace, true, false) | (Backspace, false, true) => Action::GoParent,
 
+        // --- The clipboard. Ctrl-Shift-C/V is what every modern terminal uses
+        //     and what people try first; Ctrl-Insert / Shift-Insert is what
+        //     encodes reliably in terminals that cannot report Ctrl with Shift
+        //     at all. Both, because either alone leaves someone stuck.
+        //
+        //     The Shift is load-bearing: without it Ctrl-C is the interrupt, and
+        //     a file manager that swallowed Ctrl-C would make its hosted shell
+        //     impossible to get out of. Terminals that cannot distinguish the
+        //     two send plain Ctrl-C, which goes to the child, as it must.
+        (Char(c), true, false) if shift && c.eq_ignore_ascii_case(&'c') => Action::ClipboardCopy,
+        (Char(c), true, false) if shift && c.eq_ignore_ascii_case(&'v') => Action::ClipboardPaste,
+        (Insert, true, false) => Action::ClipboardCopy,
+        (Insert, false, false) if shift => Action::ClipboardPaste,
+
         // --- Selection. Ins works from anywhere; the classic mask keys are
         //     resolved under panel focus only, because `*`, `+` and `-` are
         //     ordinary characters when you are typing a command. Binding them

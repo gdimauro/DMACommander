@@ -95,6 +95,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         &theme,
     );
     let software_cursor = app.software_cursor();
+    let shell_selection = app.shell_selection;
 
     // Split the borrow: the current session's panels are drawn mutably (they
     // record their viewport height) while the theme is read.
@@ -113,7 +114,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // both halves too little room to be useful.
     if session.view == dmac_session::View::Shell {
         if let Some(sh) = session.shell.as_ref() {
-            layout.shell = shell::draw(frame, body[1], sh, true, !full, software_cursor, theme);
+            layout.shell = shell::draw(
+                frame,
+                body[1],
+                sh,
+                &shell::Chrome {
+                    focused: true,
+                    bordered: !full,
+                    software_cursor,
+                    selection: shell_selection,
+                },
+                theme,
+            );
             layout.panels = [ratatui::layout::Rect::default(); 2];
         }
     } else if !panels_hidden {

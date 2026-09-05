@@ -155,6 +155,22 @@ pub struct App {
     dirty_at: Option<std::time::Instant>,
     /// Full screen: the frame stripped off, leaving only contents on black.
     pub(crate) fullscreen: bool,
+    /// Escape sequences to hand the real terminal after the next frame.
+    ///
+    /// Queued rather than written where they are produced, because writing to
+    /// stdout in the middle of composing a frame interleaves with what ratatui
+    /// is emitting and corrupts both.
+    pending_terminal_write: String,
+    /// The last click over the hosted shell, for double-click word selection.
+    /// Separate from `last_click`, which is about rows in a panel: a cell and a
+    /// row are not the same thing and sharing the field would make a click in
+    /// one look like a second click in the other.
+    last_shell_click: Option<(std::time::Instant, u16, u16)>,
+    /// Text selected in the hosted shell, if any.
+    pub(crate) shell_selection: Option<crate::ui::shell::Selection>,
+    /// Whether the left button is still down on that selection. A drag in
+    /// progress is protected from the repaint that would otherwise drop it.
+    selecting: bool,
     pub(crate) cursor_style: CursorStyle,
     /// When the software cursor last flipped. Only used in `Software` mode.
     cursor_phase: std::time::Instant,
@@ -194,6 +210,9 @@ pub struct App {
 /// It bounds a flood, never a first response: the frame that answers a wake-up
 /// is drawn immediately, and this only decides when the *next* one may follow.
 const SHELL_FRAME_FLOOR: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// How close together two clicks have to be to count as one gesture.
+const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
 
 impl App {
     /// Private: `Update` is an internal message type, so the only supported
@@ -235,6 +254,10 @@ impl App {
                 .then(|| std::time::Instant::now() + std::time::Duration::from_millis(1800)),
             should_quit: false,
             fullscreen: false,
+            pending_terminal_write: String::new(),
+            last_shell_click: None,
+            shell_selection: None,
+            selecting: false,
             last_shell_frame: std::time::Instant::now(),
             tx,
         }
@@ -583,6 +606,8 @@ impl App {
             }
             ToggleShell => self.toggle_shell(),
             ToggleFullscreen => self.toggle_fullscreen(),
+            ClipboardCopy => self.copy_selection(),
+            ClipboardPaste => self.paste_into_shell(),
             Refresh => self.reload(self.ses().active),
 
             ToggleSelection => self.active_panel_mut().toggle_selection(),
@@ -862,6 +887,15 @@ impl App {
         if self.ses().view != View::Shell || self.last_shell_frame.elapsed() < SHELL_FRAME_FLOOR {
             return;
         }
+        // The screen is about to change under the selection, and the selection
+        // is in screen coordinates: keeping it would highlight whatever landed
+        // in those cells. A drag in progress is the user's, and is left alone.
+        if !self.selecting
+            && self.shell_selection.is_some()
+            && self.ses().hosted().is_some_and(|s| s.dirty())
+        {
+            self.shell_selection = None;
+        }
         self.last_shell_frame = std::time::Instant::now();
         if let Some(s) = self.ses().hosted() {
             s.mark_drawn();
@@ -903,6 +937,106 @@ impl App {
             // nothing on the overwhelming majority of frames.
             let _ = sh.resize(cols, rows);
         }
+    }
+
+    /// Put the shell's selected text on the clipboard.
+    fn copy_selection(&mut self) {
+        let Some(sel) = self.shell_selection else {
+            self.status = "nothing selected — drag over the shell to select".into();
+            return;
+        };
+        let Some(text) = self.ses().hosted().map(|sh| sel.text(sh)) else {
+            return;
+        };
+        if text.trim().is_empty() {
+            self.status = "nothing selected".into();
+            return;
+        }
+        let n = text.chars().count();
+        match dmac_core::clipboard::set_text(&text) {
+            Ok(()) => self.status = format!("copied {n} characters"),
+            // No local clipboard: ask the terminal for its own. Over SSH this
+            // is not a fallback but the only correct answer — the system
+            // clipboard here belongs to the wrong machine, and the terminal at
+            // the far end is the one the user is looking at.
+            Err(e) => match dmac_core::clipboard::osc52(&text) {
+                Some(seq) => {
+                    self.pending_terminal_write.push_str(&seq);
+                    self.status = format!("copied {n} characters via the terminal");
+                }
+                None => self.status = format!("could not copy: {e}"),
+            },
+        }
+    }
+
+    /// Paste the clipboard into the hosted shell.
+    fn paste_into_shell(&mut self) {
+        if self.ses().view != View::Shell {
+            self.status = "paste goes to the shell — Ctrl-O first".into();
+            return;
+        }
+        let text = match dmac_core::clipboard::text() {
+            Ok(t) => t,
+            Err(e) => {
+                self.status = format!("nothing to paste: {e}");
+                return;
+            }
+        };
+        let bracketed = self
+            .ses()
+            .hosted()
+            .and_then(|sh| sh.with_screen(|s| s.bracketed_paste()))
+            .unwrap_or(false);
+
+        // Bracketed paste tells the shell "this is text, not typing", so a
+        // pasted newline lands as a newline instead of running the line. When
+        // the shell has not asked for it there is no way to say that, so the
+        // trailing newline is dropped: the command arrives ready to run and the
+        // user still has to press Enter. Pasting something that executes itself
+        // is the one outcome worth engineering against.
+        let mut payload = String::new();
+        if bracketed {
+            payload.push_str("\x1b[200~");
+            payload.push_str(&text);
+            payload.push_str("\x1b[201~");
+        } else {
+            payload.push_str(text.trim_end_matches(['\n', '\r']));
+        }
+
+        let waker = self.waker();
+        let (cols, rows) = self.shell_size();
+        match self.ses_mut().shell(cols, rows, waker) {
+            Ok(sh) => match sh.write(payload.as_bytes()) {
+                Ok(()) => {
+                    let n = text.chars().count();
+                    self.status = if bracketed {
+                        format!("pasted {n} characters")
+                    } else {
+                        format!("pasted {n} characters — press Enter to run")
+                    };
+                }
+                Err(e) => self.status = format!("paste: {e}"),
+            },
+            Err(e) => self.status = format!("paste: {e}"),
+        }
+    }
+
+    /// Escape sequences owed to the real terminal, taken for writing.
+    pub(crate) fn take_terminal_write(&mut self) -> Option<String> {
+        (!self.pending_terminal_write.is_empty())
+            .then(|| std::mem::take(&mut self.pending_terminal_write))
+    }
+
+    /// Where in the hosted screen a screen position falls, if it is over it.
+    fn shell_cell_at(&self, column: u16, row: u16) -> Option<(u16, u16)> {
+        let a = self.layout.shell;
+        if self.ses().view != View::Shell || a.width == 0 || a.height == 0 {
+            return None;
+        }
+        if column < a.x || column >= a.x + a.width || row < a.y || row >= a.y + a.height {
+            return None;
+        }
+        Some((row - a.y, column - a.x))
     }
 
     /// Strip the frame off, or put it back.
@@ -1196,6 +1330,10 @@ impl App {
                     self.toggle_fullscreen();
                     return;
                 }
+                Some(a @ (Action::ClipboardCopy | Action::ClipboardPaste)) => {
+                    self.handle(a);
+                    return;
+                }
                 _ => {}
             }
             self.send_to_shell(k);
@@ -1351,6 +1489,12 @@ impl App {
             return;
         }
 
+        // The shell owns the pointer while it is showing: there are no rows to
+        // click there, only text to select.
+        if self.ses().view == View::Shell && self.shell_mouse(m) {
+            return;
+        }
+
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 // The rail is to the left of the panels, so it is checked first.
@@ -1382,7 +1526,7 @@ impl App {
                         // Double-click opens, as in every file manager since 1995.
                         let now = std::time::Instant::now();
                         let double = self.last_click.is_some_and(|(t, p, i)| {
-                            p == id && i == index && now.duration_since(t).as_millis() < 400
+                            p == id && i == index && now.duration_since(t) < DOUBLE_CLICK
                         });
                         if double {
                             self.last_click = None;
@@ -1444,6 +1588,54 @@ impl App {
             MouseEventKind::ScrollDown => self.scroll_under_pointer(m, 3),
 
             _ => {}
+        }
+    }
+
+    /// Selecting text over the hosted shell. Returns whether the event was ours.
+    fn shell_mouse(&mut self, m: MouseEvent) -> bool {
+        let Some((row, col)) = self.shell_cell_at(m.column, m.row) else {
+            return false;
+        };
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                // A second click inside the current selection takes the word
+                // under it, the way every terminal has since X11.
+                let double = self
+                    .last_shell_click
+                    .is_some_and(|(t, r, c)| t.elapsed() < DOUBLE_CLICK && (r, c) == (row, col));
+                let mut sel = crate::ui::shell::Selection::new(row, col);
+                if double && let Some(sh) = self.ses().hosted() {
+                    sel.expand_to_word(sh);
+                    self.shell_selection = Some(sel);
+                    self.selecting = false;
+                    self.copy_selection();
+                    self.last_shell_click = None;
+                    return true;
+                }
+                self.last_shell_click = Some((std::time::Instant::now(), row, col));
+                self.shell_selection = Some(sel);
+                self.selecting = true;
+                true
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.selecting => {
+                if let Some(sel) = self.shell_selection.as_mut() {
+                    sel.extend_to(row, col);
+                }
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.selecting => {
+                self.selecting = false;
+                match self.shell_selection {
+                    // A click that never moved is a click, not a selection.
+                    // Copying it would silently replace the clipboard with
+                    // nothing, which is a way to lose work.
+                    Some(sel) if sel.is_empty() => self.shell_selection = None,
+                    Some(_) => self.copy_selection(),
+                    None => {}
+                }
+                true
+            }
+            _ => false,
         }
     }
 
@@ -1702,6 +1894,14 @@ pub async fn run(mut start: Startup) -> anyhow::Result<()> {
         app.before_frame();
         guard.terminal().draw(|f| ui::draw(f, &mut app))?;
         app.sync_shell_size();
+        // After the frame, never during it: stdout is shared with ratatui and
+        // interleaving with a half-written frame corrupts both.
+        if let Some(seq) = app.take_terminal_write() {
+            use std::io::Write;
+            let mut out = std::io::stdout();
+            let _ = out.write_all(seq.as_bytes());
+            let _ = out.flush();
+        }
 
         // Re-assert the cursor shape, but only on frames that actually show a
         // cursor. Terminals reset DECSCUSR for reasons outside our control, and

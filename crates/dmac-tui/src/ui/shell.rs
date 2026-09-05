@@ -16,18 +16,128 @@ use ratatui::widgets::{Block, BorderType, Borders};
 
 /// Draw the hosted screen into `area`, returning the interior rect so the caller
 /// can keep the PTY the same size as what is visible.
-/// `software_cursor` is `Some(on)` when the caller draws its own cursor because
-/// the terminal cannot be trusted to blink one, and `None` when the real
-/// terminal cursor is being used.
-pub fn draw(
-    frame: &mut Frame,
-    area: Rect,
-    shell: &Hosted,
-    focused: bool,
-    bordered: bool,
-    software_cursor: Option<bool>,
-    theme: &Theme,
-) -> Rect {
+/// A text selection over the hosted screen, in its own cell coordinates.
+///
+/// Held in screen coordinates rather than in the scrollback, which is why it is
+/// dropped as soon as the screen changes underneath it: a highlight that stayed
+/// put while the text scrolled out from under it would be pointing at whatever
+/// happened to land there, and copying it would hand you something you never
+/// selected. Wrong-looking is recoverable; wrong-and-confident is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Selection {
+    anchor: (u16, u16),
+    head: (u16, u16),
+}
+
+impl Selection {
+    pub fn new(row: u16, col: u16) -> Self {
+        Self {
+            anchor: (row, col),
+            head: (row, col),
+        }
+    }
+
+    pub fn extend_to(&mut self, row: u16, col: u16) {
+        self.head = (row, col);
+    }
+
+    /// Start and end in reading order. Tuples compare lexicographically, which
+    /// for `(row, col)` *is* reading order — so nothing downstream has to know
+    /// which way the drag went.
+    fn ordered(&self) -> ((u16, u16), (u16, u16)) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    pub fn contains(&self, row: u16, col: u16) -> bool {
+        let (a, b) = self.ordered();
+        (row, col) >= a && (row, col) <= b
+    }
+
+    /// A single click selects nothing. Without this, every click would put an
+    /// invisible one-cell selection on the clipboard and destroy what was there.
+    pub fn is_empty(&self) -> bool {
+        self.anchor == self.head
+    }
+
+    /// Grow to the whole word under the anchor, for a double-click.
+    pub fn expand_to_word(&mut self, shell: &Hosted) {
+        let (row, col) = self.anchor;
+        let Some((lo, hi)) = shell
+            .with_screen(|screen| word_at(screen, row, col))
+            .flatten()
+        else {
+            return;
+        };
+        self.anchor = (row, lo);
+        self.head = (row, hi);
+    }
+
+    /// The selected text, as the user would read it.
+    pub fn text(&self, shell: &Hosted) -> String {
+        let (a, b) = self.ordered();
+        shell
+            .with_screen(|screen| {
+                let (_, cols) = screen.size();
+                // `contents_between` stops *before* end_col; the cell under the
+                // pointer when the button came up is part of what was selected.
+                let end = b.1.saturating_add(1).min(cols);
+                screen.contents_between(a.0, a.1, b.0, end)
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// The run of word characters containing `col`, as inclusive columns.
+fn word_at(screen: &vt100::Screen, row: u16, col: u16) -> Option<(u16, u16)> {
+    let (_, cols) = screen.size();
+    let is_word = |c: u16| {
+        screen
+            .cell(row, c)
+            .map(|cell| {
+                let t = cell.contents();
+                !t.is_empty() && !t.chars().all(|ch| ch.is_whitespace())
+            })
+            .unwrap_or(false)
+    };
+    if !is_word(col) {
+        return None;
+    }
+    let mut lo = col;
+    while lo > 0 && is_word(lo - 1) {
+        lo -= 1;
+    }
+    let mut hi = col;
+    while hi + 1 < cols && is_word(hi + 1) {
+        hi += 1;
+    }
+    Some((lo, hi))
+}
+
+/// How the pane is presented this frame. A struct rather than six positional
+/// arguments, which is how `bordered` and `focused` end up swapped.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Chrome {
+    /// Whether the shell has the keyboard, which decides the cursor.
+    pub focused: bool,
+    /// A border and titles, or bare contents for full screen.
+    pub bordered: bool,
+    /// `Some(on)` when the caller draws its own cursor because the terminal
+    /// cannot be trusted to blink one, and `None` for the real one.
+    pub software_cursor: Option<bool>,
+    pub selection: Option<Selection>,
+}
+
+pub fn draw(frame: &mut Frame, area: Rect, shell: &Hosted, c: &Chrome, theme: &Theme) -> Rect {
+    let Chrome {
+        focused,
+        bordered,
+        software_cursor,
+        selection,
+    } = *c;
     let title = if shell.finished() {
         format!(" {} (exited) ", shell.program())
     } else {
@@ -71,7 +181,11 @@ pub fn draw(
                 // empty string for the continuation column of a wide character.
                 let text = cell.contents();
                 target.set_symbol(if text.is_empty() { " " } else { text });
-                target.set_style(style_of(cell));
+                let mut style = style_of(cell);
+                if selection.is_some_and(|s| s.contains(y, x)) {
+                    style = style.add_modifier(Modifier::REVERSED);
+                }
+                target.set_style(style);
             }
         }
     });
@@ -308,5 +422,100 @@ mod tests {
     fn keys_with_no_terminal_representation_are_dropped() {
         assert_eq!(encode(key(KeyCode::F(25))), None);
         assert_eq!(encode(key(KeyCode::CapsLock)), None);
+    }
+
+    /// A drag upward or leftward is the same selection as the drag back.
+    #[test]
+    fn a_selection_reads_the_same_in_either_direction() {
+        let mut forward = Selection::new(1, 2);
+        forward.extend_to(3, 4);
+        let mut backward = Selection::new(3, 4);
+        backward.extend_to(1, 2);
+        assert_eq!(forward.ordered(), backward.ordered());
+
+        for (r, c) in [(1, 2), (1, 79), (2, 0), (3, 4)] {
+            assert!(forward.contains(r, c), "{r},{c} should be in");
+            assert!(backward.contains(r, c), "{r},{c} should be in either way");
+        }
+        assert!(!forward.contains(1, 1), "before the start");
+        assert!(!forward.contains(3, 5), "after the end");
+        assert!(!forward.contains(4, 0), "a row past the end");
+    }
+
+    /// A click that never moved must not put an empty string on the clipboard:
+    /// that silently destroys whatever was there, which is a way to lose work.
+    #[test]
+    fn a_click_that_never_moved_selects_nothing() {
+        assert!(Selection::new(4, 9).is_empty());
+        let mut s = Selection::new(4, 9);
+        s.extend_to(4, 10);
+        assert!(!s.is_empty());
+    }
+
+    #[cfg(unix)]
+    fn shell_showing(text: &str) -> Hosted {
+        let h = Hosted::spawn(
+            "/bin/sh",
+            &["-c".into(), format!("printf '{text}'")],
+            None,
+            40,
+            10,
+            100,
+            None,
+        )
+        .expect("spawn");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !h.finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        h
+    }
+
+    /// The cell under the pointer when the button came up is part of what was
+    /// selected — off by one here means the last character never gets copied.
+    #[cfg(unix)]
+    #[test]
+    fn the_selected_text_includes_both_ends() {
+        let h = shell_showing("hello world");
+        let mut sel = Selection::new(0, 0);
+        sel.extend_to(0, 4);
+        assert_eq!(sel.text(&h), "hello");
+
+        let mut all = Selection::new(0, 0);
+        all.extend_to(0, 10);
+        assert_eq!(all.text(&h), "hello world");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_selection_across_rows_keeps_the_line_break() {
+        let h = shell_showing("first\\nsecond");
+        let mut sel = Selection::new(0, 0);
+        sel.extend_to(1, 5);
+        assert_eq!(sel.text(&h), "first\nsecond");
+    }
+
+    /// Double-click takes the word under the pointer, from anywhere in it.
+    #[cfg(unix)]
+    #[test]
+    fn double_click_takes_the_whole_word_from_anywhere_in_it() {
+        let h = shell_showing("alpha beta gamma");
+        for col in 6..=9 {
+            let mut sel = Selection::new(0, col);
+            sel.expand_to_word(&h);
+            assert_eq!(sel.text(&h), "beta", "clicking column {col}");
+        }
+    }
+
+    /// A double-click on empty space should not silently select a run of
+    /// spaces and replace the clipboard with them.
+    #[cfg(unix)]
+    #[test]
+    fn double_click_on_blank_space_selects_nothing() {
+        let h = shell_showing("hi");
+        let mut sel = Selection::new(0, 20);
+        sel.expand_to_word(&h);
+        assert!(sel.is_empty(), "got {:?}", sel.text(&h));
     }
 }

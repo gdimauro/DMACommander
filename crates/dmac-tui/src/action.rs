@@ -45,6 +45,14 @@ pub enum Action {
     /// is a real shell to reveal.
     ToggleShell,
 
+    /// Copy the shell's selected text to the system clipboard. Separate from
+    /// [`Action::Copy`], which is F5 and moves files: one puts bytes on a
+    /// clipboard, the other writes them to disk, and a key that sometimes did
+    /// each would eventually do the wrong one.
+    ClipboardCopy,
+    /// Paste the system clipboard into the hosted shell.
+    ClipboardPaste,
+
     /// F11: strip the screen down to its contents — no borders, no F-key bar,
     /// black behind everything. The panels stay exactly where they are, so it
     /// is the frame that goes, not the layout.
