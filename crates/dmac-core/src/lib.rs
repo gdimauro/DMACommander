@@ -11,6 +11,7 @@
 // In non-test code the workspace lints still forbid them.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 pub mod clipboard;
+pub mod complete;
 pub mod entry;
 pub mod panel;
 pub mod tools;

@@ -43,6 +43,16 @@ enum Update {
         panel: PanelId,
         message: String,
     },
+    /// Completion candidates for the command line came back.
+    Completion {
+        session: SessionId,
+        /// Dropped unless it still matches: the user keeps typing while the
+        /// directory is being read, and a completion for a word they have
+        /// moved on from would rewrite the line under them.
+        generation: u64,
+        start: usize,
+        items: Vec<String>,
+    },
     /// A hosted shell changed what is on its screen. Carries nothing: the
     /// message exists only to break the event loop out of its wait, and the
     /// frame that follows reads the emulator directly.
@@ -159,6 +169,9 @@ pub struct App {
     dirty_at: Option<std::time::Instant>,
     /// Full screen: the frame stripped off, leaving only contents on black.
     pub(crate) fullscreen: bool,
+    /// Bumped on every completion request, so a result for a word the user has
+    /// already typed past is dropped instead of rewriting the line.
+    completion_gen: u64,
     /// Escape sequences to hand the real terminal after the next frame.
     ///
     /// Queued rather than written where they are produced, because writing to
@@ -207,6 +220,117 @@ pub struct App {
     /// reader thread can parse.
     last_shell_frame: std::time::Instant,
     tx: mpsc::UnboundedSender<Update>,
+}
+
+/// Executables on `PATH` whose name starts with `word`.
+///
+/// The scan is done once and kept: `PATH` holds a dozen directories with a few
+/// thousand files between them, and re-reading all of it on every Tab would
+/// turn a keystroke into disk I/O for no new information.
+fn commands_starting_with(word: &str) -> Vec<String> {
+    static ALL: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let all = ALL.get_or_init(|| {
+        let mut out: Vec<String> = SHELL_BUILTINS.iter().map(|s| s.to_string()).collect();
+        if let Some(path) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&path) {
+                let Ok(entries) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                for e in entries.flatten() {
+                    if is_executable(&e) {
+                        out.push(e.file_name().to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    });
+    all.iter()
+        .filter(|c| c.starts_with(word))
+        .cloned()
+        .collect()
+}
+
+/// Things a shell runs that are not files on `PATH`, so `cd` completes.
+const SHELL_BUILTINS: &[&str] = &[
+    "alias", "bg", "cd", "declare", "echo", "eval", "exec", "exit", "export", "fg", "history",
+    "jobs", "kill", "let", "local", "popd", "pushd", "pwd", "read", "return", "set", "shift",
+    "source", "test", "times", "trap", "type", "ulimit", "umask", "unalias", "unset", "wait",
+];
+
+#[cfg(unix)]
+fn is_executable(e: &std::fs::DirEntry) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    e.metadata()
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable(e: &std::fs::DirEntry) -> bool {
+    e.metadata().map(|m| m.is_file()).unwrap_or(false)
+}
+
+/// Filesystem entries matching `word`, as full replacement words.
+///
+/// The part of the word before the last `/` is kept exactly as typed — a `~`
+/// the user wrote stays a `~`, because expanding it under them would rewrite a
+/// path they can still read into one they have to re-check.
+fn paths_starting_with(word: &str, cwd: &std::path::Path) -> Vec<String> {
+    use dmac_core::complete::{escape, unescape};
+
+    let (typed_dir, frag) = match word.rfind('/') {
+        Some(i) => (&word[..=i], &word[i + 1..]),
+        None => ("", word),
+    };
+    let frag = unescape(frag);
+
+    let expanded = unescape(typed_dir);
+    let dir: std::path::PathBuf = if let Some(rest) = expanded.strip_prefix("~/") {
+        match home_dir() {
+            Some(h) => h.join(rest),
+            None => return Vec::new(),
+        }
+    } else if expanded.starts_with('/') {
+        std::path::PathBuf::from(&expanded)
+    } else if expanded.is_empty() {
+        cwd.to_path_buf()
+    } else {
+        cwd.join(&expanded)
+    };
+
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(&frag) {
+            continue;
+        }
+        // A dotfile only shows once you have asked for one, as in every shell:
+        // otherwise the first Tab in a home directory buries the answer.
+        if name.starts_with('.') && !frag.starts_with('.') {
+            continue;
+        }
+        let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        // A directory ends in `/` so the next Tab carries straight on into it;
+        // a file ends in a space, because there is nothing more to say about it.
+        let tail = if is_dir { "/" } else { " " };
+        out.push(format!("{typed_dir}{}{tail}", escape(&name)));
+        if out.len() >= 5000 {
+            break;
+        }
+    }
+    out
+}
+
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
 }
 
 /// The shortest gap between two frames of a hosted shell.
@@ -258,6 +382,7 @@ impl App {
                 .then(|| std::time::Instant::now() + std::time::Duration::from_millis(1800)),
             should_quit: false,
             fullscreen: false,
+            completion_gen: 0,
             pending_terminal_write: String::new(),
             last_shell_click: None,
             shell_selection: None,
@@ -463,6 +588,12 @@ impl App {
                     p.resort();
                 }
             }
+            Update::Completion {
+                session,
+                generation,
+                start,
+                items,
+            } => self.apply_completion(session, generation, start, items),
             // Nothing to apply: arriving here already cost the redraw that the
             // hosted program was asking for.
             Update::ShellOutput => {}
@@ -515,6 +646,16 @@ impl App {
             // Tab-alternates-two-panels reflex from Norton Commander; Esc is the
             // fast two-way toggle that replaces it.
             FocusNext => {
+                // On the command line Tab completes what is being typed, and
+                // only moves the keyboard when there is nothing to complete —
+                // so it means what it means in a shell, without losing the way
+                // out of the line.
+                if self.ses().focus == Focus::CommandLine
+                    && self.mode == Mode::Normal
+                    && self.request_completion()
+                {
+                    return;
+                }
                 self.clear_quick_search();
                 match (self.ses().focus, self.ses().active) {
                     (Focus::Panel, PanelId::Left) => self.ses_mut().active = PanelId::Right,
@@ -865,6 +1006,82 @@ impl App {
             // Before the first frame there is no recorded size. Something
             // plausible beats zero: the child is told the truth on the next draw.
             (80, 24)
+        }
+    }
+
+    /// Complete the word being typed on the command line.
+    ///
+    /// The candidates come from the filesystem, so they are gathered on a task
+    /// and delivered like a directory listing. Tab has to stay instant even
+    /// when the directory being completed against is a slow network mount.
+    fn request_completion(&mut self) -> bool {
+        let line = self.ses().command_line.clone();
+        let (start, word) = dmac_core::complete::word_at_end(&line);
+        // Nothing to complete: let Tab go back to being the focus key.
+        if word.is_empty() {
+            return false;
+        }
+
+        self.completion_gen = self.completion_gen.wrapping_add(1);
+        let generation = self.completion_gen;
+        let session = self.ses().id;
+        let cwd = self.ses().cwd[Self::idx(self.ses().active)].clone();
+        let first = dmac_core::complete::is_first_word(&line, start);
+        let word = word.to_string();
+        let tx = self.tx.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let items = if first && !word.contains('/') {
+                commands_starting_with(&word)
+            } else {
+                paths_starting_with(&word, cwd.as_path())
+            };
+            let _ = tx.send(Update::Completion {
+                session,
+                generation,
+                start,
+                items,
+            });
+        });
+        true
+    }
+
+    fn apply_completion(
+        &mut self,
+        session: SessionId,
+        generation: u64,
+        start: usize,
+        items: Vec<String>,
+    ) {
+        use dmac_core::complete::{Completion, resolve, splice};
+        if generation != self.completion_gen || self.ses().id != session {
+            return;
+        }
+        let line = self.ses().command_line.clone();
+        // The line moved on while the directory was being read.
+        if start > line.len() {
+            return;
+        }
+        let word = &line[start..];
+
+        match resolve(word, items) {
+            Completion::None => self.status = "no match".into(),
+            Completion::Single(full) => {
+                self.ses_mut().command_line = splice(&line, start, &full);
+                self.status.clear();
+            }
+            Completion::Many { prefix, items } => {
+                self.ses_mut().command_line = splice(&line, start, &prefix);
+                // bash prints the candidates rather than guessing; the status
+                // line is where this program says things.
+                let shown: Vec<&str> = items.iter().take(12).map(String::as_str).collect();
+                let more = items.len().saturating_sub(shown.len());
+                self.status = if more > 0 {
+                    format!("{}  … and {more} more", shown.join("  "))
+                } else {
+                    shown.join("  ")
+                };
+            }
         }
     }
 
