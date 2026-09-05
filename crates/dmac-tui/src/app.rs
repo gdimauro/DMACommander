@@ -873,6 +873,12 @@ impl App {
         {
             eprintln!("dmac: could not save sessions: {e}");
         }
+        // Saved first, then torn down: if shutting the processes down goes
+        // wrong, the session layout is already on disk. The grace period is
+        // long enough for a program to release what it is holding and short
+        // enough not to be felt as a hang.
+        self.sessions
+            .shutdown(std::time::Duration::from_millis(400));
     }
 
     fn close_rail(&mut self) {

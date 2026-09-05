@@ -284,6 +284,29 @@ impl SessionManager {
 
     /// Mutable access by position, for delivering work to a session that is not
     /// the one on screen.
+    /// Ask every hosted process to go away, then insist, once.
+    ///
+    /// Two passes with one grace period between them, rather than a grace
+    /// period per session: quitting with four shells open should not take four
+    /// times as long as quitting with one.
+    ///
+    /// Nothing DMACommander started may outlive it. A hosted `claude` that
+    /// survives goes on holding the session it opened, and the next run is told
+    /// that session is already in use — which is not an inconvenience, it is
+    /// the user locked out of their own work.
+    pub fn shutdown(&mut self, grace: std::time::Duration) {
+        for s in &mut self.sessions {
+            if let Some(sh) = s.shell.as_mut() {
+                sh.hangup();
+            }
+        }
+        for s in &mut self.sessions {
+            if let Some(sh) = s.shell.as_mut() {
+                sh.terminate(grace);
+            }
+        }
+    }
+
     pub fn at_mut(&mut self, index: usize) -> &mut Session {
         let i = index.min(self.sessions.len() - 1);
         &mut self.sessions[i]

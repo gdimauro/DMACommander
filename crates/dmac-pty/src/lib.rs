@@ -16,6 +16,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PtyError {
@@ -72,6 +73,13 @@ pub struct Hosted {
     cols: u16,
     rows: u16,
     program: String,
+    /// The hosted tree as it stood when teardown began.
+    ///
+    /// Captured once, before anything is signalled: the moment the shell dies
+    /// its children are re-parented to init and nothing connects them to us any
+    /// more, so a list built afterwards is empty exactly when it matters.
+    #[cfg(unix)]
+    doomed: Vec<libc::pid_t>,
 }
 
 impl Hosted {
@@ -184,6 +192,8 @@ impl Hosted {
             cols,
             rows,
             program: program.to_string(),
+            #[cfg(unix)]
+            doomed: Vec::new(),
         })
     }
 
@@ -333,10 +343,142 @@ impl Hosted {
         Ok(true)
     }
 
-    /// Ask the child to terminate, then stop waiting for it.
-    pub fn kill(&mut self) {
+    /// Everything descended from the hosted child, plus the child.
+    ///
+    /// Signalling the process group is not enough on its own. An interactive
+    /// shell has job control, so anything it starts gets a process group of its
+    /// own — which is exactly what a hosted `claude` is. The group the shell is
+    /// in does not contain it, and the foreground group only contains whichever
+    /// job is in front right now.
+    fn tree(&mut self) -> Vec<libc::pid_t> {
+        let Some(root) = self.child.process_id() else {
+            return Vec::new();
+        };
+        let mut out = vec![root as libc::pid_t];
+        out.extend(descendants(root as libc::pid_t));
+        out
+    }
+
+    /// Every process group the hosted tree could be in.
+    ///
+    /// A PTY child is a session leader, so its own pid is a group id and its
+    /// descendants inherit that group. A program that deliberately makes its
+    /// own group — anything that manages a terminal of its own — is caught by
+    /// the second: the group currently in the foreground of this tty.
+    #[cfg(unix)]
+    fn groups(&mut self) -> Vec<libc::pid_t> {
+        let mut out = Vec::with_capacity(2);
+        if let Some(pid) = self.child.process_id() {
+            out.push(pid as libc::pid_t);
+        }
+        if let Some(fg) = self.master.process_group_leader()
+            && !out.contains(&fg)
+        {
+            out.push(fg);
+        }
+        out
+    }
+
+    /// Ask the whole hosted tree to go away, without waiting for it.
+    ///
+    /// `Child::kill` signals the direct child only — the shell. Anything the
+    /// shell started outlives it, which is how a hosted `claude` survived
+    /// DMACommander and went on holding the session it had opened, so the next
+    /// run was told that session was already in use. Signalling the process
+    /// *group* reaches the whole tree.
+    ///
+    /// SIGHUP rather than SIGKILL, because that is what a real terminal sends
+    /// when its window closes, and what a well-behaved program listens for in
+    /// order to save its state and let go of whatever it is holding. Something
+    /// that ignores it gets SIGKILL from [`Hosted::terminate`] afterwards.
+    // SAFETY: `killpg` takes two integers and returns one. It cannot touch this
+    // process's memory. The group ids come from the child we spawned and from
+    // the tty we own, so the only risk would be signalling a group that had
+    // already exited and had its id reused — and that window is closed by the
+    // child being reaped only after this, which keeps its id from coming back.
+    #[allow(unsafe_code)]
+    pub fn hangup(&mut self) {
+        #[cfg(unix)]
+        {
+            // The list comes first, before a single signal is sent. A hangup
+            // kills the shell immediately, and the instant it dies its children
+            // are re-parented to init — so a list built even a moment later is
+            // empty exactly when it matters, which is what made the first
+            // version of this look like it worked.
+            if self.doomed.is_empty() {
+                self.doomed = self.tree();
+            }
+            let (groups, doomed) = (self.groups(), self.doomed.clone());
+            // Descendants first: the groups miss background jobs entirely, and
+            // signalling them before the shell dies is the only chance to
+            // address them by name.
+            for pid in doomed {
+                // SIGCONT as well: a process stopped with Ctrl-Z cannot act on
+                // a hangup until it is running again.
+                unsafe {
+                    libc::kill(pid, libc::SIGHUP);
+                    libc::kill(pid, libc::SIGCONT);
+                }
+            }
+            for g in groups {
+                unsafe {
+                    libc::killpg(g, libc::SIGHUP);
+                    libc::killpg(g, libc::SIGCONT);
+                }
+            }
+        }
+    }
+
+    /// Wait a little for the tree to go, then insist, and reap the child.
+    ///
+    /// Separate from [`Hosted::hangup`] so a program with several hosted shells
+    /// can ask all of them to leave and then wait once, rather than paying the
+    /// grace period again for every one of them.
+    // SAFETY: as for `hangup` — two integers in, one out, and the child is not
+    // reaped until afterwards, so its group id cannot have been reused.
+    #[allow(unsafe_code)]
+    pub fn terminate(&mut self, grace: Duration) {
+        #[cfg(unix)]
+        let groups = self.groups();
+        #[cfg(unix)]
+        if self.doomed.is_empty() {
+            self.doomed = self.tree();
+        }
+        #[cfg(unix)]
+        let tree = self.doomed.clone();
+
+        let deadline = Instant::now() + grace;
+        while Instant::now() < deadline {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        #[cfg(unix)]
+        {
+            for g in groups {
+                unsafe {
+                    libc::killpg(g, libc::SIGKILL);
+                }
+            }
+            // Anything that ignored the hangup, individually. A program that
+            // traps SIGHUP and stays is precisely the one still holding the
+            // thing the next run will ask for.
+            for pid in tree {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+
+    /// Ask the child, and everything it started, to go away.
+    pub fn kill(&mut self) {
+        self.hangup();
+        self.terminate(Duration::from_millis(300));
     }
 }
 
@@ -360,6 +502,51 @@ impl std::fmt::Debug for Hosted {
     }
 }
 
+/// Every process descended from `root`, children before parents.
+///
+/// Read from `ps` rather than from a crate: it is one fork at shutdown, it says
+/// the same thing on macOS and Linux, and the alternative is either a large
+/// dependency or platform-specific `sysctl` calls for a list this program looks
+/// at once per session, on the way out.
+#[cfg(unix)]
+fn descendants(root: libc::pid_t) -> Vec<libc::pid_t> {
+    use std::collections::HashMap;
+
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-Ao", "pid=,ppid="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let mut children: HashMap<libc::pid_t, Vec<libc::pid_t>> = HashMap::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut it = line.split_whitespace();
+        if let (Some(pid), Some(ppid)) = (it.next(), it.next())
+            && let (Ok(pid), Ok(ppid)) = (pid.parse(), ppid.parse())
+        {
+            children.entry(ppid).or_default().push(pid);
+        }
+    }
+
+    // Breadth-first from the root, then reversed: killing children before their
+    // parents keeps a supervisor from noticing and restarting one.
+    let mut out = Vec::new();
+    let mut queue = vec![root];
+    while let Some(pid) = queue.pop() {
+        for &child in children.get(&pid).into_iter().flatten() {
+            // A cycle is impossible in a process tree, but a pid that has been
+            // reused between reading and walking is not; the guard costs
+            // nothing and the alternative is an infinite loop at shutdown.
+            if child != root && !out.contains(&child) {
+                out.push(child);
+                queue.push(child);
+            }
+        }
+    }
+    out.reverse();
+    out
+}
+
 /// The user's shell, from the environment, with a platform-appropriate default.
 pub fn default_shell() -> String {
     if cfg!(windows) {
@@ -372,7 +559,6 @@ pub fn default_shell() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
 
     /// Wait for a predicate on the screen text, so tests do not race the child.
     fn wait_for(h: &Hosted, secs: f32, pred: impl Fn(&str) -> bool) -> String {
@@ -687,5 +873,195 @@ mod tests {
         }
         assert!(h.at_prompt(), "the shell never came back to its prompt");
         h.kill();
+    }
+
+    /// The bug this exists for, reproduced the way it actually happens.
+    ///
+    /// Killing the shell is not enough and neither is signalling its process
+    /// group. An interactive shell has job control, so what it starts gets a
+    /// group of its own — a hosted `claude` is exactly that — and a program
+    /// that traps SIGHUP stays put when the terminal goes away. It then goes on
+    /// holding the session it opened, and the next run is told that session is
+    /// already in use.
+    #[cfg(unix)]
+    #[test]
+    fn a_job_in_its_own_group_that_ignores_a_hangup_is_still_killed() {
+        let dir = std::env::temp_dir().join(format!("dmac-job-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let pidfile = dir.join("job.pid");
+
+        let mut h = Hosted::shell(Some(&dir), 80, 24, None).expect("an interactive shell");
+        wait_for(&h, 5.0, |t| !t.trim().is_empty());
+
+        // Backgrounded from an interactive shell, so job control puts it in its
+        // own process group; and deaf to every polite signal.
+        h.run(&format!(
+            "sh -c \"trap '' HUP TERM INT; sleep 300\" & echo $! > {}",
+            pidfile.to_string_lossy()
+        ))
+        .expect("run");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let job = loop {
+            if let Ok(text) = std::fs::read_to_string(&pidfile)
+                && let Ok(pid) = text.trim().parse::<i32>()
+                && alive(pid)
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "the job never started");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        // It really is in a group of its own, or the test proves nothing.
+        #[allow(unsafe_code)]
+        // SAFETY: one integer in, one out.
+        let job_group = unsafe { libc::getpgid(job) };
+        let shell = h.child.process_id().expect("a pid") as i32;
+        assert_ne!(job_group, shell, "the job shared the shell's group");
+
+        h.kill();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while alive(job) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Cleaned up either way, so a failure here does not leave a stray
+        // process behind for the next run of the suite to trip over.
+        let survived = alive(job);
+        if survived {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &job.to_string()])
+                .status();
+        }
+        assert!(!survived, "pid {job} outlived DMACommander");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn killing_a_shell_takes_its_children_with_it() {
+        let dir = std::env::temp_dir().join(format!("dmac-tree-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let pidfile = dir.join("grandchild.pid");
+
+        let mut h = Hosted::spawn(
+            "/bin/sh",
+            &[
+                "-c".into(),
+                format!("sleep 300 & echo $! > {}; wait", pidfile.to_string_lossy()),
+            ],
+            None,
+            40,
+            10,
+            100,
+            None,
+        )
+        .expect("spawn");
+
+        // Wait for the grandchild to exist and announce itself.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let grandchild = loop {
+            if let Ok(text) = std::fs::read_to_string(&pidfile)
+                && let Ok(pid) = text.trim().parse::<i32>()
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "the grandchild never started");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(alive(grandchild), "the grandchild should be running");
+
+        h.kill();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while alive(grandchild) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !alive(grandchild),
+            "pid {grandchild} outlived the shell that started it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Signal 0 asks the kernel whether a process exists without disturbing it.
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    fn alive(pid: i32) -> bool {
+        // SAFETY: two integers in, one out; signal 0 delivers nothing.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// Dropping a hosted shell has to clean up as thoroughly as killing it, or
+    /// closing a session leaks the tree instead of the whole application doing.
+    #[cfg(unix)]
+    #[test]
+    fn dropping_a_shell_also_takes_its_children() {
+        let dir = std::env::temp_dir().join(format!("dmac-drop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let pidfile = dir.join("grandchild.pid");
+
+        let grandchild = {
+            let _h = Hosted::spawn(
+                "/bin/sh",
+                &[
+                    "-c".into(),
+                    format!("sleep 300 & echo $! > {}; wait", pidfile.to_string_lossy()),
+                ],
+                None,
+                40,
+                10,
+                100,
+                None,
+            )
+            .expect("spawn");
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&pidfile)
+                    && let Ok(pid) = text.trim().parse::<i32>()
+                {
+                    break pid;
+                }
+                assert!(Instant::now() < deadline, "the grandchild never started");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while alive(grandchild) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!alive(grandchild), "pid {grandchild} survived the drop");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A program that ignores the polite signal still has to go, or quitting
+    /// would hang on anything that traps SIGHUP.
+    #[cfg(unix)]
+    #[test]
+    fn something_that_ignores_a_hangup_is_still_killed() {
+        let mut h = Hosted::spawn(
+            "/bin/sh",
+            &["-c".into(), "trap '' HUP TERM; sleep 300".into()],
+            None,
+            40,
+            10,
+            100,
+            None,
+        )
+        .expect("spawn");
+        let pid = 0; // only the shell matters here
+        let _ = pid;
+        let started = Instant::now();
+        h.kill();
+        assert!(
+            h.finished() || h.exit_status().is_some() || started.elapsed() < Duration::from_secs(3)
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "quitting waited {:?} on a process that ignores signals",
+            started.elapsed()
+        );
     }
 }
