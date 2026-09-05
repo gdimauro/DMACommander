@@ -54,6 +54,19 @@ impl Theme {
         }
     }
 
+    /// The same theme with the panel background taken down to black.
+    ///
+    /// Full screen is for looking at contents, and Norton blue is frame: it
+    /// reads as a surface holding something. Black reads as nothing, which is
+    /// the point. The foregrounds are left alone — they were chosen against a
+    /// dark ground and still work.
+    pub fn blacked_out(&self) -> Self {
+        Self {
+            panel_bg: Color::Black,
+            ..self.clone()
+        }
+    }
+
     pub fn panel(&self) -> Style {
         Style::default().fg(self.panel_fg).bg(self.panel_bg)
     }

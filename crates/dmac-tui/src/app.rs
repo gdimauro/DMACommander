@@ -153,6 +153,8 @@ pub struct App {
     /// Set when the session set changed; the loop flushes it, debounced, so a
     /// burst of edits costs one write rather than one per keystroke.
     dirty_at: Option<std::time::Instant>,
+    /// Full screen: the frame stripped off, leaving only contents on black.
+    pub(crate) fullscreen: bool,
     pub(crate) cursor_style: CursorStyle,
     /// When the software cursor last flipped. Only used in `Software` mode.
     cursor_phase: std::time::Instant,
@@ -232,6 +234,7 @@ impl App {
             splash_until: splash
                 .then(|| std::time::Instant::now() + std::time::Duration::from_millis(1800)),
             should_quit: false,
+            fullscreen: false,
             last_shell_frame: std::time::Instant::now(),
             tx,
         }
@@ -258,11 +261,14 @@ impl App {
     /// Whether a text cursor is on screen at all: only when the command line has
     /// focus, nothing is overlaying it, and the terminal is drawing it for us.
     fn shows_text_cursor(&self) -> bool {
-        !self.cursor_style.is_software()
-            && self.ses().focus == Focus::CommandLine
-            && self.mode == Mode::Normal
-            && !self.screensaver.is_active()
-            && !self.splash_visible()
+        !self.cursor_style.is_software() && self.wants_text_cursor()
+    }
+
+    /// The software cursor's state for this frame, or `None` when the real
+    /// terminal cursor is being used instead.
+    pub(crate) fn software_cursor(&self) -> Option<bool> {
+        (self.cursor_style.is_software() && self.wants_text_cursor())
+            .then(|| self.software_cursor_on())
     }
 
     /// Whether the software cursor is in its visible half. The classic terminal
@@ -273,15 +279,30 @@ impl App {
         (self.cursor_phase.elapsed().as_millis() / PERIOD_MS).is_multiple_of(2)
     }
 
+    /// Whether a text cursor belongs on screen this frame, in either style.
+    ///
+    /// One predicate for both, because they must never disagree: a frame that
+    /// draws a cursor and does not tell it to blink is exactly how a blinking
+    /// cursor silently stops blinking.
+    fn wants_text_cursor(&self) -> bool {
+        if self.mode != Mode::Normal || self.screensaver.is_active() || self.splash_visible() {
+            return false;
+        }
+        match self.ses().view {
+            // The hosted program decides. An editor that hid its cursor must
+            // stay without one — putting it back would be dmac overriding a
+            // decision the program made about its own display.
+            View::Shell => self.ses().hosted().is_some_and(|s| {
+                !s.finished() && s.with_screen(|sc| !sc.hide_cursor()).unwrap_or(false)
+            }),
+            View::Panels => self.ses().focus == Focus::CommandLine,
+        }
+    }
+
     /// When the software cursor next needs redrawing, if it is in use and
     /// visible. `None` costs no timer, which is the usual case.
     fn cursor_deadline(&self) -> Option<std::time::Instant> {
-        if !self.cursor_style.is_software()
-            || self.ses().focus != Focus::CommandLine
-            || self.mode != Mode::Normal
-            || self.screensaver.is_active()
-            || self.splash_visible()
-        {
+        if !self.cursor_style.is_software() || !self.wants_text_cursor() {
             return None;
         }
         const PERIOD: std::time::Duration = std::time::Duration::from_millis(530);
@@ -561,6 +582,7 @@ impl App {
                 s.generation.swap(0, 1);
             }
             ToggleShell => self.toggle_shell(),
+            ToggleFullscreen => self.toggle_fullscreen(),
             Refresh => self.reload(self.ses().active),
 
             ToggleSelection => self.active_panel_mut().toggle_selection(),
@@ -860,6 +882,39 @@ impl App {
             .then(|| self.last_shell_frame + SHELL_FRAME_FLOOR)
     }
 
+    /// Keep the hosted shell exactly the size of the pane showing it.
+    ///
+    /// A terminal program redraws itself when its terminal changes size, and it
+    /// only knows because the terminal tells it. This used to happen lazily, on
+    /// the way through `send_to_shell`, so a hosted `vim` or `htop` kept the old
+    /// geometry until the user pressed a key — the window had been resized and
+    /// the program inside it had not been told.
+    ///
+    /// Called after the frame, because the pane's size is what the renderer just
+    /// recorded. The child repaints in its own time and its output asks for the
+    /// frame that shows it.
+    pub(crate) fn sync_shell_size(&mut self) {
+        if self.ses().view != View::Shell {
+            return;
+        }
+        let (cols, rows) = self.shell_size();
+        if let Some(sh) = self.ses_mut().shell.as_mut() {
+            // `resize` is a no-op when the size already matches, so this costs
+            // nothing on the overwhelming majority of frames.
+            let _ = sh.resize(cols, rows);
+        }
+    }
+
+    /// Strip the frame off, or put it back.
+    fn toggle_fullscreen(&mut self) {
+        self.fullscreen = !self.fullscreen;
+        self.status = if self.fullscreen {
+            "full screen — F11 to bring the frame back".into()
+        } else {
+            String::new()
+        };
+    }
+
     /// Show the shell, or go back to the panels.
     fn toggle_shell(&mut self) {
         if self.ses().view == View::Shell {
@@ -871,6 +926,11 @@ impl App {
         let waker = self.waker();
         match self.ses_mut().shell(cols, rows, waker) {
             Ok(_) => {
+                // Norton's Ctrl-O landed you where the panel was, and that is
+                // most of why it was worth pressing. Done on the way in rather
+                // than on every navigation, so a shell you are not looking at
+                // is never typed into behind your back.
+                self.ses_mut().follow_panel_cwd();
                 self.ses_mut().view = View::Shell;
                 self.status.clear();
             }
@@ -1122,15 +1182,21 @@ impl App {
         }
 
         // While the shell is showing it owns the keyboard, or half the keys a
-        // shell needs would be eaten by the file manager. Exactly one binding is
-        // reserved: the one that gets you back out.
+        // shell needs would be eaten by the file manager. Two bindings are
+        // reserved: the one that gets you back out, and the one that changes
+        // how the screen is drawn — a display mode that stopped working in one
+        // view would be a worse surprise than a hosted program losing F11.
         if self.ses().view == View::Shell {
-            if matches!(
-                keymap::resolve(k, self.ses().focus),
-                Some(Action::ToggleShell)
-            ) {
-                self.toggle_shell();
-                return;
+            match keymap::resolve(k, self.ses().focus) {
+                Some(Action::ToggleShell) => {
+                    self.toggle_shell();
+                    return;
+                }
+                Some(Action::ToggleFullscreen) => {
+                    self.toggle_fullscreen();
+                    return;
+                }
+                _ => {}
             }
             self.send_to_shell(k);
             return;
@@ -1635,6 +1701,7 @@ pub async fn run(mut start: Startup) -> anyhow::Result<()> {
     loop {
         app.before_frame();
         guard.terminal().draw(|f| ui::draw(f, &mut app))?;
+        app.sync_shell_size();
 
         // Re-assert the cursor shape, but only on frames that actually show a
         // cursor. Terminals reset DECSCUSR for reasons outside our control, and
@@ -2355,5 +2422,174 @@ mod tests {
         assert_eq!(app.ses_mut().panels[0].sort_order, SortOrder::Ascending);
         app.handle(Action::SortBy(dmac_core::SortKey::Size));
         assert_eq!(app.ses_mut().panels[0].sort_order, SortOrder::Descending);
+    }
+
+    /// Full screen takes the frame off and leaves the contents. If a border
+    /// survives it, the mode has not done the one thing it is for.
+    #[test]
+    fn full_screen_removes_every_border_and_the_f_key_bar() {
+        let mut app = fixture();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let framed: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(framed.contains('│'), "the normal frame should have borders");
+
+        app.handle(Action::ToggleFullscreen);
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let bare: String = buf.content().iter().map(|c| c.symbol()).collect();
+
+        // Corners only, plus the columns a box would occupy. A filename can
+        // legitimately contain '│' — the fixture has one — so the bare glyph is
+        // not evidence of a border, and asserting on it tests the fixture.
+        for ch in ['┌', '┐', '└', '┘'] {
+            assert!(
+                !bare.contains(ch),
+                "full screen still draws a box corner {ch:?}"
+            );
+        }
+        for y in 0..23 {
+            for x in [0u16, 40, 79] {
+                let c = buf[(x, y)].symbol();
+                assert_ne!(c, "│", "a panel edge survived at {x},{y}");
+            }
+        }
+        let last: String = (0..80).map(|x| buf[(x, 23)].symbol().to_string()).collect();
+        assert!(
+            !last.contains("Copy"),
+            "the F-key bar should be gone: {last:?}"
+        );
+    }
+
+    /// Black, not Norton blue: full screen is for looking at contents, and blue
+    /// reads as a surface holding something.
+    #[test]
+    fn full_screen_paints_the_background_black() {
+        let mut app = fixture();
+        app.handle(Action::ToggleFullscreen);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+
+        let buf = term.backend().buffer();
+        let blue = buf
+            .content()
+            .iter()
+            .filter(|c| c.style().bg == Some(ratatui::style::Color::Blue))
+            .count();
+        assert_eq!(blue, 0, "{blue} cells are still Norton blue");
+    }
+
+    /// The row the F-key bar gave up has to go to the listing, or the mode costs
+    /// a border and buys nothing.
+    #[test]
+    fn full_screen_gives_its_rows_to_the_listing() {
+        let mut app = fixture();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let framed = app.layout.panels[0].height;
+
+        app.handle(Action::ToggleFullscreen);
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let bare = app.layout.panels[0].height;
+
+        assert!(
+            bare > framed,
+            "full screen showed {bare} rows against {framed} framed"
+        );
+    }
+
+    #[test]
+    fn f11_is_full_screen_and_toggles_back() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        assert_eq!(
+            keymap::resolve(
+                KeyEvent::new(KeyCode::F(11), KeyModifiers::NONE),
+                Focus::Panel
+            ),
+            Some(Action::ToggleFullscreen)
+        );
+        let mut app = fixture();
+        assert!(!app.fullscreen);
+        app.handle(Action::ToggleFullscreen);
+        assert!(app.fullscreen);
+        app.handle(Action::ToggleFullscreen);
+        assert!(!app.fullscreen);
+    }
+
+    /// The collapsed strip is a hint and goes with the rest of the frame, but a
+    /// rail you opened on purpose is contents and must still work.
+    #[test]
+    fn the_rail_still_opens_in_full_screen() {
+        let mut app = fixture();
+        app.handle(Action::ToggleFullscreen);
+        app.handle(Action::ToggleRail);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert!(
+            app.layout.rail.width > 0,
+            "the rail vanished in full screen"
+        );
+    }
+
+    /// A hosted CLI you cannot see the cursor of is a CLI you cannot tell is
+    /// waiting for you. The style is re-asserted every frame that shows one, so
+    /// this predicate is also what makes it blink.
+    #[cfg(unix)]
+    #[test]
+    fn the_hosted_shell_gets_a_visible_cursor() {
+        let mut app = fixture();
+        assert!(
+            !app.wants_text_cursor(),
+            "a panel with the keyboard must have no cursor"
+        );
+
+        app.handle(Action::ToggleShell);
+        assert_eq!(app.ses().view, View::Shell);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !app.wants_text_cursor() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            app.wants_text_cursor(),
+            "the hosted shell never showed a cursor"
+        );
+        assert!(
+            app.shows_text_cursor(),
+            "and its style is never re-asserted"
+        );
+    }
+
+    /// A terminal program only learns it was resized because the terminal tells
+    /// it. Doing that lazily is why a hosted `vim` kept the old geometry until
+    /// the next keystroke.
+    #[cfg(unix)]
+    #[test]
+    fn resizing_reaches_the_hosted_shell_without_a_keystroke() {
+        let mut app = fixture();
+        app.handle(Action::ToggleShell);
+
+        let mut small = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        small.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        app.sync_shell_size();
+        let before = app.ses().hosted().map(|s| s.size()).expect("a shell");
+
+        let mut big = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        big.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        app.sync_shell_size();
+        let after = app.ses().hosted().map(|s| s.size()).expect("a shell");
+
+        assert_ne!(before, after, "the child was never told the window changed");
+        assert!(
+            after.0 > before.0 && after.1 > before.1,
+            "expected a bigger pty than {before:?}, got {after:?}"
+        );
     }
 }

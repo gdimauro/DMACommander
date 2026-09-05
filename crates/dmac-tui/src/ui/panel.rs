@@ -24,10 +24,20 @@ pub fn draw(
     panel: &mut Panel,
     active: bool,
     focused: bool,
+    bordered: bool,
     theme: &Theme,
 ) {
+    // Unbordered, the title stays: without a box around it the path is the only
+    // thing saying which directory these rows are, and losing it to save one
+    // line would make full screen worse, not cleaner. The item count goes,
+    // because the panel is a list and a list you can see the end of counts
+    // itself.
     let block = Block::default()
-        .borders(Borders::ALL)
+        .borders(if bordered {
+            Borders::ALL
+        } else {
+            Borders::NONE
+        })
         .border_type(BorderType::Plain)
         .border_style(theme.border(active))
         .title(Span::styled(
@@ -38,11 +48,15 @@ pub fn draw(
             ),
             theme.border(active),
         ))
-        .title_bottom(Span::styled(
+        .style(theme.panel());
+    let block = if bordered {
+        block.title_bottom(Span::styled(
             format!(" {} items ", panel.len()),
             theme.border(active),
         ))
-        .style(theme.panel());
+    } else {
+        block
+    };
 
     let inner = block.inner(area);
     frame.render_widget(block, area);

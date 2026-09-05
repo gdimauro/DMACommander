@@ -92,6 +92,11 @@ pub struct Session {
     /// sessions never need one, and paying for a process per session up front
     /// would be a cost for nothing.
     pub shell: Option<Hosted>,
+    /// Where the hosted shell was last sent. Compared against the panel's
+    /// directory so a `cd` is written when it would change something, and not
+    /// on every visit — re-entering a directory you are already in still costs
+    /// a line of scrollback and a wasted prompt.
+    pub shell_cwd: Option<VfsPath>,
     pub last_used: std::time::Instant,
 }
 
@@ -110,6 +115,7 @@ impl Session {
             panels_hidden: false,
             view: View::Panels,
             shell: None,
+            shell_cwd: None,
             last_used: std::time::Instant::now(),
         }
     }
@@ -167,6 +173,9 @@ impl Session {
             let cwd = self.cwd[Self::index_of(self.active)].clone();
             let dir = cwd.is_local().then(|| cwd.as_path().to_path_buf());
             self.shell = Some(Hosted::shell(dir.as_deref(), cols, rows, waker)?);
+            // It started there, so it is already there: recording it is what
+            // keeps the first Ctrl-O from writing a `cd` to where we already are.
+            self.shell_cwd = cwd.is_local().then(|| cwd.clone());
         }
         match self.shell.as_mut() {
             Some(s) => {
@@ -181,6 +190,28 @@ impl Session {
     /// The session's shell if it has one, without starting one.
     pub fn hosted(&self) -> Option<&Hosted> {
         self.shell.as_ref()
+    }
+
+    /// Send the hosted shell to the active panel's directory.
+    ///
+    /// Norton's Ctrl-O did this, and it is most of why the key was worth
+    /// pressing: the panels are how you navigate, and a shell that ignores
+    /// where you navigated to is a shell you have to re-navigate by hand.
+    ///
+    /// Silent when it cannot be done — a remote or in-archive directory has no
+    /// meaning to a shell, and a shell running something must not be typed
+    /// into. Neither is an error worth interrupting anyone about.
+    pub fn follow_panel_cwd(&mut self) {
+        let cwd = self.cwd[Self::index_of(self.active)].clone();
+        if !cwd.is_local() || self.shell_cwd.as_ref() == Some(&cwd) {
+            return;
+        }
+        let Some(shell) = self.shell.as_mut() else {
+            return;
+        };
+        if matches!(shell.cd(cwd.as_path()), Ok(true)) {
+            self.shell_cwd = Some(cwd);
+        }
     }
 
     pub fn shell_running(&self) -> bool {

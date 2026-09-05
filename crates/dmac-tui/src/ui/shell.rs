@@ -16,7 +16,18 @@ use ratatui::widgets::{Block, BorderType, Borders};
 
 /// Draw the hosted screen into `area`, returning the interior rect so the caller
 /// can keep the PTY the same size as what is visible.
-pub fn draw(frame: &mut Frame, area: Rect, shell: &Hosted, focused: bool, theme: &Theme) -> Rect {
+/// `software_cursor` is `Some(on)` when the caller draws its own cursor because
+/// the terminal cannot be trusted to blink one, and `None` when the real
+/// terminal cursor is being used.
+pub fn draw(
+    frame: &mut Frame,
+    area: Rect,
+    shell: &Hosted,
+    focused: bool,
+    bordered: bool,
+    software_cursor: Option<bool>,
+    theme: &Theme,
+) -> Rect {
     let title = if shell.finished() {
         format!(" {} (exited) ", shell.program())
     } else {
@@ -24,12 +35,21 @@ pub fn draw(frame: &mut Frame, area: Rect, shell: &Hosted, focused: bool, theme:
     };
 
     let block = Block::default()
-        .borders(Borders::ALL)
+        .borders(if bordered {
+            Borders::ALL
+        } else {
+            Borders::NONE
+        })
         .border_type(BorderType::Plain)
         .border_style(theme.border(focused))
-        .title(Span::styled(title, theme.border(focused)))
-        .title_bottom(Span::styled(" Ctrl-O panels ", theme.border(false)))
         .style(Style::default().bg(Color::Black));
+    let block = if bordered {
+        block
+            .title(Span::styled(title, theme.border(focused)))
+            .title_bottom(Span::styled(" Ctrl-O panels ", theme.border(false)))
+    } else {
+        block
+    };
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -58,14 +78,31 @@ pub fn draw(frame: &mut Frame, area: Rect, shell: &Hosted, focused: bool, theme:
 
     // The child's cursor, only when the shell has the keyboard. Two visible
     // cursors is worse than none.
+    //
+    // A hosted CLI without a visible cursor is a CLI you cannot tell is
+    // waiting for you, so this matters more here than on the command line.
+    // `hide_cursor` is the child's own decision and is always honoured.
     if focused && !shell.finished() {
         shell.with_screen(|screen| {
             if screen.hide_cursor() {
                 return;
             }
             let (row, col) = screen.cursor_position();
-            if row < inner.height && col < inner.width {
-                frame.set_cursor_position((inner.x + col, inner.y + row));
+            if row >= inner.height || col >= inner.width {
+                return;
+            }
+            let at = (inner.x + col, inner.y + row);
+            match software_cursor {
+                // Drawn, not asked for: some terminals ignore the request to
+                // blink, and inverting the cell works in every one of them.
+                Some(on) => {
+                    if on {
+                        frame.buffer_mut()[at].set_style(
+                            Style::default().add_modifier(ratatui::style::Modifier::REVERSED),
+                        );
+                    }
+                }
+                None => frame.set_cursor_position(at),
             }
         });
     }

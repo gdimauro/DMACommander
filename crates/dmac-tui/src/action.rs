@@ -45,6 +45,11 @@ pub enum Action {
     /// is a real shell to reveal.
     ToggleShell,
 
+    /// F11: strip the screen down to its contents — no borders, no F-key bar,
+    /// black behind everything. The panels stay exactly where they are, so it
+    /// is the frame that goes, not the layout.
+    ToggleFullscreen,
+
     // Selection
     /// Shift+Up/Down: grow or shrink an anchored selection by rows.
     ExtendSelection(isize),

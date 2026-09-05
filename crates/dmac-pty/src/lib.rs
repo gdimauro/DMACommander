@@ -285,6 +285,48 @@ impl Hosted {
         self.parser.lock().ok().map(|p| f(p.screen()))
     }
 
+    /// Whether the child has nothing running in the foreground — that is,
+    /// whether a shell is sitting at its prompt.
+    ///
+    /// The terminal's foreground process group is the shell itself exactly when
+    /// no command is running in it. This is what makes it safe to type at a
+    /// hosted shell on the user's behalf: without the check, a `cd` sent while
+    /// the user has `vim` open is not a directory change, it is two stray
+    /// keystrokes in the middle of their document.
+    ///
+    /// Answers `false` whenever it cannot tell, which is the safe direction:
+    /// the cost is a directory that did not follow, not a corrupted file.
+    pub fn at_prompt(&self) -> bool {
+        #[cfg(unix)]
+        {
+            match (self.master.process_group_leader(), self.child.process_id()) {
+                (Some(fg), Some(pid)) => fg >= 0 && fg as u32 == pid,
+                _ => false,
+            }
+        }
+        // Windows has no foreground process group to ask about, so there is no
+        // way to know, and guessing is exactly what must not happen here.
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    /// Send the child to `dir`, if it is idle enough for that to mean what it
+    /// says. Returns whether anything was sent.
+    pub fn cd(&mut self, dir: &Path) -> Result<bool> {
+        if self.finished() || !self.at_prompt() {
+            return Ok(false);
+        }
+        let line = if cfg!(windows) {
+            format!("cd /d {}", quote(&dir.to_string_lossy()))
+        } else {
+            format!("cd -- {}", quote(&dir.to_string_lossy()))
+        };
+        self.run(&line)?;
+        Ok(true)
+    }
+
     /// Ask the child to terminate, then stop waiting for it.
     pub fn kill(&mut self) {
         let _ = self.child.kill();
@@ -310,6 +352,27 @@ impl std::fmt::Debug for Hosted {
             .field("finished", &self.finished())
             .finish()
     }
+}
+
+/// Wrap a string so a shell reads it as one literal word.
+///
+/// A path is data. It arrives from the filesystem, from an archive, or from a
+/// remote listing, and a directory really can be called `; rm -rf ~` — nothing
+/// stops anyone creating one. Single quotes suspend every kind of expansion a
+/// shell does, and the only character they cannot contain is the single quote
+/// itself, which is closed, escaped and reopened.
+fn quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// The user's shell, from the environment, with a platform-appropriate default.
@@ -578,5 +641,79 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(h.dirty(), "an exited child left nothing to redraw");
+    }
+
+    /// A directory can be called almost anything, including things that look
+    /// like shell syntax. If quoting is wrong here, browsing into a directory
+    /// runs its name.
+    #[test]
+    fn quoting_makes_a_path_one_literal_word() {
+        assert_eq!(quote("/tmp/plain"), "'/tmp/plain'");
+        assert_eq!(quote("/tmp/with space"), "'/tmp/with space'");
+        assert_eq!(quote("/tmp/; rm -rf ~"), "'/tmp/; rm -rf ~'");
+        assert_eq!(quote("/tmp/$(whoami)"), "'/tmp/$(whoami)'");
+        assert_eq!(quote("/tmp/`id`"), "'/tmp/`id`'");
+        assert_eq!(quote("/tmp/a'b"), r#"'/tmp/a'\''b'"#);
+    }
+
+    /// The escaping has to survive a real shell, not just look right.
+    #[cfg(unix)]
+    #[test]
+    fn a_hostile_directory_name_is_entered_not_executed() {
+        let base = std::env::temp_dir().join(format!("dmac-cd-{}", std::process::id()));
+        let evil = base.join("a'b; touch PWNED $(id) `id`");
+        if std::fs::create_dir_all(&evil).is_err() {
+            eprintln!("skipping: this filesystem will not take that name");
+            return;
+        }
+
+        let mut h = Hosted::spawn("/bin/sh", &[], Some(&base), 200, 10, 200, None).expect("spawn");
+        wait_for(&h, 3.0, |t| !t.trim().is_empty());
+        assert!(
+            h.cd(&evil).expect("cd"),
+            "the shell was idle; cd should have gone"
+        );
+        h.run("pwd").expect("pwd");
+        let text = wait_for(&h, 3.0, |t| t.contains("a'b;"));
+        h.kill();
+
+        assert!(
+            text.contains("a'b;"),
+            "never arrived in the directory: {text:?}"
+        );
+        assert!(
+            !base.join("PWNED").exists(),
+            "the directory name was executed instead of entered"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The whole point of the idle check: a shell running something must not be
+    /// typed into, or the `cd` lands in whatever has the terminal.
+    #[cfg(unix)]
+    #[test]
+    fn a_busy_shell_is_left_alone() {
+        let mut h = Hosted::spawn("/bin/sh", &[], None, 80, 10, 200, None).expect("spawn");
+        wait_for(&h, 3.0, |t| !t.trim().is_empty());
+        assert!(h.at_prompt(), "a fresh shell should be at its prompt");
+
+        h.run("cat > /dev/null").expect("run");
+        let busy = Instant::now() + Duration::from_secs(3);
+        while h.at_prompt() && Instant::now() < busy {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!h.at_prompt(), "a foreground command should read as busy");
+        assert!(
+            !h.cd(&std::env::temp_dir()).expect("cd"),
+            "sent a cd into a running program's stdin"
+        );
+
+        h.write(&[0x04]).expect("eof"); // end `cat`
+        let idle = Instant::now() + Duration::from_secs(3);
+        while !h.at_prompt() && Instant::now() < idle {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(h.at_prompt(), "the shell never came back to its prompt");
+        h.kill();
     }
 }

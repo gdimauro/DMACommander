@@ -68,13 +68,19 @@ pub fn resolve(key: KeyEvent, focus: Focus) -> Option<Action> {
         (KeyCode::Home, false, false) => Action::GoTop,
         (KeyCode::End, false, false) => Action::GoBottom,
 
+        // Full screen. Global on purpose: it is a property of the display, so
+        // it has to work from the shell view too, which costs the hosted
+        // program one key it almost never wants.
+        (F(11), _, _) => Action::ToggleFullscreen,
+
         // --- Sessions ---
         (BackTab, _, _) => Action::ToggleRail,
         (Tab, _, _) if shift => Action::ToggleRail,
-        // F11 as a plain-key equivalent: Shift+Tab is claimed by a number of
+        // Ctrl-T as a plain-key equivalent: Shift+Tab is claimed by a number of
         // terminals (Warp among them) before it ever reaches the application,
-        // and a binding you cannot press is not a binding.
-        (F(11), _, _) => Action::ToggleRail,
+        // and a binding you cannot press is not a binding. `t` for the tab-like
+        // strip of sessions it opens.
+        (Char('t'), true, false) => Action::ToggleRail,
         // Alt+1..9. Digits, not F-keys: they are the numbers shown in the rail.
         (Char(c @ '1'..='9'), false, true) => {
             Action::SwitchSession(c.to_digit(10).unwrap_or(1) as usize - 1)

@@ -32,22 +32,47 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         return;
     }
 
-    // The command line and the F-key bar are always visible. Ctrl-O collapses
-    // only the panels, revealing the shell output underneath — the panels are
-    // the removable part, the bottom two rows are the app's spine.
+    // Full screen takes the frame off and leaves the contents: no borders, no
+    // F-key bar, black behind everything. The command line stays either way —
+    // it is not decoration, it is where you type.
+    let full = app.fullscreen;
+    let theme = if full {
+        app.theme.blacked_out()
+    } else {
+        app.theme.clone()
+    };
+    if full {
+        // The buffer starts unstyled, so anything not covered would show the
+        // host terminal's own background through it.
+        frame.render_widget(
+            ratatui::widgets::Block::default()
+                .style(Style::default().bg(ratatui::style::Color::Black)),
+            area,
+        );
+    }
+
+    // The command line is always visible. Ctrl-O collapses only the panels,
+    // revealing the shell output underneath — the panels are the removable
+    // part, the command line is the app's spine.
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(0),    // panels
-            Constraint::Length(1), // command line
-            Constraint::Length(1), // F-key bar
+            Constraint::Min(0),                           // panels
+            Constraint::Length(1),                        // command line
+            Constraint::Length(if full { 0 } else { 1 }), // F-key bar
         ])
         .split(area);
 
     // The rail pushes the panels rather than covering them, so both stay
     // readable and a file can eventually be dragged from a panel onto a session.
     let rail_open = app.rail_open;
-    let rail_w = rail::width(rail_open, rows[0].width);
+    // The collapsed strip is a hint, and a hint is frame. Opened deliberately,
+    // the rail is contents and stays.
+    let rail_w = if full && !rail_open {
+        0
+    } else {
+        rail::width(rail_open, rows[0].width)
+    };
     let body = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(rail_w), Constraint::Min(0)])
@@ -67,17 +92,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         &app.sessions,
         rail_open,
         rail_cursor,
-        &app.theme,
+        &theme,
     );
+    let software_cursor = app.software_cursor();
 
     // Split the borrow: the current session's panels are drawn mutably (they
     // record their viewport height) while the theme is read.
     let App {
-        sessions,
-        theme,
-        layout,
-        ..
+        sessions, layout, ..
     } = app;
+    let theme = &theme;
     let session = sessions.current_mut();
     let (active, focus, panels_hidden) = (session.active, session.focus, session.panels_hidden);
 
@@ -89,7 +113,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // both halves too little room to be useful.
     if session.view == dmac_session::View::Shell {
         if let Some(sh) = session.shell.as_ref() {
-            layout.shell = shell::draw(frame, body[1], sh, true, theme);
+            layout.shell = shell::draw(frame, body[1], sh, true, !full, software_cursor, theme);
             layout.panels = [ratatui::layout::Rect::default(); 2];
         }
     } else if !panels_hidden {
@@ -105,7 +129,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         {
             // Record the *interior* rect so a click maps straight to a row with
             // no border arithmetic at the call site.
-            layout.panels[i] = inner(cols[i]);
+            // Without a border the interior still starts one row down: the
+            // title keeps its line, so a click maps to the same row either way.
+            layout.panels[i] = if full {
+                let mut r = cols[i];
+                r.y = r.y.saturating_add(1);
+                r.height = r.height.saturating_sub(1);
+                r
+            } else {
+                inner(cols[i])
+            };
             let is_active = active == id;
             panel::draw(
                 frame,
@@ -113,6 +146,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 &mut panels[i],
                 is_active,
                 is_active && focus == crate::app::Focus::Panel,
+                !full,
                 theme,
             );
         }
@@ -121,18 +155,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     draw_command_line(frame, rows[1], app);
-    fkeybar::draw(frame, rows[2], &app.theme);
+    if !full {
+        fkeybar::draw(frame, rows[2], theme);
+    }
 
     match app.mode {
         crate::app::Mode::Picker { selected } => {
-            app.layout.picker = picker::draw(frame, area, dmac_fx::catalog(), selected, &app.theme);
+            app.layout.picker = picker::draw(frame, area, dmac_fx::catalog(), selected, theme);
         }
         crate::app::Mode::Context { selected, anchor } => {
             let items = app.context_items();
-            app.layout.menu = menu::draw(frame, area, anchor, &items, selected, &app.theme);
+            app.layout.menu = menu::draw(frame, area, anchor, &items, selected, theme);
         }
         crate::app::Mode::Prompt { intent } => {
-            prompt::draw(frame, area, intent.title(), &app.prompt_value, &app.theme);
+            prompt::draw(frame, area, intent.title(), &app.prompt_value, theme);
         }
         crate::app::Mode::Rail { .. } | crate::app::Mode::Normal => {
             app.layout.picker = ratatui::layout::Rect::default();
@@ -143,7 +179,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Over the panels rather than instead of them: the app is already usable
     // behind it, and it should look that way.
     if app.splash_visible() {
-        splash::draw(frame, area, &app.theme);
+        splash::draw(frame, area, theme);
     }
 
     // Last, so it sits on top of everything: DOS text mode had no pointer
