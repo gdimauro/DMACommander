@@ -9,6 +9,7 @@
 // In non-test code the workspace lints still forbid them.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod audio;
 pub mod canvas;
 pub mod effects;
 pub mod screensaver;
@@ -132,6 +133,11 @@ pub fn catalog() -> &'static [CatalogEntry] {
             blurb: "the 1995 office classic",
         },
         CatalogEntry {
+            name: "spectrum",
+            kind: Screensaver,
+            blurb: "listens to the room and draws it",
+        },
+        CatalogEntry {
             name: "asteroids",
             kind: Demo,
             blurb: "the computer plays; space to take over",
@@ -175,6 +181,7 @@ pub fn build(name: &str) -> Option<Box<dyn Effect>> {
         "plasma" => Some(Box::new(effects::plasma::Plasma::new())),
         "life" => Some(Box::new(effects::life::Life::new())),
         "pipes" => Some(Box::new(effects::pipes::Pipes::new())),
+        "spectrum" => Some(Box::new(effects::spectrum::Spectrum::new())),
         "asteroids" => Some(Box::new(effects::asteroids::Asteroids::new())),
         "snake" => Some(Box::new(effects::snake::Snake::new())),
         _ => None,

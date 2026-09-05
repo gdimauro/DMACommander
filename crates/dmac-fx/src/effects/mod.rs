@@ -7,4 +7,5 @@ pub mod matrix;
 pub mod pipes;
 pub mod plasma;
 pub mod snake;
+pub mod spectrum;
 pub mod starfield;

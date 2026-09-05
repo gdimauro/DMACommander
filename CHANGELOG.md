@@ -6,6 +6,15 @@ Notable changes, newest first. Versions follow the policy in
 ## Unreleased
 
 ### Added
+- **A spectrum analyser that listens to the room.** Log-spaced frequency bands,
+  because linear FFT bins put everything musical in the leftmost tenth of the
+  screen; fast attack and slow decay, because a transient has to arrive
+  instantly and leave slowly; and eight block glyphs per row for sub-cell
+  resolution, so quiet passages still move. The microphone is opened when the
+  effect starts and released when it stops — a file manager holding the
+  microphone open while you are not looking at it is not one anybody should
+  trust. No device, no permission or an unsupported format each say so on screen,
+  with what to do about it.
 - **The session rail is a manager, not just a display.** `Shift-Tab` or `F11`
   opens it *and* hands it the keyboard: `↑↓` move the highlight without switching
   (you look before you leap), `Enter` switches, `n` creates, `r` renames, `d`
