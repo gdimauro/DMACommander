@@ -13,6 +13,8 @@ workspace = true
 
 [dependencies]
 arboard = { version = "3.6.1", default-features = false }
+getrandom = "0.3.4"
 jiff = "0.2.35"
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.20"
+uuid = { version = "1.11.0", features = ["v4"] }

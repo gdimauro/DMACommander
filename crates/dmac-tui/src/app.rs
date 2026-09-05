@@ -89,6 +89,10 @@ pub(crate) enum Mode {
     Prompt {
         intent: PromptIntent,
     },
+    /// The utilities menu, with the highlighted row.
+    Utilities {
+        selected: usize,
+    },
 }
 
 /// What a prompt is collecting. The value itself lives on `App`, because a
@@ -606,6 +610,11 @@ impl App {
             }
             ToggleShell => self.toggle_shell(),
             ToggleFullscreen => self.toggle_fullscreen(),
+            UtilitiesMenu => {
+                self.mode = Mode::Utilities {
+                    selected: crate::ui::menu::first_selectable(&crate::utilities::items()),
+                };
+            }
             ClipboardCopy => self.copy_selection(),
             ClipboardPaste => self.paste_into_shell(),
             Refresh => self.reload(self.ses().active),
@@ -1312,6 +1321,7 @@ impl App {
             Mode::Context { selected, anchor } => return self.context_key(k, selected, anchor),
             Mode::Rail { selected } => return self.rail_key(k, selected),
             Mode::Prompt { intent } => return self.prompt_key(k, intent),
+            Mode::Utilities { selected } => return self.utilities_key(k, selected),
             Mode::Normal => {}
         }
 
@@ -1343,6 +1353,98 @@ impl App {
         if let Some(action) = keymap::resolve(k, self.ses().focus) {
             self.handle(action);
         }
+    }
+
+    /// Driving the utilities menu.
+    fn utilities_key(&mut self, k: KeyEvent, selected: usize) {
+        use crate::utilities::Utility;
+        let items = crate::utilities::items();
+        match k.code {
+            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Up => {
+                if let Some(i) = crate::ui::menu::next_selectable(&items, selected, -1) {
+                    self.mode = Mode::Utilities { selected: i };
+                }
+            }
+            KeyCode::Down => {
+                if let Some(i) = crate::ui::menu::next_selectable(&items, selected, 1) {
+                    self.mode = Mode::Utilities { selected: i };
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(u) = Utility::at(selected) {
+                    self.run_utility(u);
+                }
+            }
+            // The accelerator shown in the hint column. A menu that lists its
+            // shortcuts and does not answer to them is worse than one that
+            // lists none.
+            KeyCode::Char(c) => {
+                if let Some(u) = Utility::from_key(c.to_ascii_lowercase()) {
+                    self.run_utility(u);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Apply a utility to the command line, and get out of the menu's way.
+    fn run_utility(&mut self, u: crate::utilities::Utility) {
+        use crate::utilities::{Context, Outcome};
+
+        let ses = self.ses();
+        let this = Self::idx(ses.active);
+        let other = 1 - this;
+        let panel = &ses.panels[this];
+        let base = ses.cwd[this].clone();
+        let names: Vec<String> = panel.operands().iter().map(|e| e.name.clone()).collect();
+        let paths: Vec<String> = names
+            .iter()
+            .map(|n| match base.join(n) {
+                Some(p) => p.to_string(),
+                // A name the VFS refuses to join is shown as itself rather than
+                // dropped: a shorter list than the one you selected is the kind
+                // of wrong that gets noticed after the command has run.
+                None => n.clone(),
+            })
+            .collect();
+
+        let cx = Context {
+            line: &ses.command_line,
+            this_path: ses.cwd[this].to_string(),
+            other_path: ses.cwd[other].to_string(),
+            selected: names,
+            selected_paths: paths,
+        };
+
+        match crate::utilities::run(u, &cx) {
+            Outcome::Insert(text) => {
+                let line = &mut self.ses_mut().command_line;
+                // A separating space, but only where one is wanted: after
+                // `cd ` there is already one, and at the start there is nothing
+                // to separate from.
+                if !line.is_empty() && !line.ends_with(' ') {
+                    line.push(' ');
+                }
+                line.push_str(&text);
+                self.after_utility(u);
+            }
+            Outcome::Replace(text) => {
+                self.ses_mut().command_line = text;
+                self.after_utility(u);
+            }
+            // Left open on purpose: the menu is still there to pick something
+            // else, which is what you want when you picked the wrong entry.
+            Outcome::Nothing(why) => self.status = why.to_string(),
+        }
+    }
+
+    /// Close the menu and put the keyboard where the text landed.
+    fn after_utility(&mut self, u: crate::utilities::Utility) {
+        self.mode = Mode::Normal;
+        self.ses_mut().focus = Focus::CommandLine;
+        self.status = format!("{} — Enter to run, Ctrl-Y to clear", u.label());
+        self.touch_sessions();
     }
 
     fn picker_key(&mut self, k: KeyEvent, selected: usize) {

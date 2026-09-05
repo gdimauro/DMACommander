@@ -13,5 +13,6 @@ pub mod keymap;
 pub mod terminal;
 pub mod theme;
 pub(crate) mod ui;
+pub mod utilities;
 
 pub use app::run;

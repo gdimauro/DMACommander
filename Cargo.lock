@@ -628,9 +628,11 @@ name = "dmac-core"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "getrandom 0.3.4",
  "jiff",
  "serde",
  "thiserror 2.0.20",
+ "uuid",
 ]
 
 [[package]]
@@ -659,6 +661,7 @@ name = "dmac-pty"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dmac-core",
  "dmac-vfs",
  "portable-pty",
  "thiserror 2.0.20",

@@ -13,6 +13,7 @@
 pub mod clipboard;
 pub mod entry;
 pub mod panel;
+pub mod tools;
 
 pub use entry::{Entry, EntryKind, SortKey, SortOrder};
 pub use panel::{Panel, PanelId};

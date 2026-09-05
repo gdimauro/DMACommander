@@ -98,7 +98,13 @@ pub fn resolve(key: KeyEvent, focus: Focus) -> Option<Action> {
         (Tab, _, _) => Action::FocusNext,
         (Esc, _, _) => Action::FocusToggle,
 
-        (Char('u'), true, false) => Action::SwapPanels,
+        // Cmd-U as asked for, and Ctrl-U because Cmd never reaches a terminal
+        // application unless the terminal is configured to forward it — a
+        // binding you cannot press is not a binding. Swapping the panels, which
+        // is Ctrl-U in the canon, moves to Alt-U.
+        (Char('u'), _, _) if key.modifiers.contains(KeyModifiers::SUPER) => Action::UtilitiesMenu,
+        (Char('u'), true, false) => Action::UtilitiesMenu,
+        (Char('u'), false, true) => Action::SwapPanels,
         (Char('o'), true, false) => Action::ToggleShell,
         (Char('r'), true, false) => Action::Refresh,
         // Backspace goes up a directory only with a modifier now, because plain

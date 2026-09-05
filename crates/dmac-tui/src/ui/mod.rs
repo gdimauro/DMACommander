@@ -182,6 +182,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         crate::app::Mode::Prompt { intent } => {
             prompt::draw(frame, area, intent.title(), &app.prompt_value, theme);
         }
+        crate::app::Mode::Utilities { selected } => {
+            // Anchored at the command line, because that is where its output
+            // lands — the menu should point at what it is about to change.
+            let anchor = (rows[1].x + 2, rows[1].y);
+            app.layout.menu = menu::draw(
+                frame,
+                area,
+                anchor,
+                &crate::utilities::items(),
+                selected,
+                theme,
+            );
+        }
         crate::app::Mode::Rail { .. } | crate::app::Mode::Normal => {
             app.layout.picker = ratatui::layout::Rect::default();
             app.layout.menu = ratatui::layout::Rect::default();

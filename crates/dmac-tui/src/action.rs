@@ -53,6 +53,10 @@ pub enum Action {
     /// Paste the system clipboard into the hosted shell.
     ClipboardPaste,
 
+    /// Cmd-U / Ctrl-U: the utilities menu — generators, what the panels know,
+    /// and transforms of what is typed.
+    UtilitiesMenu,
+
     /// F11: strip the screen down to its contents — no borders, no F-key bar,
     /// black behind everything. The panels stay exactly where they are, so it
     /// is the frame that goes, not the layout.

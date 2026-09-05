@@ -319,9 +319,15 @@ impl Hosted {
             return Ok(false);
         }
         let line = if cfg!(windows) {
-            format!("cd /d {}", quote(&dir.to_string_lossy()))
+            format!(
+                "cd /d {}",
+                dmac_core::tools::shell_quote(&dir.to_string_lossy())
+            )
         } else {
-            format!("cd -- {}", quote(&dir.to_string_lossy()))
+            format!(
+                "cd -- {}",
+                dmac_core::tools::shell_quote(&dir.to_string_lossy())
+            )
         };
         self.run(&line)?;
         Ok(true)
@@ -352,27 +358,6 @@ impl std::fmt::Debug for Hosted {
             .field("finished", &self.finished())
             .finish()
     }
-}
-
-/// Wrap a string so a shell reads it as one literal word.
-///
-/// A path is data. It arrives from the filesystem, from an archive, or from a
-/// remote listing, and a directory really can be called `; rm -rf ~` — nothing
-/// stops anyone creating one. Single quotes suspend every kind of expansion a
-/// shell does, and the only character they cannot contain is the single quote
-/// itself, which is closed, escaped and reopened.
-fn quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for c in s.chars() {
-        if c == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(c);
-        }
-    }
-    out.push('\'');
-    out
 }
 
 /// The user's shell, from the environment, with a platform-appropriate default.
@@ -641,19 +626,6 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(h.dirty(), "an exited child left nothing to redraw");
-    }
-
-    /// A directory can be called almost anything, including things that look
-    /// like shell syntax. If quoting is wrong here, browsing into a directory
-    /// runs its name.
-    #[test]
-    fn quoting_makes_a_path_one_literal_word() {
-        assert_eq!(quote("/tmp/plain"), "'/tmp/plain'");
-        assert_eq!(quote("/tmp/with space"), "'/tmp/with space'");
-        assert_eq!(quote("/tmp/; rm -rf ~"), "'/tmp/; rm -rf ~'");
-        assert_eq!(quote("/tmp/$(whoami)"), "'/tmp/$(whoami)'");
-        assert_eq!(quote("/tmp/`id`"), "'/tmp/`id`'");
-        assert_eq!(quote("/tmp/a'b"), r#"'/tmp/a'\''b'"#);
     }
 
     /// The escaping has to survive a real shell, not just look right.
