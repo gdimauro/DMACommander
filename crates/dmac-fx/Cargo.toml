@@ -1,0 +1,15 @@
+[package]
+name         = "dmac-fx"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description  = "Screensavers, the dock and visual effects."
+
+[lints]
+workspace = true
+
+[dependencies]
+fastrand = "2.5.0"

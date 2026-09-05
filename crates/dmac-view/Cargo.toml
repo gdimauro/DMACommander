@@ -1,0 +1,14 @@
+[package]
+name         = "dmac-view"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description  = "File viewer and editor: syntax highlighting, hex, images, diff."
+
+[lints]
+workspace = true
+
+[dependencies]

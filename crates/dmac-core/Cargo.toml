@@ -1,0 +1,17 @@
+[package]
+name         = "dmac-core"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description  = "Core domain: entries, panels, jobs and the file-operation engine."
+
+[lints]
+workspace = true
+
+[dependencies]
+jiff = "0.2.35"
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.20"

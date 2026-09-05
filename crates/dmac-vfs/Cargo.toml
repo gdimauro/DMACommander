@@ -1,0 +1,22 @@
+[package]
+name         = "dmac-vfs"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description  = "Virtual filesystem: local, archives, SFTP, S3 and friends, all as directories."
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = "0.1.92"
+dmac-core = { version = "0.1.0", path = "../dmac-core" }
+futures-core = "0.3.34"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["fs", "rt", "macros", "sync", "io-util"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

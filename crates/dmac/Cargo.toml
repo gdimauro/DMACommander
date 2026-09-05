@@ -1,0 +1,31 @@
+[package]
+name         = "dmac"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description  = "DMACommander: a next-generation orthodox file manager."
+
+[[bin]]
+name = "dmac"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.6", features = ["derive"] }
+dmac-core = { version = "0.1.0", path = "../dmac-core" }
+dmac-fx = { version = "0.1.0", path = "../dmac-fx" }
+dmac-gpu = { version = "0.1.0", path = "../dmac-gpu", optional = true }
+dmac-tui = { version = "0.1.0", path = "../dmac-tui" }
+dmac-vfs = { version = "0.1.0", path = "../dmac-vfs" }
+tokio = { version = "1.53.1", features = ["full"] }
+
+[features]
+default = []
+# The GPU window is opt-in: a headless server gets a small, fast binary.
+gpu = ["dep:dmac-gpu"]

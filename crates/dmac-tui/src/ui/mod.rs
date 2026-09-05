@@ -1,0 +1,188 @@
+//! Rendering. Every function here is a pure function of [`App`] state — nothing
+//! is stored in the widgets, which is what lets a second backend draw the exact
+//! same frame from the exact same state.
+
+mod fkeybar;
+pub(crate) mod menu;
+mod panel;
+pub(crate) mod picker;
+mod screen;
+
+pub use screen::draw_canvas;
+
+use crate::app::App;
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
+use unicode_width::UnicodeWidthStr;
+
+pub fn draw(frame: &mut Frame, app: &mut App) {
+    let area = frame.area();
+
+    // The screensaver owns the whole screen when it is running — no panels, no
+    // F-key bar. Anything less is a screensaver that does not save the screen.
+    if let Some(canvas) = app.screensaver_canvas(area.width, area.height) {
+        draw_canvas(frame, area, canvas);
+        return;
+    }
+
+    // The command line and the F-key bar are always visible. Ctrl-O collapses
+    // only the panels, revealing the shell output underneath — the panels are
+    // the removable part, the bottom two rows are the app's spine.
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),    // panels
+            Constraint::Length(1), // command line
+            Constraint::Length(1), // F-key bar
+        ])
+        .split(area);
+
+    // Split the borrow: the panels are drawn mutably (they record their viewport
+    // height) while the theme is read. Destructuring is what keeps both legal.
+    let App {
+        panels,
+        active,
+        theme,
+        panels_hidden,
+        layout,
+        focus,
+        ..
+    } = app;
+
+    layout.fkeys = rows[2];
+    layout.command = rows[1];
+
+    if !*panels_hidden {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(rows[0]);
+
+        for (i, id) in [dmac_core::PanelId::Left, dmac_core::PanelId::Right]
+            .into_iter()
+            .enumerate()
+        {
+            // Record the *interior* rect so a click maps straight to a row with
+            // no border arithmetic at the call site.
+            layout.panels[i] = inner(cols[i]);
+            let is_active = *active == id;
+            panel::draw(
+                frame,
+                cols[i],
+                &mut panels[i],
+                is_active,
+                is_active && *focus == crate::app::Focus::Panel,
+                theme,
+            );
+        }
+    } else {
+        layout.panels = [ratatui::layout::Rect::default(); 2];
+    }
+
+    draw_command_line(frame, rows[1], app);
+    fkeybar::draw(frame, rows[2], &app.theme);
+
+    match app.mode {
+        crate::app::Mode::Picker { selected } => {
+            app.layout.picker = picker::draw(frame, area, dmac_fx::catalog(), selected, &app.theme);
+        }
+        crate::app::Mode::Context { selected, anchor } => {
+            let items = app.context_items();
+            app.layout.menu = menu::draw(frame, area, anchor, &items, selected, &app.theme);
+        }
+        crate::app::Mode::Normal => {
+            app.layout.picker = ratatui::layout::Rect::default();
+            app.layout.menu = ratatui::layout::Rect::default();
+        }
+    }
+
+    // Last, so it sits on top of everything: DOS text mode had no pointer
+    // sprite — it inverted the attribute of the cell under the mouse, and that
+    // is exactly what this does.
+    draw_mouse_pointer(frame, area, app);
+}
+
+/// The bottom command line: a prompt, whatever the user has typed, and — when
+/// there is something to say — a transient status message on the right.
+///
+/// The real terminal cursor is placed here, and *only* here. When the keyboard
+/// is on a panel no cursor is set, and ratatui hides it — so a blinking cursor
+/// always means "text goes here", with no exceptions to remember.
+fn draw_command_line(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    let theme = &app.theme;
+    let focused = app.focus == crate::app::Focus::CommandLine;
+
+    let prompt = format!("{}> ", short_path(&app.cwd_display(app.active)));
+    let mut spans = vec![
+        Span::styled(
+            prompt.clone(),
+            if focused {
+                // The prompt brightens when it has the keyboard: a second cue
+                // for anyone who cannot see the cursor blink.
+                Style::default()
+                    .fg(theme.selected_fg)
+                    .add_modifier(ratatui::style::Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.status_fg)
+            },
+        ),
+        Span::raw(app.command_line.as_str()),
+    ];
+
+    if !app.status.is_empty() {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            app.status.as_str(),
+            Style::default().fg(theme.status_fg),
+        ));
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+
+    if focused {
+        // Width in columns, not bytes: a multi-byte or wide character typed into
+        // the command line must not push the cursor off its own text.
+        let col = prompt.width() + app.command_line.width();
+        let x = area.x.saturating_add(col.min(u16::MAX as usize) as u16);
+        frame.set_cursor_position((x.min(area.x + area.width.saturating_sub(1)), area.y));
+    }
+}
+
+/// Invert the cell under the pointer, the way DOS text mode drew a mouse.
+fn draw_mouse_pointer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    let Some((x, y)) = app.mouse else { return };
+    if x < area.x || y < area.y || x >= area.x + area.width || y >= area.y + area.height {
+        return;
+    }
+    let buf = frame.buffer_mut();
+    let cell = &buf[(x, y)];
+    let (fg, bg) = (cell.fg, cell.bg);
+    // Swap foreground and background. Whatever the theme, the pointer is always
+    // visible and never hides the character it is over.
+    buf[(x, y)].set_fg(bg).set_bg(fg);
+}
+
+/// The area inside a one-cell border.
+fn inner(area: ratatui::layout::Rect) -> ratatui::layout::Rect {
+    ratatui::layout::Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    }
+}
+
+/// Keep the prompt short so the typed command has room. Long paths collapse from
+/// the left, which is where the least useful part of a path lives.
+fn short_path(p: &str) -> String {
+    const MAX: usize = 28;
+    let chars: Vec<char> = p.chars().collect();
+    if chars.len() <= MAX {
+        return p.to_string();
+    }
+    let tail: String = chars[chars.len() - (MAX - 1)..].iter().collect();
+    format!("…{tail}")
+}

@@ -1,0 +1,14 @@
+[package]
+name         = "dmac-session"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description  = "Named sessions: persistent workspaces and reattachable agent sessions."
+
+[lints]
+workspace = true
+
+[dependencies]

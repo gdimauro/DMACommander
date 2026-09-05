@@ -1,0 +1,47 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/dmac",
+    "crates/dmac-config",
+    "crates/dmac-core",
+    "crates/dmac-vfs",
+    "crates/dmac-session",
+    "crates/dmac-search",
+    "crates/dmac-view",
+    "crates/dmac-fx",
+    "crates/dmac-tui",
+    "crates/dmac-gpu",
+    "crates/dmac-agent",
+    "crates/dmac-plugin",
+    "crates/dmac-pty",
+]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.85"
+license      = "MIT OR Apache-2.0"
+repository   = "https://github.com/gdimauro/DMACommander"
+authors      = ["Giuseppe Dimauro <gdimauro@codearchitects.com>"]
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+dbg_macro       = "warn"
+todo            = "warn"
+unwrap_used     = "warn"
+expect_used     = "warn"
+# A blocking call inside async is the #1 way this app stutters.
+await_holding_lock = "deny"
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+strip         = true
+panic         = "abort"
+
+# Fast iteration: our deps are heavy (wgpu, tantivy, wasmtime), our code is not.
+[profile.dev.package."*"]
+opt-level = 2
