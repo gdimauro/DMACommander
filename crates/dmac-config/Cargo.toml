@@ -12,3 +12,6 @@ description  = "Configuration, keymaps and themes for DMACommander."
 workspace = true
 
 [dependencies]
+
+[build-dependencies]
+jiff = "0.2.35"

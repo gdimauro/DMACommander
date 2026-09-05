@@ -442,6 +442,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "dmac-config",
  "dmac-core",
  "dmac-fx",
  "dmac-gpu",
@@ -457,6 +458,9 @@ version = "0.1.0"
 [[package]]
 name = "dmac-config"
 version = "0.1.0"
+dependencies = [
+ "jiff",
+]
 
 [[package]]
 name = "dmac-core"
@@ -499,6 +503,7 @@ name = "dmac-tui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dmac-config",
  "dmac-core",
  "dmac-fx",
  "dmac-vfs",

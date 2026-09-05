@@ -15,7 +15,8 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(
     name = "dmac",
-    version,
+    version = dmac_config::build_info::VERSION,
+    long_version = dmac_config::build_info::clap_long_version(),
     about = "DMACommander — an orthodox file manager with a VFS, agents and a dock",
     long_about = None
 )]
@@ -50,10 +51,24 @@ struct Cli {
     /// Print the available screensavers and exit.
     #[arg(long)]
     list_screensavers: bool,
+
+    /// Skip the startup splash.
+    #[arg(long)]
+    no_splash: bool,
+
+    /// Print the full build identity and exit. The first thing to paste into a
+    /// bug report.
+    #[arg(long)]
+    build_info: bool,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    if cli.build_info {
+        print!("{}", dmac_config::build_info::long());
+        return Ok(());
+    }
 
     if cli.list_screensavers {
         println!("{:<11} a different one every time", "random");
@@ -118,7 +133,7 @@ fn main() -> Result<()> {
             // flag worked and silently losing the user's workspace.
             eprintln!("session {name:?} requested — persistence is not implemented yet");
         }
-        dmac_tui::run(left, right, screensaver).await
+        dmac_tui::run(left, right, screensaver, !cli.no_splash).await
     })
 }
 

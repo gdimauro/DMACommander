@@ -14,10 +14,7 @@ use ratatui::crossterm::{
         PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
-    terminal::{
-        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-        supports_keyboard_enhancement,
-    },
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -25,13 +22,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// pushed. A stray pop corrupts the stack of whatever runs next in this terminal.
 static PUSHED_KEYBOARD_FLAGS: AtomicBool = AtomicBool::new(false);
 
-/// Did the terminal accept the kitty keyboard protocol?
+/// Whether we asked for the kitty keyboard protocol.
 ///
-/// Without it, a terminal cannot tell `Shift+F3` from `F3`, or `Ctrl+Shift+F1`
-/// from nothing at all — which is why those bindings ship with plain-key
-/// equivalents. Reported in the UI so a missing key has a visible explanation
-/// instead of looking like a bug.
-pub fn enhanced_keyboard() -> bool {
+/// Note what this does *not* say: whether the terminal honoured the request.
+/// Finding that out requires querying the terminal and waiting for a reply, and
+/// a terminal that does not implement the protocol never replies — so the query
+/// costs a full timeout in exactly the terminals where the answer is "no". That
+/// is far too expensive for the startup path; `crate::doctor` runs the query on
+/// demand instead.
+pub fn requested_enhanced_keyboard() -> bool {
     PUSHED_KEYBOARD_FLAGS.load(Ordering::Relaxed)
 }
 use std::io::{Stdout, stdout};
@@ -63,14 +62,18 @@ impl TerminalGuard {
             SetCursorStyle::BlinkingBlock,
         )?;
 
-        // The kitty keyboard protocol, where the terminal supports it. This is
-        // what makes modified function keys and Ctrl+Shift combinations arrive
-        // at all, and it disambiguates a real Esc from the start of an escape
-        // sequence — which matters here, because Esc switches focus.
+        // The kitty keyboard protocol. This is what makes modified function keys
+        // and Ctrl+Shift combinations arrive at all, and it lets a real Esc be
+        // told apart from the start of an escape sequence — which matters here,
+        // because Esc switches focus.
         //
-        // Ask first: pushing flags a terminal does not understand leaves visible
-        // garbage on the screen.
-        if supports_keyboard_enhancement().unwrap_or(false) {
+        // Pushed without asking first, deliberately. `supports_keyboard_enhancement`
+        // sends a query and waits for a reply, and a terminal that does not
+        // implement the protocol never replies — so it burns the full 2s timeout
+        // in precisely the terminals where the answer is "no". That measured 2.0s
+        // to first frame against an 80ms budget. The push itself is an ordinary
+        // CSI sequence, which terminals that do not understand it discard.
+        if !std::env::var("DMAC_NO_KEYBOARD_ENHANCEMENT").is_ok_and(|v| v != "0") {
             let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                 | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
                 | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES;

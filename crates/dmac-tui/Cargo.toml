@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 anyhow = "1.0.104"
+dmac-config = { version = "0.1.0", path = "../dmac-config" }
 dmac-core = { version = "0.1.0", path = "../dmac-core" }
 dmac-fx = { version = "0.1.0", path = "../dmac-fx" }
 dmac-vfs = { version = "0.1.0", path = "../dmac-vfs" }

@@ -7,6 +7,7 @@ pub(crate) mod menu;
 mod panel;
 pub(crate) mod picker;
 mod screen;
+mod splash;
 
 pub use screen::draw_canvas;
 
@@ -97,6 +98,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             app.layout.picker = ratatui::layout::Rect::default();
             app.layout.menu = ratatui::layout::Rect::default();
         }
+    }
+
+    // Over the panels rather than instead of them: the app is already usable
+    // behind it, and it should look that way.
+    if app.splash_visible() {
+        splash::draw(frame, area, &app.theme);
     }
 
     // Last, so it sits on top of everything: DOS text mode had no pointer

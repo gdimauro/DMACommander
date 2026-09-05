@@ -115,6 +115,9 @@ pub struct App {
     right_dragged: bool,
     /// Where the pointer is, so it can be drawn the way DOS text mode did.
     pub(crate) mouse: Option<(u16, u16)>,
+    /// When the splash stops showing. `None` means it was never shown or has
+    /// already gone, and contributes no timer either way.
+    splash_until: Option<std::time::Instant>,
     should_quit: bool,
     tx: mpsc::UnboundedSender<Update>,
 }
@@ -126,6 +129,7 @@ impl App {
         left: VfsPath,
         right: VfsPath,
         screensaver: ScreensaverConfig,
+        splash: bool,
         tx: mpsc::UnboundedSender<Update>,
     ) -> Self {
         Self {
@@ -148,6 +152,8 @@ impl App {
             last_click: None,
             right_dragged: false,
             mouse: None,
+            splash_until: splash
+                .then(|| std::time::Instant::now() + std::time::Duration::from_millis(1800)),
             should_quit: false,
             tx,
         }
@@ -163,6 +169,25 @@ impl App {
     fn active_panel_mut(&mut self) -> &mut Panel {
         let i = Self::idx(self.active);
         &mut self.panels[i]
+    }
+
+    /// Whether the splash is still on screen. Expiry is checked here rather than
+    /// on a timer tick, so a splash that has run out disappears on the next frame
+    /// without needing one.
+    pub(crate) fn splash_visible(&self) -> bool {
+        self.splash_until
+            .is_some_and(|t| std::time::Instant::now() < t)
+    }
+
+    /// Dismiss the splash. Returns `true` if it was showing, in which case the
+    /// input that dismissed it must not also reach the application.
+    fn dismiss_splash(&mut self) -> bool {
+        if self.splash_visible() {
+            self.splash_until = None;
+            return true;
+        }
+        self.splash_until = None;
+        false
     }
 
     /// The screensaver frame to draw, or `None` when the normal UI should be
@@ -544,6 +569,9 @@ impl App {
     }
 
     fn on_key(&mut self, k: KeyEvent) {
+        if self.dismiss_splash() {
+            return;
+        }
         match self.screensaver.on_key(effect_key(k)) {
             // A game used the key, or a screensaver was dismissed by it. Either
             // way the application must not also act on it — waking a screen is
@@ -668,6 +696,11 @@ impl App {
         // Never let mouse motion end a game; the idle clock still resets.
         self.screensaver.on_activity();
         self.mouse = Some((m.column, m.row));
+        // A click dismisses the splash, but pointer motion alone does not —
+        // brushing the mouse should not rob you of the version you were reading.
+        if !matches!(m.kind, MouseEventKind::Moved) && self.dismiss_splash() {
+            return;
+        }
         if self.screensaver.is_active() || self.mode != Mode::Normal {
             self.mouse_overlay(m);
             return;
@@ -969,11 +1002,12 @@ pub async fn run(
     left: VfsPath,
     right: VfsPath,
     screensaver: ScreensaverConfig,
+    splash: bool,
 ) -> anyhow::Result<()> {
     let mut guard = TerminalGuard::enter()?;
 
     let (update_tx, mut update_rx) = mpsc::unbounded_channel();
-    let mut app = App::new(left, right, screensaver, update_tx);
+    let mut app = App::new(left, right, screensaver, splash, update_tx);
     app.reload(PanelId::Left);
     app.reload(PanelId::Right);
 
@@ -995,7 +1029,12 @@ pub async fn run(
         // Exactly one timer, and only when something actually needs waking:
         // the idle deadline, or the next animation frame. `None` means we block
         // on input alone and cost nothing at all.
-        let wake = app.screensaver.deadline();
+        // One timer for everything that needs waking: the splash expiry and the
+        // screensaver, whichever comes first. Still `None` when neither wants one.
+        let wake = match (app.splash_until, app.screensaver.deadline()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         let sleep = async {
             match wake {
                 Some(at) => tokio::time::sleep_until(at.into()).await,
@@ -1047,6 +1086,7 @@ mod tests {
                 enabled: false,
                 ..Default::default()
             },
+            false, // no splash: it would swallow the first key of every test
             tx,
         );
         let mk = |name: &str, kind| dmac_core::Entry {
