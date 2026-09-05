@@ -324,12 +324,22 @@ impl App {
         self.status.clear();
 
         match action {
-            CursorUp => self.active_panel_mut().move_cursor(-1),
-            CursorDown => self.active_panel_mut().move_cursor(1),
-            PageUp => self.active_panel_mut().page(-1),
-            PageDown => self.active_panel_mut().page(1),
-            GoTop => self.active_panel_mut().go_home(),
-            GoBottom => self.active_panel_mut().go_end(),
+            // A plain move ends any Shift-selection, so the next Shift+arrow
+            // anchors where the cursor now is instead of resuming an old span.
+            CursorUp => self.move_plain(|p| p.move_cursor(-1)),
+            CursorDown => self.move_plain(|p| p.move_cursor(1)),
+            PageUp => self.move_plain(|p| p.page(-1)),
+            PageDown => self.move_plain(|p| p.page(1)),
+            GoTop => self.move_plain(|p| p.go_home()),
+            GoBottom => self.move_plain(|p| p.go_end()),
+
+            ExtendSelection(delta) => self.extend(|p| p.extend_selection_by(delta)),
+            ExtendSelectionPage(pages) => self.extend(|p| p.extend_selection_page(pages)),
+            ExtendSelectionToTop => self.extend(|p| p.extend_selection_to(0)),
+            ExtendSelectionToBottom => self.extend(|p| {
+                let last = p.len().saturating_sub(1);
+                p.extend_selection_to(last)
+            }),
 
             Activate => self.activate(),
             GoParent => self.go_parent(),
@@ -506,6 +516,24 @@ impl App {
             Menu => self.status = "F9 menu — not implemented yet".into(),
             Unimplemented(what) => self.status = format!("{what} — not implemented yet"),
         }
+    }
+
+    /// A movement that is not a Shift-selection: it ends any running gesture.
+    fn move_plain(&mut self, f: impl FnOnce(&mut Panel)) {
+        let p = self.ses_mut().active_panel_mut();
+        p.end_selection_gesture();
+        f(p);
+    }
+
+    /// A Shift-selection step, reporting the running total.
+    ///
+    /// Saying how many rows are selected is what stops this feeling like a mode
+    /// you fell into: the count changes as you move, so it is obvious what the
+    /// keys are doing.
+    fn extend(&mut self, f: impl FnOnce(&mut Panel)) {
+        f(self.ses_mut().active_panel_mut());
+        let n = self.ses().active_panel().operands().len();
+        self.status = format!("{n} selected");
     }
 
     /// Settle the UI after the visible session changes.
@@ -809,8 +837,15 @@ impl App {
         self.mouse = Some((m.column, m.row));
         // A click dismisses the splash, but pointer motion alone does not —
         // brushing the mouse should not rob you of the version you were reading.
-        if !matches!(m.kind, MouseEventKind::Moved) && self.dismiss_splash() {
-            return;
+        if !matches!(m.kind, MouseEventKind::Moved) {
+            // Any deliberate mouse action ends a keyboard Shift-selection, so the
+            // two gestures never fight over the same span. Mere pointer motion
+            // does not: the mouse can drift while you are selecting with the
+            // keyboard, and that should cost you nothing.
+            self.ses_mut().active_panel_mut().end_selection_gesture();
+            if self.dismiss_splash() {
+                return;
+            }
         }
         if self.screensaver.is_active() || self.mode != Mode::Normal {
             self.mouse_overlay(m);
@@ -1530,6 +1565,126 @@ mod tests {
         let mut app = with_layout(fixture());
         app.on_mouse(click(MouseButton::Left, 36, 23)); // 36/8 = cell 4 -> F5
         assert!(app.status.contains("F5 copy"), "got {:?}", app.status);
+    }
+
+    // ---- the software cursor ----
+
+    /// The blink has to actually alternate. A phase function that never flips is
+    /// exactly as useless as a terminal that ignores the cursor style, and it is
+    /// the reason this mode exists at all.
+    #[test]
+    fn the_software_cursor_alternates_on_and_off() {
+        let mut app = fixture();
+        app.cursor_style = CursorStyle::Software;
+
+        // Rewind the phase by hand rather than sleeping: a test that waits half a
+        // second per assertion is a test people start skipping.
+        let period = std::time::Duration::from_millis(530);
+        let base = std::time::Instant::now();
+        let observed: Vec<bool> = (0..4)
+            .map(|k| {
+                app.cursor_phase = base - period * k - std::time::Duration::from_millis(10);
+                app.software_cursor_on()
+            })
+            .collect();
+        assert_eq!(
+            observed,
+            vec![true, false, true, false],
+            "phase must alternate"
+        );
+    }
+
+    /// And it must only be drawn where text is actually being edited.
+    #[test]
+    fn no_cursor_is_scheduled_while_a_panel_has_focus() {
+        let mut app = fixture();
+        app.cursor_style = CursorStyle::Software;
+        assert_eq!(app.ses().focus, Focus::Panel);
+        assert!(
+            app.cursor_deadline().is_none(),
+            "a panel needs no blink timer"
+        );
+
+        app.handle(Action::FocusToggle);
+        assert_eq!(app.ses().focus, Focus::CommandLine);
+        assert!(app.cursor_deadline().is_some(), "the command line does");
+    }
+
+    /// An overlay owns the screen; a cursor blinking underneath it is noise.
+    #[test]
+    fn an_open_overlay_stops_the_cursor_blinking() {
+        let mut app = fixture();
+        app.cursor_style = CursorStyle::Software;
+        app.handle(Action::FocusToggle);
+        assert!(app.cursor_deadline().is_some());
+        app.handle(Action::ScreensaverMenu);
+        assert!(app.cursor_deadline().is_none());
+    }
+
+    /// The real-cursor path must schedule no timer at all — the terminal blinks
+    /// it for us, and waking twice a second to do nothing is exactly the kind of
+    /// idle cost this codebase refuses to pay.
+    #[test]
+    fn the_terminal_cursor_costs_no_timer() {
+        let mut app = fixture();
+        app.cursor_style = CursorStyle::BlinkingBlock;
+        app.handle(Action::FocusToggle);
+        assert!(app.cursor_deadline().is_none());
+    }
+
+    // ---- shift-selection ----
+
+    #[test]
+    fn shift_down_builds_a_selection_and_reports_the_count() {
+        let mut app = fixture();
+        app.ses_mut().active_panel_mut().move_to(1);
+        app.handle(Action::ExtendSelection(1));
+        app.handle(Action::ExtendSelection(1));
+        assert_eq!(app.ses().active_panel().operands().len(), 3);
+        assert!(app.status.contains("3 selected"), "got {:?}", app.status);
+    }
+
+    /// A plain arrow must not silently continue the previous span — the anchor
+    /// has to move with the cursor, or the next Shift+arrow selects a surprise.
+    #[test]
+    fn a_plain_arrow_ends_the_gesture() {
+        let mut app = fixture();
+        app.ses_mut().active_panel_mut().move_to(1);
+        app.handle(Action::ExtendSelection(1));
+        assert!(app.ses().active_panel().selecting());
+        app.handle(Action::CursorDown);
+        assert!(!app.ses().active_panel().selecting());
+    }
+
+    #[test]
+    fn shift_end_selects_everything_below_the_cursor() {
+        let mut app = fixture();
+        app.ses_mut().active_panel_mut().move_to(2);
+        app.handle(Action::ExtendSelectionToBottom);
+        // rows 2..4 of the five-row fixture; `..` at 0 is never selectable
+        assert_eq!(app.ses().active_panel().operands().len(), 3);
+    }
+
+    #[test]
+    fn shift_home_stops_short_of_the_parent_row() {
+        let mut app = fixture();
+        app.ses_mut().active_panel_mut().move_to(3);
+        app.handle(Action::ExtendSelectionToTop);
+        assert!(
+            !app.ses().panels[0].entries[0].selected,
+            "`..` is never selectable"
+        );
+        assert_eq!(app.ses().active_panel().operands().len(), 3);
+    }
+
+    /// The mouse and the keyboard must not fight over the same span.
+    #[test]
+    fn clicking_ends_a_keyboard_selection() {
+        let mut app = with_layout(fixture());
+        app.ses_mut().active_panel_mut().move_to(1);
+        app.handle(Action::ExtendSelection(1));
+        app.on_mouse(click(MouseButton::Left, 5, 4));
+        assert!(!app.ses().active_panel().selecting());
     }
 
     // ---- sessions ----

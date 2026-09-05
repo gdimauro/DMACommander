@@ -51,6 +51,15 @@ pub fn resolve(key: KeyEvent, focus: Focus) -> Option<Action> {
         (F(9), _, _) => Action::Menu,
         (F(10), _, _) => Action::Quit,
 
+        // --- Shift+cursor: anchored multi-selection. Must precede the plain
+        //     navigation arms below, or they shadow it. ---
+        (Up, false, false) if shift => Action::ExtendSelection(-1),
+        (Down, false, false) if shift => Action::ExtendSelection(1),
+        (PageUp, false, false) if shift => Action::ExtendSelectionPage(-1),
+        (PageDown, false, false) if shift => Action::ExtendSelectionPage(1),
+        (KeyCode::Home, false, false) if shift => Action::ExtendSelectionToTop,
+        (KeyCode::End, false, false) if shift => Action::ExtendSelectionToBottom,
+
         // --- Navigation ---
         (Up, false, false) => Action::CursorUp,
         (Down, false, false) => Action::CursorDown,
@@ -62,6 +71,10 @@ pub fn resolve(key: KeyEvent, focus: Focus) -> Option<Action> {
         // --- Sessions ---
         (BackTab, _, _) => Action::ToggleRail,
         (Tab, _, _) if shift => Action::ToggleRail,
+        // F11 as a plain-key equivalent: Shift+Tab is claimed by a number of
+        // terminals (Warp among them) before it ever reaches the application,
+        // and a binding you cannot press is not a binding.
+        (F(11), _, _) => Action::ToggleRail,
         // Alt+1..9. Digits, not F-keys: they are the numbers shown in the rail.
         (Char(c @ '1'..='9'), false, true) => {
             Action::SwitchSession(c.to_digit(10).unwrap_or(1) as usize - 1)

@@ -22,6 +22,18 @@ Notable changes, newest first. Versions follow the policy in
   directory, `Ctrl-W` closes one, `Ctrl-PageUp/PageDown` cycles, and clicking a
   row in the rail switches to it. Closing the last session is refused and points
   at F10 rather than quietly becoming a way to quit.
+- **Shift + cursor keys select a range.** Anchored rather than toggle-and-move,
+  so backing off shrinks the selection instead of stamping a second toggle over
+  it — the same way the mouse drag already behaved, and two gestures that select
+  a range should not disagree about what reversing means. Marks made earlier with
+  Ins survive a span shrinking back over them, `..` is never swept in, and the
+  status line shows the running count. Shift+Up/Down, Shift+PageUp/PageDown and
+  Shift+Home/End all extend; any plain movement or mouse click ends the gesture.
+- `run-release.sh` and `run-debug.sh`. The debug one redirects stderr to a log
+  file, because anything written to stderr while a TUI is running corrupts the
+  display.
+- `F11` also toggles the session rail. Shift+Tab is claimed by several terminals
+  (Warp among them) before it reaches the application.
 - `--cursor <style>` — `blinking-block` (default), `blinking-bar`,
   `blinking-underline`, `steady-block`, or `software`. See *Fixed* below.
 - Startup splash showing version, build number, commit, build time, rustc and

@@ -44,6 +44,14 @@ pub enum Action {
     TogglePanels,
 
     // Selection
+    /// Shift+Up/Down: grow or shrink an anchored selection by rows.
+    ExtendSelection(isize),
+    /// Shift+PageUp/PageDown: the same by whole screens.
+    ExtendSelectionPage(isize),
+    /// Shift+Home / Shift+End: extend all the way to one end.
+    ExtendSelectionToTop,
+    ExtendSelectionToBottom,
+
     ToggleSelection,
     InvertSelection,
     SelectAll,
