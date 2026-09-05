@@ -1,0 +1,43 @@
+# Dependency policy, enforced in CI.
+#
+# The rule from `.claude/agents/release-engineer.md`: permissive licences only.
+# A copyleft licence in a statically linked binary changes what users of
+# DMACommander are allowed to do with it, so it fails the build rather than
+# being discovered at distribution time.
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "MPL-2.0",       # file-level copyleft; fine for a linked dependency
+    "BSL-1.0",
+    "Unlicense",
+    "CC0-1.0",
+    # Unicode data tables. Permissive, but they need naming explicitly because
+    # they arrive as `AND` clauses that cannot be satisfied by another choice.
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    # `terminfo`, reached through ratatui's terminal backend. Permissive, if
+    # unconventionally worded.
+    "WTFPL",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
