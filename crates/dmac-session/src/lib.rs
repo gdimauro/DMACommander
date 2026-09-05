@@ -104,6 +104,13 @@ pub struct Session {
     /// is the whole point: come back tomorrow and `claude` rejoins the
     /// conversation you left, instead of starting a new one next to it.
     pub conversation: Option<String>,
+    /// An agent that was running when this session was last saved, waiting to
+    /// be started again. Cleared once it has been.
+    pub reattach: Option<String>,
+    /// The agent's whole command line as found running at save time, recorded
+    /// for the store so the next run can put back what was there, not an
+    /// approximation of it.
+    pub agent: Option<String>,
     pub last_used: std::time::Instant,
 }
 
@@ -124,6 +131,8 @@ impl Session {
             shell: None,
             shell_cwd: None,
             conversation: None,
+            reattach: None,
+            agent: None,
             last_used: std::time::Instant::now(),
         }
     }
@@ -219,6 +228,12 @@ impl Session {
             // No agent installed: no shim, and no PATH surgery for nothing.
             None => Vec::new(),
         }
+    }
+
+    /// The attached agent running in this session's shell right now, if any.
+    pub fn running_agent(&mut self) -> Option<String> {
+        let commands = self.shell.as_mut()?.running_commands();
+        agent::running_agent(&commands)
     }
 
     /// The session's shell if it has one, without starting one.

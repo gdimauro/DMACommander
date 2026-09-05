@@ -724,9 +724,25 @@ mod tests {
     /// The demo has to actually play: over a few seconds it must hit something.
     #[test]
     fn the_autopilot_scores() {
-        let mut a = game();
-        run(&mut a, 12.0);
-        assert!(a.score > 0, "the autopilot never hit anything");
+        // Seeded, and several games rather than one. Wave placement is random,
+        // so a single unseeded game is a coin toss about whether anything comes
+        // into range — this failed roughly one run in five, and a test that
+        // fails one run in five is not a test, it is a rumour. Each libtest
+        // case runs on its own thread, so seeding the thread-local generator
+        // here cannot disturb another test.
+        let mut scoreless = Vec::new();
+        for seed in 0..5u64 {
+            fastrand::seed(seed);
+            let mut a = game();
+            run(&mut a, 30.0);
+            if a.score == 0 {
+                scoreless.push(seed);
+            }
+        }
+        assert!(
+            scoreless.is_empty(),
+            "the autopilot went scoreless on seeds {scoreless:?}"
+        );
     }
 
     /// And it must not simply die repeatedly instead of playing.

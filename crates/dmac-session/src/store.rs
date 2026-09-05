@@ -77,6 +77,14 @@ struct PersistedSession {
     /// what you were talking about rather than starting beside it.
     #[serde(default)]
     conversation: Option<String>,
+    /// What was typed on the command line and not yet run. Half a command is
+    /// still work, and losing it on restart is losing work.
+    #[serde(default)]
+    command_line: String,
+    /// The attached agent that was running when this was saved, so the next run
+    /// can start it again in the same conversation.
+    #[serde(default)]
+    agent: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -236,6 +244,8 @@ fn persist(s: &Session) -> PersistedSession {
         // respawned on demand, in the directory that was restored.
         view_shell: s.view == View::Shell,
         conversation: s.conversation.clone(),
+        command_line: s.command_line.clone(),
+        agent: s.agent.clone(),
         panels: [
             PersistedPanel {
                 sort_key: Some(s.panels[0].sort_key),
@@ -263,12 +273,20 @@ fn apply(session: &mut Session, saved: &PersistedSession) {
     } else {
         Focus::Panel
     };
-    // Never restore straight into the shell view: there is no shell yet, and a
-    // blank pane on startup is alarming. The directory is what mattered.
-    session.view = View::Panels;
     // The process is gone, the conversation is not. This is what makes the
     // next `claude` in this session pick up where the last one left off.
     session.conversation = saved.conversation.clone();
+    session.command_line = saved.command_line.clone();
+    // Not started here — the store does not spawn processes. Recorded so the
+    // caller, which owns the event loop and the waker, can put it back.
+    session.reattach = saved.agent.clone();
+    // A session that was showing its shell comes back showing its shell. This
+    // used to be refused because there was nothing to show; now there is.
+    session.view = if saved.view_shell {
+        View::Shell
+    } else {
+        View::Panels
+    };
 
     for (i, p) in saved.panels.iter().enumerate() {
         if let Some(key) = p.sort_key {
@@ -354,15 +372,68 @@ mod tests {
         assert!(!clean, "the crash must be visible on the next start");
     }
 
-    /// Restoring into a shell view would show a pane with no process in it.
+    /// A session that was showing its shell comes back showing its shell.
+    ///
+    /// This used to be refused, on the grounds that the pane would be empty —
+    /// which was true when nothing respawned the shell. Now something does, and
+    /// dropping the user back on the panels loses where they actually were.
     #[test]
-    fn a_session_never_comes_back_showing_a_shell() {
+    fn a_session_comes_back_to_the_view_it_was_left_in() {
         let (_d, s) = store();
         let mut m = manager();
         m.current_mut().view = View::Shell;
         s.save(&m, true).expect("save");
         let (loaded, _) = s.load().expect("load").expect("some");
+        assert_eq!(loaded.current().view, View::Shell);
+
+        let mut m = manager();
+        m.current_mut().view = View::Panels;
+        s.save(&m, true).expect("save");
+        let (loaded, _) = s.load().expect("load").expect("some");
         assert_eq!(loaded.current().view, View::Panels);
+    }
+
+    /// Half a command is still work, and losing it on restart is losing work.
+    #[test]
+    fn what_was_typed_and_not_run_comes_back() {
+        let (_d, s) = store();
+        let mut m = manager();
+        m.current_mut().command_line = "rsync -av --dry-run ".to_string();
+        s.save(&m, true).expect("save");
+        let (loaded, _) = s.load().expect("load").expect("some");
+        assert_eq!(loaded.current().command_line, "rsync -av --dry-run ");
+    }
+
+    /// The conversation id and what was running in it are the two halves of
+    /// coming back to the same agent; one without the other is no use.
+    #[test]
+    fn the_agent_and_its_conversation_both_come_back() {
+        let (_d, s) = store();
+        let mut m = manager();
+        m.current_mut().conversation = Some("11111111-2222-4333-8444-555555555555".into());
+        m.current_mut().agent = Some("claude --session-id 1234".into());
+        s.save(&m, true).expect("save");
+
+        let (loaded, _) = s.load().expect("load").expect("some");
+        assert_eq!(
+            loaded.current().conversation.as_deref(),
+            Some("11111111-2222-4333-8444-555555555555")
+        );
+        assert_eq!(
+            loaded.current().reattach.as_deref(),
+            Some("claude --session-id 1234"),
+            "the agent's own arguments have to come back with it"
+        );
+    }
+
+    /// A session with no agent must not have one started in it. Launching a
+    /// program the user never ran is worse than not restoring one they did.
+    #[test]
+    fn a_session_without_an_agent_asks_for_nothing() {
+        let (_d, s) = store();
+        s.save(&manager(), true).expect("save");
+        let (loaded, _) = s.load().expect("load").expect("some");
+        assert!(loaded.current().reattach.is_none());
     }
 
     #[test]

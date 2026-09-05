@@ -892,6 +892,11 @@ impl App {
 
     /// Final write, marking a clean exit so the next start knows we did not crash.
     fn save_on_exit(&mut self) {
+        // What is running has to be looked at before anything is torn down:
+        // afterwards there is nothing left to ask.
+        for i in 0..self.sessions.len() {
+            self.sessions.at_mut(i).agent = self.sessions.at_mut(i).running_agent();
+        }
         if let Some(store) = &self.store
             && let Err(e) = store.save(&self.sessions, true)
         {
@@ -1170,6 +1175,61 @@ impl App {
             .hosted()
             .is_some_and(|s| s.dirty())
             .then(|| self.last_shell_frame + SHELL_FRAME_FLOOR)
+    }
+
+    /// Put back whatever was running in these sessions when they were saved.
+    ///
+    /// Started after the first frame, never before it: a cold start has 80ms to
+    /// show something, and spawning shells inside that budget would spend it on
+    /// work the user cannot see yet.
+    pub(crate) fn reattach_agents(&mut self) {
+        for i in 0..self.sessions.len() {
+            let Some(saved) = self.sessions.at_mut(i).reattach.take() else {
+                continue;
+            };
+            // Replayed as a resume: the saved line names the conversation it
+            // *created*, and running it verbatim asks for one that already
+            // exists. Every other argument the user chose is kept.
+            let command = dmac_session::agent::as_resume(&saved);
+            let program = command
+                .split_whitespace()
+                .next()
+                .and_then(|w| w.rsplit('/').next())
+                .unwrap_or("agent")
+                .to_string();
+            // Anything still holding this conversation is an orphan from a run
+            // that did not get to clean up, and it is holding exactly what we
+            // are about to ask for. Left alone it produces "that session is
+            // already in use" on a fresh start.
+            let conversation = self.sessions.at_mut(i).conversation_id().to_string();
+            let cleared = dmac_session::agent::clear_orphans(&conversation);
+
+            let waker = self.waker();
+            let (cols, rows) = self.shell_size();
+            let session = self.sessions.at_mut(i);
+            match session.shell(cols, rows, waker) {
+                Ok(shell) => {
+                    // Just the program name: the shim on PATH turns it into a
+                    // resume of this session's conversation.
+                    if shell.run(&command).is_ok() {
+                        // Show the shell: reattaching something and leaving the
+                        // user on the panels hides the very thing just started.
+                        session.view = dmac_session::View::Shell;
+                        self.status = if cleared > 0 {
+                            format!("{program} reattached — cleared {cleared} left over")
+                        } else {
+                            format!("{program} reattached")
+                        };
+                    }
+                }
+                Err(e) => self.status = format!("could not reattach {program}: {e}"),
+            }
+        }
+    }
+
+    /// Quit as if F10 had been pressed. Used when the terminal goes away.
+    pub(crate) fn request_quit(&mut self) {
+        self.should_quit = true;
     }
 
     /// Keep the hosted shell exactly the size of the pane showing it.
@@ -2344,10 +2404,38 @@ pub async fn run(mut start: Startup) -> anyhow::Result<()> {
         }
     });
 
+    // Nothing of ours is running yet, so the terminal going away — the window
+    // closed, the session logged out, a `kill` — has to run the same teardown
+    // F10 does. Without this the hosted tree is simply abandoned, which is how
+    // an agent survives to hold a conversation the next run will ask for.
+    #[cfg(unix)]
+    let mut signals = {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut set = Vec::new();
+        for kind in [
+            SignalKind::hangup(),
+            SignalKind::terminate(),
+            SignalKind::interrupt(),
+        ] {
+            if let Ok(s) = signal(kind) {
+                set.push(s);
+            }
+        }
+        set
+    };
+
+    let mut first_frame = true;
+
     loop {
         app.before_frame();
         guard.terminal().draw(|f| ui::draw(f, &mut app))?;
         app.sync_shell_size();
+        if first_frame {
+            first_frame = false;
+            // After the frame, so a cold start still shows something inside its
+            // budget and the spawning happens where the user can watch it.
+            app.reattach_agents();
+        }
         // After the frame, never during it: stdout is shared with ratatui and
         // interleaving with a half-written frame corrupts both.
         if let Some(seq) = app.take_terminal_write() {
@@ -2407,6 +2495,10 @@ pub async fn run(mut start: Startup) -> anyhow::Result<()> {
                     app.apply(u);
                 }
             }
+            // Any of the ways a terminal tells an application to go away.
+            Some(()) = wait_for_signal(&mut signals) => {
+                app.request_quit();
+            }
             else => break,
         }
 
@@ -2417,6 +2509,25 @@ pub async fn run(mut start: Startup) -> anyhow::Result<()> {
 
     app.save_on_exit();
     Ok(())
+}
+
+/// Resolve when any of these signals arrives.
+///
+/// A helper because `tokio::select!` needs one future, and which signals exist
+/// is a platform question that should not be spelled out inside the loop.
+#[cfg(unix)]
+async fn wait_for_signal(set: &mut [tokio::signal::unix::Signal]) -> Option<()> {
+    if set.is_empty() {
+        return std::future::pending().await;
+    }
+    let mut futures: Vec<_> = set.iter_mut().map(|s| Box::pin(s.recv())).collect();
+    let (result, _, _) = futures::future::select_all(futures.iter_mut()).await;
+    result.map(|_| ())
+}
+
+#[cfg(not(unix))]
+async fn wait_for_signal(_set: &mut [()]) -> Option<()> {
+    std::future::pending().await
 }
 
 #[cfg(test)]

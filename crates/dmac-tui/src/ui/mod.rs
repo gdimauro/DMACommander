@@ -51,15 +51,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         );
     }
 
-    // The command line is always visible. Ctrl-O collapses only the panels,
-    // revealing the shell output underneath — the panels are the removable
-    // part, the command line is the app's spine.
+    // In the shell view both bottom rows go. A second prompt under a shell's
+    // own prompt is two places to type with no way to tell which is listening,
+    // and an F-key legend for keys the shell has taken is a legend that lies.
+    // What stays is one row of status, and only when there is something to say.
+    let in_shell = app.sessions.current().view == dmac_session::View::Shell;
+    let command_rows = u16::from(!in_shell);
+    let status_rows = u16::from(in_shell && !app.status.is_empty());
+    let fkey_rows = u16::from(!full && !in_shell);
+
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(0),                           // panels
-            Constraint::Length(1),                        // command line
-            Constraint::Length(if full { 0 } else { 1 }), // F-key bar
+            Constraint::Min(0),                             // panels or shell
+            Constraint::Length(command_rows + status_rows), // command line
+            Constraint::Length(fkey_rows),                  // F-key bar
         ])
         .split(area);
 
@@ -166,8 +172,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         layout.panels = [ratatui::layout::Rect::default(); 2];
     }
 
-    draw_command_line(frame, rows[1], app);
-    if !full {
+    if in_shell {
+        if status_rows > 0 {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!(" {}", app.status),
+                    Style::default().fg(theme.status_fg),
+                ))),
+                rows[1],
+            );
+        }
+    } else {
+        draw_command_line(frame, rows[1], app);
+    }
+    if fkey_rows > 0 {
         fkeybar::draw(frame, rows[2], theme);
     }
 

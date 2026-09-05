@@ -349,6 +349,31 @@ impl Hosted {
         self.parser.lock().ok().map(|p| f(p.screen()))
     }
 
+    /// The full command lines of everything running inside this shell.
+    ///
+    /// Asked at shutdown, so the next run knows what to start again — and knows
+    /// it exactly, arguments included. Empty on platforms where the tree cannot
+    /// be walked, which reads as "nothing was running": the safe answer, since
+    /// the cost is an agent not reattached rather than one started that the
+    /// user never asked for.
+    pub fn running_commands(&mut self) -> Vec<String> {
+        #[cfg(unix)]
+        {
+            match self.child.process_id() {
+                Some(pid) => descendants_with_command(pid as libc::pid_t)
+                    .into_iter()
+                    .map(|(_, c)| c)
+                    .filter(|c| !c.is_empty())
+                    .collect(),
+                None => Vec::new(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Vec::new()
+        }
+    }
+
     /// Whether the child has nothing running in the foreground — that is,
     /// whether a shell is sitting at its prompt.
     ///
@@ -564,35 +589,54 @@ impl std::fmt::Debug for Hosted {
 /// at once per session, on the way out.
 #[cfg(unix)]
 fn descendants(root: libc::pid_t) -> Vec<libc::pid_t> {
+    descendants_with_command(root)
+        .into_iter()
+        .map(|(p, _)| p)
+        .collect()
+}
+
+/// The same, with each process's command name.
+///
+/// Used to answer "was an agent running in this shell when we quit?", which is
+/// what makes reattaching it on the way back in possible.
+#[cfg(unix)]
+fn descendants_with_command(root: libc::pid_t) -> Vec<(libc::pid_t, String)> {
     use std::collections::HashMap;
 
     let Ok(output) = std::process::Command::new("ps")
-        .args(["-Ao", "pid=,ppid="])
+        .args(["-Ao", "pid=,ppid=,args="])
         .output()
     else {
         return Vec::new();
     };
     let mut children: HashMap<libc::pid_t, Vec<libc::pid_t>> = HashMap::new();
+    let mut command: HashMap<libc::pid_t, String> = HashMap::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let mut it = line.split_whitespace();
         if let (Some(pid), Some(ppid)) = (it.next(), it.next())
             && let (Ok(pid), Ok(ppid)) = (pid.parse(), ppid.parse())
         {
             children.entry(ppid).or_default().push(pid);
+            // The whole command line, arguments and all. The program name alone
+            // is not enough to start something again as it was: a model, a
+            // permission mode or a working directory chosen on the command line
+            // is part of what the user set up, and dropping it silently gives
+            // them back something that only looks like what they had.
+            command.insert(pid, it.collect::<Vec<_>>().join(" "));
         }
     }
 
     // Breadth-first from the root, then reversed: killing children before their
     // parents keeps a supervisor from noticing and restarting one.
-    let mut out = Vec::new();
+    let mut out: Vec<(libc::pid_t, String)> = Vec::new();
     let mut queue = vec![root];
     while let Some(pid) = queue.pop() {
         for &child in children.get(&pid).into_iter().flatten() {
             // A cycle is impossible in a process tree, but a pid that has been
             // reused between reading and walking is not; the guard costs
             // nothing and the alternative is an infinite loop at shutdown.
-            if child != root && !out.contains(&child) {
-                out.push(child);
+            if child != root && !out.iter().any(|(p, _)| *p == child) {
+                out.push((child, command.get(&child).cloned().unwrap_or_default()));
                 queue.push(child);
             }
         }
