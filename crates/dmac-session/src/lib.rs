@@ -14,6 +14,8 @@
 // In non-test code the workspace lints still forbid them.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod store;
+
 use dmac_core::{Panel, PanelId};
 use dmac_pty::Hosted;
 use dmac_vfs::VfsPath;
@@ -66,7 +68,7 @@ impl SessionColor {
         SessionColor::Red,
     ];
 
-    fn nth(i: usize) -> Self {
+    pub(crate) fn nth(i: usize) -> Self {
         Self::ALL[i % Self::ALL.len()]
     }
 }

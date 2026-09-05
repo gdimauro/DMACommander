@@ -23,7 +23,8 @@ For the order it happens in, the acceptance criteria and the risks, see
 - [ ] **`dmac-config`**: platform paths (`directories`), TOML config, keymap
       presets (`norton`/`far`/`mc`/`total`/`vim`), themes — `rust-architect` + `ux-keeper`
 - [x] **Live multi-session + rail** (`Shift-Tab`, `Alt+1..9`, `Ctrl-N`/`Ctrl-W`) — `session-engineer`
-- [ ] **Session persistence**: named sessions, `--session` / `$DMAC_SESSION` /
+- [x] **Session persistence** — atomic, debounced, crash-aware — `session-engineer`
+- [ ] **Session picker at startup and `--session` resolution**: named sessions, `--session` / `$DMAC_SESSION` /
       `.dmac-session` / picker resolution, atomic debounced workspace snapshots,
       crash recovery — `session-engineer`
 - [ ] **Claude session reattach**: record the Claude Code sessions a workspace had

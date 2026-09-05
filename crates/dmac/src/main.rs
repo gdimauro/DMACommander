@@ -147,15 +147,43 @@ fn main() -> Result<()> {
     // yet is simply created rather than restored.
     let session_name = session.unwrap_or_else(|| "main".to_string());
 
+    // Sessions live in one file, written atomically. `--no-session` opts out
+    // entirely rather than writing to a throwaway location: "do not persist"
+    // should mean exactly that.
+    let (store, restored) = if cli.no_session {
+        (None, None)
+    } else {
+        match dmac_session::store::SessionStore::platform_default() {
+            Ok(store) => match store.load() {
+                Ok(found) => (Some(store), found),
+                Err(e) => {
+                    // Never let a bad file block startup: keep it, say where it
+                    // went, and carry on with a fresh set.
+                    eprintln!("dmac: {e}");
+                    if let Some(backup) = store.quarantine() {
+                        eprintln!("dmac: moved it to {}", backup.display());
+                    }
+                    (Some(store), None)
+                }
+            },
+            Err(e) => {
+                eprintln!("dmac: sessions will not be saved: {e}");
+                (None, None)
+            }
+        }
+    };
+
     runtime.block_on(async move {
-        dmac_tui::run(
+        dmac_tui::run(dmac_tui::app::Startup {
             session_name,
             left,
             right,
             screensaver,
-            !cli.no_splash,
+            splash: !cli.no_splash,
             cursor,
-        )
+            store,
+            restored,
+        })
         .await
     })
 }

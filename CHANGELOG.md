@@ -6,6 +6,20 @@ Notable changes, newest first. Versions follow the policy in
 ## Unreleased
 
 ### Added
+- **Sessions survive a restart.** They are written to one file, atomically
+  (temp file plus rename, in the same directory so the rename stays atomic), and
+  debounced — renaming a session one keystroke at a time should not mean one file
+  write per keystroke. Launching with no arguments restores every session with
+  its directories, sort orders, active panel and focus. `--no-session` opts out
+  entirely rather than writing somewhere throwaway.
+
+  Failures are forgiving in the direction that matters: a missing file is a first
+  run, a corrupt one is moved aside and reported rather than blocking startup,
+  and a file written by a newer version is refused and left alone instead of
+  being silently downgraded. An unclean exit is announced on the next start,
+  because a layout that looks subtly stale with no explanation is worse than one
+  that says what happened. A session never comes back showing its shell: the
+  process is gone, and a blank pane on startup would be alarming.
 - **A spectrum analyser that listens to the room.** Log-spaced frequency bands,
   because linear FFT bins put everything musical in the leftmost tenth of the
   screen; fast attack and slow decay, because a transient has to arrive

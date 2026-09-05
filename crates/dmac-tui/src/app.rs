@@ -11,6 +11,7 @@ use crate::{keymap, ui};
 use dmac_core::{Panel, PanelId, SortOrder};
 use dmac_fx::{Canvas, EffectKey, Screensaver, ScreensaverConfig, Wake};
 pub use dmac_session::Focus;
+use dmac_session::store::SessionStore;
 use dmac_session::{Session, SessionId, SessionManager, View};
 use dmac_vfs::{BackendRef, ListChunk, VfsPath, local::LocalBackend};
 use ratatui::crossterm::event::{
@@ -42,6 +43,25 @@ enum Update {
         panel: PanelId,
         message: String,
     },
+}
+
+/// Everything the application needs to start.
+///
+/// A struct rather than nine parameters: they are all decided in one place and
+/// arrive together, and this is the shape `dmac-config` will eventually produce
+/// wholesale.
+pub struct Startup {
+    pub session_name: String,
+    pub left: VfsPath,
+    pub right: VfsPath,
+    pub screensaver: ScreensaverConfig,
+    pub splash: bool,
+    pub cursor: CursorStyle,
+    /// Where sessions are written. `None` disables persistence entirely.
+    pub store: Option<SessionStore>,
+    /// Sessions already read back from the store, and whether the last run
+    /// exited cleanly.
+    pub restored: Option<(SessionManager, bool)>,
 }
 
 /// Which overlay, if any, owns the keyboard.
@@ -123,6 +143,12 @@ pub struct App {
     pub(crate) rail_open: bool,
     /// Text being typed into the current prompt.
     pub(crate) prompt_value: String,
+    /// Where sessions are written. `None` disables persistence entirely, which
+    /// is what `--no-session` and the tests use.
+    store: Option<SessionStore>,
+    /// Set when the session set changed; the loop flushes it, debounced, so a
+    /// burst of edits costs one write rather than one per keystroke.
+    dirty_at: Option<std::time::Instant>,
     pub(crate) cursor_style: CursorStyle,
     /// When the software cursor last flipped. Only used in `Software` mode.
     cursor_phase: std::time::Instant,
@@ -156,19 +182,25 @@ pub struct App {
 impl App {
     /// Private: `Update` is an internal message type, so the only supported
     /// entry point is [`run`].
-    fn new(
-        session_name: String,
-        left: VfsPath,
-        right: VfsPath,
-        screensaver: ScreensaverConfig,
-        splash: bool,
-        cursor: CursorStyle,
-        tx: mpsc::UnboundedSender<Update>,
-    ) -> Self {
+    fn new(start: Startup, tx: mpsc::UnboundedSender<Update>) -> Self {
+        let Startup {
+            session_name,
+            left,
+            right,
+            screensaver,
+            splash,
+            cursor,
+            store,
+            // Handled by `run`, which needs the terminal up before it can list
+            // the restored sessions.
+            restored: _,
+        } = start;
         Self {
             sessions: SessionManager::new(session_name, left, right),
             rail_open: false,
             prompt_value: String::new(),
+            store,
+            dirty_at: None,
             cursor_style: cursor,
             cursor_phase: std::time::Instant::now(),
             theme: Theme::default(),
@@ -274,17 +306,30 @@ impl App {
 
     /// Kick off a listing for one panel. Returns immediately; entries arrive as
     /// [`Update::Entries`] messages, so a slow or hung backend never blocks the loop.
+    /// Start a listing for one panel of the session on screen.
     fn reload(&mut self, id: PanelId) {
+        let i = self.sessions.current_index();
+        self.reload_session(i, id);
+    }
+
+    /// Start a listing for any session, visible or not. Restoring a saved set
+    /// needs this: every session is live, so every panel needs its contents.
+    fn reload_session(&mut self, index: usize, id: PanelId) {
+        if index >= self.sessions.len() {
+            return;
+        }
         let i = Self::idx(id);
-        self.ses_mut().generation[i] += 1;
-        let generation = self.ses().generation[i];
-        let path = self.ses().cwd[i].clone();
-        let session = self.ses().id;
+        let target = self.sessions.at_mut(index);
+        target.generation[i] += 1;
+        let generation = target.generation[i];
+        let path = target.cwd[i].clone();
+        let session = target.id;
+
+        target.panels[i].location = path.display();
+        target.panels[i].set_entries(Vec::new());
+
         let backend = Arc::clone(&self.backend);
         let tx = self.tx.clone();
-
-        self.ses_mut().panels[i].location = path.display();
-        self.ses_mut().panels[i].set_entries(Vec::new());
 
         tokio::spawn(async move {
             // Bounded: if the UI falls behind, the walk waits instead of buffering
@@ -579,6 +624,42 @@ impl App {
         }
     }
 
+    /// Note that the session set changed. The actual write is debounced by the
+    /// event loop: renaming a session one keystroke at a time should not mean
+    /// one file write per keystroke.
+    fn touch_sessions(&mut self) {
+        if self.store.is_some() {
+            self.dirty_at = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Write now if the debounce has elapsed. Returns when the next flush is due.
+    fn flush_sessions(&mut self) -> Option<std::time::Instant> {
+        const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(600);
+        let due = self.dirty_at? + DEBOUNCE;
+        if std::time::Instant::now() < due {
+            return Some(due);
+        }
+        self.dirty_at = None;
+        if let Some(store) = &self.store
+            && let Err(e) = store.save(&self.sessions, false)
+        {
+            // Say so once rather than every 600ms: a read-only config directory
+            // would otherwise fill the status line forever.
+            self.status = format!("could not save sessions: {e}");
+        }
+        None
+    }
+
+    /// Final write, marking a clean exit so the next start knows we did not crash.
+    fn save_on_exit(&mut self) {
+        if let Some(store) = &self.store
+            && let Err(e) = store.save(&self.sessions, true)
+        {
+            eprintln!("dmac: could not save sessions: {e}");
+        }
+    }
+
     fn close_rail(&mut self) {
         self.rail_open = false;
         if matches!(self.mode, Mode::Rail { .. }) {
@@ -671,6 +752,7 @@ impl App {
         match intent {
             PromptIntent::RenameSession(index) => match self.sessions.rename(index, &value) {
                 Ok(()) => {
+                    self.touch_sessions();
                     self.mode = Mode::Rail { selected: index };
                     self.status = format!("renamed to {}", value.trim());
                 }
@@ -692,6 +774,7 @@ impl App {
                 let i = self.sessions.create(name, left, right);
                 self.reload(PanelId::Left);
                 self.reload(PanelId::Right);
+                self.touch_sessions();
                 self.mode = Mode::Rail { selected: i };
                 self.after_session_switch();
             }
@@ -778,6 +861,7 @@ impl App {
     /// point of holding them all live. Only the transient, per-view state that
     /// belonged to the session we just left is cleared.
     fn after_session_switch(&mut self) {
+        self.touch_sessions();
         self.quick_search.clear();
         // Close an overlay that belonged to the session we left — but not the
         // rail, which is how you got here and where you still are. Clobbering it
@@ -1398,6 +1482,7 @@ impl App {
                 if let Some(next) = self.ses().cwd[i].join(&entry.name) {
                     self.ses_mut().cwd[i] = next;
                     self.reload(self.ses().active);
+                    self.touch_sessions();
                 } else {
                     self.status = format!("refusing to enter suspicious name: {}", entry.name);
                 }
@@ -1413,6 +1498,7 @@ impl App {
         if let Some(parent) = self.ses().cwd[i].parent() {
             self.ses_mut().cwd[i] = parent;
             self.reload(self.ses().active);
+            self.touch_sessions();
         }
     }
 }
@@ -1436,28 +1522,34 @@ fn effect_key(k: KeyEvent) -> EffectKey {
 }
 
 /// Run the application until the user quits.
-pub async fn run(
-    session_name: String,
-    left: VfsPath,
-    right: VfsPath,
-    screensaver: ScreensaverConfig,
-    splash: bool,
-    cursor: CursorStyle,
-) -> anyhow::Result<()> {
+pub async fn run(mut start: Startup) -> anyhow::Result<()> {
+    let cursor = start.cursor;
+    let restored = start.restored.take();
     let mut guard = TerminalGuard::enter(cursor)?;
 
     let (update_tx, mut update_rx) = mpsc::unbounded_channel();
-    let mut app = App::new(
-        session_name,
-        left,
-        right,
-        screensaver,
-        splash,
-        cursor,
-        update_tx,
-    );
-    app.reload(PanelId::Left);
-    app.reload(PanelId::Right);
+    let mut app = App::new(start, update_tx);
+
+    // Replace the freshly-made session set with what was on disk, if anything,
+    // and list every panel of every session — they are all live, so they all
+    // need their contents.
+    if let Some((sessions, clean_exit)) = restored {
+        let count = sessions.len();
+        app.sessions = sessions;
+        if !clean_exit {
+            // Never let a crash pass silently: a layout that looks subtly stale
+            // with no explanation is worse than one that says what happened.
+            app.status =
+                "previous run did not exit cleanly — sessions restored from the last save".into();
+        }
+        for i in 0..count {
+            app.reload_session(i, PanelId::Left);
+            app.reload_session(i, PanelId::Right);
+        }
+    } else {
+        app.reload(PanelId::Left);
+        app.reload(PanelId::Right);
+    }
 
     // Input lives on its own thread doing a blocking read. Cheaper and more
     // portable than an async event stream, and it keeps the loop below free of
@@ -1488,10 +1580,14 @@ pub async fn run(
         // on input alone and cost nothing at all.
         // One timer for everything that needs waking: the splash expiry and the
         // screensaver, whichever comes first. Still `None` when neither wants one.
+        // Writing sessions is debounced, so it contributes a deadline like
+        // everything else rather than a timer of its own.
+        let save_due = app.flush_sessions();
         let wake = [
             app.splash_until,
             app.screensaver.deadline(),
             app.cursor_deadline(),
+            save_due,
         ]
         .into_iter()
         .flatten()
@@ -1527,6 +1623,7 @@ pub async fn run(
         }
     }
 
+    app.save_on_exit();
     Ok(())
 }
 
@@ -1540,16 +1637,22 @@ mod tests {
     fn fixture() -> App {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = App::new(
-            "test".to_string(),
-            VfsPath::local("/left"),
-            VfsPath::local("/right"),
-            // Tests must never have a screensaver appear mid-assertion.
-            ScreensaverConfig {
-                enabled: false,
-                ..Default::default()
+            Startup {
+                session_name: "test".to_string(),
+                left: VfsPath::local("/left"),
+                right: VfsPath::local("/right"),
+                // Tests must never have a screensaver appear mid-assertion, and
+                // no splash: it would swallow the first key of every one.
+                screensaver: ScreensaverConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                splash: false,
+                cursor: CursorStyle::default(),
+                // Tests never touch the real session file.
+                store: None,
+                restored: None,
             },
-            false, // no splash: it would swallow the first key of every test
-            CursorStyle::default(),
             tx,
         );
         let mk = |name: &str, kind| dmac_core::Entry {
