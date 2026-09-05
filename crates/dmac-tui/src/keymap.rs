@@ -74,6 +74,12 @@ pub fn resolve(key: KeyEvent, focus: Focus) -> Option<Action> {
         (F(11), _, _) => Action::ToggleFullscreen,
 
         // --- Sessions ---
+        // Ctrl+Tab forward, Ctrl+Shift+Tab back, as in every browser and IDE.
+        // Both spellings of the shifted one, because terminals disagree about
+        // whether it arrives as Tab-with-Shift or as BackTab.
+        (Tab, true, _) if shift => Action::CycleSession(-1),
+        (BackTab, true, _) => Action::CycleSession(-1),
+        (Tab, true, _) => Action::CycleSession(1),
         (BackTab, _, _) => Action::ToggleRail,
         (Tab, _, _) if shift => Action::ToggleRail,
         // Ctrl-T as a plain-key equivalent: Shift+Tab is claimed by a number of
@@ -103,6 +109,7 @@ pub fn resolve(key: KeyEvent, focus: Focus) -> Option<Action> {
         // binding you cannot press is not a binding. Swapping the panels, which
         // is Ctrl-U in the canon, moves to Alt-U.
         (Char('u'), _, _) if key.modifiers.contains(KeyModifiers::SUPER) => Action::UtilitiesMenu,
+        (Char(c), true, false) if shift && c.eq_ignore_ascii_case(&'u') => Action::UtilitiesMenu,
         (Char('u'), true, false) => Action::UtilitiesMenu,
         (Char('u'), false, true) => Action::SwapPanels,
         (Char('o'), true, false) => Action::ToggleShell,

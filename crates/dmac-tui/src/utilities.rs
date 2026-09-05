@@ -26,6 +26,7 @@ pub enum Utility {
 }
 
 /// What choosing an entry does to the command line.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// Add this to what is already typed.
     Insert(String),
@@ -147,6 +148,10 @@ fn hint_of(u: Utility) -> &'static str {
 /// Everything the utilities can need to know about where the user is.
 pub struct Context<'a> {
     pub line: &'a str,
+    /// Text the user has selected, which the transforms prefer over the command
+    /// line. Selecting something and then having a menu act on something else
+    /// is the kind of surprise that costs trust in the whole menu.
+    pub selection: Option<&'a str>,
     pub this_path: String,
     pub other_path: String,
     /// Names of the selected entries, or of the one under the cursor when
@@ -154,6 +159,28 @@ pub struct Context<'a> {
     /// selection" and what the F-keys already do here.
     pub selected: Vec<String>,
     pub selected_paths: Vec<String>,
+}
+
+impl Context<'_> {
+    /// What a transform acts on, and whether it came from a selection.
+    ///
+    /// A selection can be anywhere — the hosted shell's screen most of all —
+    /// so its result cannot replace anything. It is added to the command line
+    /// instead, which is somewhere the user can then do something with it.
+    fn subject(&self) -> (&str, bool) {
+        match self.selection {
+            Some(s) if !s.trim().is_empty() => (s, true),
+            _ => (self.line, false),
+        }
+    }
+}
+
+fn transformed(from_selection: bool, text: String) -> Outcome {
+    if from_selection {
+        Outcome::Insert(text)
+    } else {
+        Outcome::Replace(text)
+    }
 }
 
 pub fn run(u: Utility, cx: &Context<'_>) -> Outcome {
@@ -169,27 +196,32 @@ pub fn run(u: Utility, cx: &Context<'_>) -> Outcome {
         Utility::SelectedNames => join_quoted(&cx.selected, "nothing is selected"),
         Utility::SelectedPaths => join_quoted(&cx.selected_paths, "nothing is selected"),
         Utility::Base64Encode => {
-            if cx.line.is_empty() {
-                Outcome::Nothing("the command line is empty")
+            let (text, from_sel) = cx.subject();
+            if text.is_empty() {
+                Outcome::Nothing("nothing selected and the command line is empty")
             } else {
-                Outcome::Replace(tools::base64_encode(cx.line.as_bytes()))
+                transformed(from_sel, tools::base64_encode(text.as_bytes()))
             }
         }
-        Utility::Base64Decode => match tools::base64_decode(cx.line) {
-            // Decoded bytes that are not text would put control characters on
-            // the command line, where they are invisible and still get sent.
-            Some(bytes) => match String::from_utf8(bytes) {
-                Ok(s) if !s.is_empty() => Outcome::Replace(s),
-                Ok(_) => Outcome::Nothing("that decodes to nothing"),
-                Err(_) => Outcome::Nothing("that decodes to bytes, not text"),
-            },
-            None => Outcome::Nothing("that is not base64"),
-        },
+        Utility::Base64Decode => {
+            let (text, from_sel) = cx.subject();
+            match tools::base64_decode(text.trim()) {
+                // Decoded bytes that are not text would put control characters
+                // on a command line, where they are invisible and still sent.
+                Some(bytes) => match String::from_utf8(bytes) {
+                    Ok(s) if !s.is_empty() => transformed(from_sel, s),
+                    Ok(_) => Outcome::Nothing("that decodes to nothing"),
+                    Err(_) => Outcome::Nothing("that decodes to bytes, not text"),
+                },
+                None => Outcome::Nothing("that is not base64"),
+            }
+        }
         Utility::QuoteLine => {
-            if cx.line.is_empty() {
-                Outcome::Nothing("the command line is empty")
+            let (text, from_sel) = cx.subject();
+            if text.is_empty() {
+                Outcome::Nothing("nothing selected and the command line is empty")
             } else {
-                Outcome::Replace(tools::shell_quote(cx.line))
+                transformed(from_sel, tools::shell_quote(text))
             }
         }
     }
@@ -215,6 +247,7 @@ mod tests {
     fn cx(line: &str) -> Context<'_> {
         Context {
             line,
+            selection: None,
             this_path: "/tmp/here".into(),
             other_path: "/tmp/there".into(),
             selected: vec!["one.txt".into(), "two files.txt".into()],
@@ -311,6 +344,7 @@ mod tests {
     fn an_empty_selection_is_reported_not_pasted_as_nothing() {
         let empty = Context {
             line: "",
+            selection: None,
             this_path: "/tmp".into(),
             other_path: "/tmp".into(),
             selected: vec![],
@@ -320,5 +354,61 @@ mod tests {
             run(Utility::SelectedNames, &empty),
             Outcome::Nothing(_)
         ));
+    }
+
+    fn with_selection<'a>(line: &'a str, sel: &'a str) -> Context<'a> {
+        Context {
+            line,
+            selection: Some(sel),
+            this_path: "/tmp/here".into(),
+            other_path: "/tmp/there".into(),
+            selected: vec![],
+            selected_paths: vec![],
+        }
+    }
+
+    /// Selecting something and having the menu act on something else is the
+    /// surprise that costs trust in the whole menu.
+    #[test]
+    fn a_selection_wins_over_the_command_line() {
+        let sel = with_selection("this is the line", "ciao");
+        match run(Utility::Base64Encode, &sel) {
+            Outcome::Insert(s) => assert_eq!(s, "Y2lhbw=="),
+            other => panic!("expected the selection to be inserted, got {other:?}"),
+        }
+    }
+
+    /// A selection can be anywhere — the shell's screen most of all — so its
+    /// result has nothing to replace and is added to the command line instead.
+    #[test]
+    fn a_transform_on_a_selection_adds_rather_than_replaces() {
+        let sel = with_selection("keep me", "one two");
+        assert!(matches!(
+            run(Utility::QuoteLine, &sel),
+            Outcome::Insert(ref s) if s == "'one two'"
+        ));
+        // With no selection the same utility rewrites the line in place.
+        assert!(matches!(
+            run(Utility::QuoteLine, &cx("one two")),
+            Outcome::Replace(ref s) if s == "'one two'"
+        ));
+    }
+
+    /// A selection of nothing but spaces is not a selection.
+    #[test]
+    fn a_blank_selection_falls_back_to_the_line() {
+        let sel = with_selection("echo hi", "   \n ");
+        assert!(matches!(
+            run(Utility::Base64Encode, &sel),
+            Outcome::Replace(ref s) if s == "ZWNobyBoaQ=="
+        ));
+    }
+
+    /// Text selected off a terminal screen arrives with the trailing spaces of
+    /// the row it came from; base64 does not survive them.
+    #[test]
+    fn a_selection_is_trimmed_before_being_decoded() {
+        let sel = with_selection("", "  Y2lhbw==  \n");
+        assert!(matches!(run(Utility::Base64Decode, &sel), Outcome::Insert(ref s) if s == "ciao"));
     }
 }

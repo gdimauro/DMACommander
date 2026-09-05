@@ -1561,6 +1561,25 @@ impl App {
                     self.handle(a);
                     return;
                 }
+                // Sessions stay reachable from inside a shell. Being able to
+                // start something long-running and then leave it to look at
+                // another session is most of what several sessions are for.
+                Some(
+                    a @ (Action::ToggleRail | Action::CycleSession(_) | Action::SwitchSession(_)),
+                ) => {
+                    self.handle(a);
+                    return;
+                }
+                // Ctrl-Shift-U, never plain Ctrl-U: in a shell that is
+                // readline's kill-line, and a file manager that swallowed it
+                // would break every shell it hosts.
+                Some(Action::UtilitiesMenu)
+                    if k.modifiers
+                        .intersects(KeyModifiers::SHIFT | KeyModifiers::SUPER) =>
+                {
+                    self.handle(Action::UtilitiesMenu);
+                    return;
+                }
                 _ => {}
             }
             self.send_to_shell(k);
@@ -1626,8 +1645,18 @@ impl App {
             })
             .collect();
 
+        // What the utilities act on: the shell's selection when there is one,
+        // and the command line otherwise. Reachable from the shell view, this
+        // is the difference between a useful menu and one whose transforms all
+        // report an empty command line.
+        let selection = self
+            .shell_selection
+            .zip(ses.hosted())
+            .map(|(sel, sh)| sel.text(sh));
+
         let cx = Context {
             line: &ses.command_line,
+            selection: selection.as_deref(),
             this_path: ses.cwd[this].to_string(),
             other_path: ses.cwd[other].to_string(),
             selected: names,
@@ -3109,6 +3138,106 @@ mod tests {
         assert!(
             after.0 > before.0 && after.1 > before.1,
             "expected a bigger pty than {before:?}, got {after:?}"
+        );
+    }
+
+    /// Ctrl-Shift-U has to reach the menu from wherever the user is, including
+    /// from inside a hosted shell — a utilities menu you can only open from one
+    /// view is one you stop reaching for.
+    #[test]
+    fn ctrl_shift_u_opens_the_utilities_menu_everywhere() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let ctrl_shift_u = KeyEvent::new(
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        for focus in [Focus::Panel, Focus::CommandLine] {
+            assert_eq!(
+                keymap::resolve(ctrl_shift_u, focus),
+                Some(Action::UtilitiesMenu),
+                "{focus:?}"
+            );
+        }
+
+        let mut app = fixture();
+        app.on_key(ctrl_shift_u);
+        assert!(
+            matches!(app.mode, Mode::Utilities { .. }),
+            "from the panels"
+        );
+
+        let mut app = fixture();
+        app.handle(Action::ToggleShell);
+        assert_eq!(app.ses().view, View::Shell);
+        app.on_key(ctrl_shift_u);
+        assert!(
+            matches!(app.mode, Mode::Utilities { .. }),
+            "the shell swallowed it"
+        );
+    }
+
+    /// Plain Ctrl-U is readline's kill-line. Swallowing it would break every
+    /// shell the file manager hosts, so in the shell view it goes to the child.
+    #[test]
+    fn plain_ctrl_u_still_belongs_to_the_shell() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = fixture();
+        app.handle(Action::ToggleShell);
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(app.mode, Mode::Normal, "the menu stole the shell's Ctrl-U");
+        assert_eq!(app.ses().view, View::Shell);
+    }
+
+    /// Ctrl-Tab and Ctrl-Shift-Tab move between sessions, in both the spellings
+    /// terminals use for the shifted one.
+    #[test]
+    fn ctrl_tab_cycles_sessions_in_either_encoding() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let ctrl = KeyModifiers::CONTROL;
+        let ctrl_shift = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        assert_eq!(
+            keymap::resolve(KeyEvent::new(KeyCode::Tab, ctrl), Focus::Panel),
+            Some(Action::CycleSession(1))
+        );
+        for shifted in [
+            KeyEvent::new(KeyCode::Tab, ctrl_shift),
+            KeyEvent::new(KeyCode::BackTab, ctrl_shift),
+            KeyEvent::new(KeyCode::BackTab, ctrl),
+        ] {
+            assert_eq!(
+                keymap::resolve(shifted, Focus::Panel),
+                Some(Action::CycleSession(-1)),
+                "{shifted:?}"
+            );
+        }
+        // Bare Shift-Tab still opens the rail; the Ctrl arms must not shadow it.
+        assert_eq!(
+            keymap::resolve(
+                KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+                Focus::Panel
+            ),
+            Some(Action::ToggleRail)
+        );
+    }
+
+    /// Switching sessions from inside a shell is most of what several sessions
+    /// are for: start something long-running, then go and look at another one.
+    // A runtime, because leaving a session re-lists the one arrived at, and
+    // listings are spawned tasks.
+    #[tokio::test]
+    async fn sessions_are_reachable_from_inside_the_shell() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = fixture();
+        app.handle(Action::NewSession);
+        app.mode = Mode::Normal;
+        let before = app.sessions.current().id;
+
+        app.handle(Action::ToggleShell);
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL));
+        assert_ne!(
+            app.sessions.current().id,
+            before,
+            "Ctrl-Tab did not leave the session"
         );
     }
 }
