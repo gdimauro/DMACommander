@@ -13,5 +13,6 @@ workspace = true
 
 [dependencies]
 dmac-core = { version = "0.1.0", path = "../dmac-core" }
+dmac-pty = { version = "0.1.0", path = "../dmac-pty" }
 dmac-vfs = { version = "0.1.0", path = "../dmac-vfs" }
 thiserror = "2.0.20"

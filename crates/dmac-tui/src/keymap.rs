@@ -93,17 +93,17 @@ pub fn resolve(key: KeyEvent, focus: Focus) -> Option<Action> {
         (Esc, _, _) => Action::FocusToggle,
 
         (Char('u'), true, false) => Action::SwapPanels,
-        (Char('o'), true, false) => Action::TogglePanels,
+        (Char('o'), true, false) => Action::ToggleShell,
         (Char('r'), true, false) => Action::Refresh,
         // Backspace goes up a directory only with a modifier now, because plain
         // Backspace edits the quick-search buffer while a panel has focus.
         (Backspace, true, false) | (Backspace, false, true) => Action::GoParent,
 
-        // --- Selection. Ins sweeps; Gray +/-/* are the classic mask keys. ---
+        // --- Selection. Ins works from anywhere; the classic mask keys are
+        //     resolved under panel focus only, because `*`, `+` and `-` are
+        //     ordinary characters when you are typing a command. Binding them
+        //     here would silently eat every hyphen in a command line. ---
         (Insert, _, _) => Action::ToggleSelection,
-        (Char('*'), false, false) => Action::InvertSelection,
-        (Char('+'), false, false) => Action::SelectAll,
-        (Char('-'), false, false) => Action::ClearSelection,
 
         (Char('h'), true, false) => Action::ToggleHidden,
 
@@ -135,6 +135,10 @@ fn resolve_focused(key: KeyEvent, focus: Focus) -> Option<Action> {
 
         Focus::Panel => match (key.code, ctrl, alt) {
             (Enter, false, false) => Action::Activate,
+            // The Norton mask keys, live only while a panel has the keyboard.
+            (Char('*'), false, false) => Action::InvertSelection,
+            (Char('+'), false, false) => Action::SelectAll,
+            (Char('-'), false, false) => Action::ClearSelection,
             (Backspace, false, false) => Action::QuickSearchBackspace,
             // Selection keys keep their meaning; everything else printable is a
             // search. `*`, `+` and `-` are matched earlier, above this function.

@@ -53,6 +53,10 @@ pub enum EffectControl {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Screensaver,
+    /// Plays itself. Safe for the idle timer and the rotation, because it needs
+    /// nobody watching — and a key still gives the file manager back, unless the
+    /// user deliberately takes over.
+    Demo,
     Game,
 }
 
@@ -128,6 +132,11 @@ pub fn catalog() -> &'static [CatalogEntry] {
             blurb: "the 1995 office classic",
         },
         CatalogEntry {
+            name: "asteroids",
+            kind: Demo,
+            blurb: "the computer plays; space to take over",
+        },
+        CatalogEntry {
             name: "snake",
             kind: Game,
             blurb: "arrows to steer, esc to leave",
@@ -135,15 +144,22 @@ pub fn catalog() -> &'static [CatalogEntry] {
     ]
 }
 
-/// Screensaver names only — what `random` and the rotation draw from. Games are
-/// excluded on purpose.
+/// What `random` and the rotation draw from: everything except games.
+///
+/// Derived from [`catalog`] rather than kept as a second list. They were two
+/// lists briefly, and they immediately disagreed — an effect was advertised in
+/// one and missing from the other, which is a whole class of bug that simply
+/// cannot happen once one is computed from the other.
 pub fn available() -> &'static [&'static str] {
-    // A const slice would need duplicating the list; this is called on user
-    // action, never per frame.
-    SCREENSAVERS
+    static NAMES: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
+        catalog()
+            .iter()
+            .filter(|e| e.kind != Kind::Game)
+            .map(|e| e.name)
+            .collect()
+    });
+    &NAMES
 }
-
-const SCREENSAVERS: &[&str] = &["matrix", "starfield", "plasma", "life", "pipes"];
 
 /// The entry for a name, if it exists.
 pub fn entry(name: &str) -> Option<&'static CatalogEntry> {
@@ -159,6 +175,7 @@ pub fn build(name: &str) -> Option<Box<dyn Effect>> {
         "plasma" => Some(Box::new(effects::plasma::Plasma::new())),
         "life" => Some(Box::new(effects::life::Life::new())),
         "pipes" => Some(Box::new(effects::pipes::Pipes::new())),
+        "asteroids" => Some(Box::new(effects::asteroids::Asteroids::new())),
         "snake" => Some(Box::new(effects::snake::Snake::new())),
         _ => None,
     }
@@ -188,22 +205,20 @@ mod tests {
         }
     }
 
-    /// Games must never be started by the idle timer or by `random`. Coming back
-    /// from coffee to find yourself mid-Snake is not a feature.
+    /// Games must never be started by the idle timer or by `random`. Coming
+    /// back from coffee to find yourself mid-Snake is not a feature. A demo
+    /// plays itself, so it is allowed.
     #[test]
     fn games_are_excluded_from_the_random_rotation() {
         for name in available() {
             let kind = entry(name).expect("in catalog").kind;
-            assert_eq!(
-                kind,
-                Kind::Screensaver,
-                "{name} must not be in the rotation"
-            );
+            assert_ne!(kind, Kind::Game, "{name} must not be in the rotation");
         }
         assert!(
             catalog().iter().any(|e| e.kind == Kind::Game),
             "there should be games"
         );
+        assert!(catalog().iter().any(|e| e.kind == Kind::Demo), "and demos");
     }
 
     /// A screensaver dismisses on any key; a game does not, or you could not
@@ -215,7 +230,9 @@ mod tests {
             fx.resize(40, 20);
             let control = fx.on_input(EffectKey::Left);
             match e.kind {
-                Kind::Screensaver => assert_eq!(control, EffectControl::Exit, "{}", e.name),
+                Kind::Screensaver | Kind::Demo => {
+                    assert_eq!(control, EffectControl::Exit, "{}", e.name)
+                }
                 Kind::Game => assert_eq!(control, EffectControl::Consumed, "{}", e.name),
             }
         }

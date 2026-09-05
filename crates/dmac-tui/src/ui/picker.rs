@@ -78,7 +78,7 @@ pub fn draw(
         {
             games_started = true;
             lines.push(Line::from(Span::styled(
-                "  — games —",
+                "  \u{2014} games \u{2014}",
                 Style::default().fg(theme.status_fg).bg(theme.panel_bg),
             )));
         }

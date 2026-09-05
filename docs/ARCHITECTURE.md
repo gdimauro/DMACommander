@@ -20,7 +20,9 @@ cannot reconstruct.
 | `dmac-config` | config, keymaps, themes; platform paths | `rust-architect` |
 | `dmac-core` | entries, panels, jobs, the file-operation engine | `fileops-engineer` |
 | `dmac-vfs` | `VfsBackend` trait + every provider | `vfs-engineer` |
-| `dmac-session` | named sessions, workspace persistence, agent reattach | `session-engineer` |
+| `dmac-pty` | hosting child processes on a pseudo-terminal | `tui-engineer` |
+| `dmac-desktop` | launching and raising external GUI windows (ADR 0003) | `tui-engineer` |
+| `dmac-session` | live sessions, their shells, workspace persistence | `session-engineer` |
 | `dmac-search` | fuzzy, full-text and vector search | `search-engineer` |
 | `dmac-view` | viewer, editor, hex, diff, image preview | `tui-engineer` |
 | `dmac-fx` | dock, screensavers, transitions | `fx-engineer` |

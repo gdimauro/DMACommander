@@ -11,7 +11,7 @@ use crate::{keymap, ui};
 use dmac_core::{Panel, PanelId, SortOrder};
 use dmac_fx::{Canvas, EffectKey, Screensaver, ScreensaverConfig, Wake};
 pub use dmac_session::Focus;
-use dmac_session::{Session, SessionManager};
+use dmac_session::{Session, SessionManager, View};
 use dmac_vfs::{BackendRef, ListChunk, VfsPath, local::LocalBackend};
 use ratatui::crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
@@ -72,6 +72,8 @@ pub(crate) struct LayoutCache {
     pub command: Rect,
     /// Interior of the session rail.
     pub rail: Rect,
+    /// Interior of the shell view while it is showing.
+    pub shell: Rect,
     /// Interior of the context menu while it is open.
     pub menu: Rect,
     /// Interior of the screensaver picker while it is open.
@@ -428,10 +430,7 @@ impl App {
                 s.cwd.swap(0, 1);
                 s.generation.swap(0, 1);
             }
-            TogglePanels => {
-                let hidden = self.ses().panels_hidden;
-                self.ses_mut().panels_hidden = !hidden;
-            }
+            ToggleShell => self.toggle_shell(),
             Refresh => self.reload(self.ses().active),
 
             ToggleSelection => self.active_panel_mut().toggle_selection(),
@@ -485,12 +484,7 @@ impl App {
                 self.ses_mut().command_line.pop();
             }
             CommandClear => self.ses_mut().command_line.clear(),
-            CommandSubmit => {
-                if !self.ses().command_line.is_empty() {
-                    self.status = format!("shell not wired up yet: {}", self.ses().command_line);
-                    self.ses_mut().command_line.clear();
-                }
-            }
+            CommandSubmit => self.run_command(),
 
             QuickSearch(c) => self.quick_search(c),
             QuickSearchBackspace => {
@@ -515,6 +509,62 @@ impl App {
             Delete => self.status = self.pending_op("F8 delete"),
             Menu => self.status = "F9 menu — not implemented yet".into(),
             Unimplemented(what) => self.status = format!("{what} — not implemented yet"),
+        }
+    }
+
+    /// The area the shell is drawn in, in cells. Recorded by the renderer, so
+    /// the PTY is always exactly the size of what the user can see.
+    fn shell_size(&self) -> (u16, u16) {
+        let a = self.layout.shell;
+        if a.width >= 2 && a.height >= 2 {
+            (a.width, a.height)
+        } else {
+            // Before the first frame there is no recorded size. Something
+            // plausible beats zero: the child is told the truth on the next draw.
+            (80, 24)
+        }
+    }
+
+    /// Show the shell, or go back to the panels.
+    fn toggle_shell(&mut self) {
+        if self.ses().view == View::Shell {
+            self.ses_mut().view = View::Panels;
+            self.status.clear();
+            return;
+        }
+        let (cols, rows) = self.shell_size();
+        match self.ses_mut().shell(cols, rows) {
+            Ok(_) => {
+                self.ses_mut().view = View::Shell;
+                self.status.clear();
+            }
+            // A shell that will not start must say why. A blank pane the user
+            // cannot explain is the worst possible outcome here.
+            Err(e) => self.status = format!("shell: {e}"),
+        }
+    }
+
+    /// Run what is on the command line in the session's shell.
+    ///
+    /// Switches to the shell view, because a command whose output you cannot
+    /// see has not really run as far as the user is concerned.
+    fn run_command(&mut self) {
+        let line = self.ses().command_line.trim().to_string();
+        if line.is_empty() {
+            return;
+        }
+
+        let (cols, rows) = self.shell_size();
+        match self.ses_mut().shell(cols, rows) {
+            Ok(shell) => match shell.run(&line) {
+                Ok(()) => {
+                    self.ses_mut().command_line.clear();
+                    self.ses_mut().view = View::Shell;
+                    self.status.clear();
+                }
+                Err(e) => self.status = format!("shell: {e}"),
+            },
+            Err(e) => self.status = format!("shell: {e}"),
         }
     }
 
@@ -725,6 +775,21 @@ impl App {
             Mode::Normal => {}
         }
 
+        // While the shell is showing it owns the keyboard, or half the keys a
+        // shell needs would be eaten by the file manager. Exactly one binding is
+        // reserved: the one that gets you back out.
+        if self.ses().view == View::Shell {
+            if matches!(
+                keymap::resolve(k, self.ses().focus),
+                Some(Action::ToggleShell)
+            ) {
+                self.toggle_shell();
+                return;
+            }
+            self.send_to_shell(k);
+            return;
+        }
+
         if let Some(action) = keymap::resolve(k, self.ses().focus) {
             self.handle(action);
         }
@@ -752,6 +817,27 @@ impl App {
             KeyCode::End => self.mode = Mode::Picker { selected: rows - 1 },
             KeyCode::Enter => self.start_picked(selected),
             _ => {}
+        }
+    }
+
+    fn send_to_shell(&mut self, k: KeyEvent) {
+        let Some(bytes) = crate::ui::shell::encode(k) else {
+            return;
+        };
+        let (cols, rows) = self.shell_size();
+        match self.ses_mut().shell(cols, rows) {
+            Ok(shell) => {
+                if let Err(e) = shell.write(&bytes) {
+                    // The shell exited under us. Say so and go back to the
+                    // panels rather than swallowing keys into a dead process.
+                    self.status = format!("shell: {e}");
+                    self.ses_mut().view = View::Panels;
+                }
+            }
+            Err(e) => {
+                self.status = format!("shell: {e}");
+                self.ses_mut().view = View::Panels;
+            }
         }
     }
 

@@ -7,8 +7,57 @@
 use crate::{Canvas, Cell, Effect, Rgb};
 use std::time::Duration;
 
-/// Generations per second. Life is legible slowly; at 60fps it is a grey blur.
-const GENERATIONS_PER_SEC: f32 = 12.0;
+/// Generations per second. Life is legible slowly; at 60fps it is a grey blur,
+/// and the point is to watch structures move.
+const GENERATIONS_PER_SEC: f32 = 9.0;
+
+/// Background soup density. Deliberately thin: enough to give the spaceships
+/// something to run into, not enough to drown them.
+const SOUP: f32 = 0.06;
+
+/// Patterns, as (width, rows-of-bits). Coordinates are row-major, `#` alive.
+const GLIDER: (&[&str], &str) = (&[".#.", "..#", "###"], "glider");
+const LWSS: (&[&str], &str) = (
+    &[".####", "#...#", "....#", "#..#."],
+    "lightweight spaceship",
+);
+const PULSAR: (&[&str], &str) = (
+    &[
+        "..###...###..",
+        ".............",
+        "#....#.#....#",
+        "#....#.#....#",
+        "#....#.#....#",
+        "..###...###..",
+        ".............",
+        "..###...###..",
+        "#....#.#....#",
+        "#....#.#....#",
+        "#....#.#....#",
+        ".............",
+        "..###...###..",
+    ],
+    "pulsar",
+);
+/// Five cells that stay chaotic for over a thousand generations.
+const R_PENTOMINO: (&[&str], &str) = (&[".##", "##.", ".#."], "r-pentomino");
+/// Seven cells, five thousand generations.
+const ACORN: (&[&str], &str) = (&[".#.....", "...#...", "##..###"], "acorn");
+/// Emits a glider every 30 generations, forever. The showpiece.
+const GOSPER_GUN: (&[&str], &str) = (
+    &[
+        "........................#...........",
+        "......................#.#...........",
+        "............##......##............##",
+        "...........#...#....##............##",
+        "##........#.....#...##..............",
+        "##........#...#.##....#.#...........",
+        "..........#.....#.......#...........",
+        "...........#...#....................",
+        "............##......................",
+    ],
+    "gosper glider gun",
+);
 /// Reseed after this many generations without a population change — the board
 /// has almost certainly settled.
 const STALL_LIMIT: u32 = 40;
@@ -42,9 +91,61 @@ impl Life {
 
     fn seed(&mut self) {
         for c in &mut self.cells {
-            *c = if fastrand::f32() < 0.28 { 1 } else { 0 };
+            *c = if fastrand::f32() < SOUP { 1 } else { 0 };
         }
+
+        // A gun if there is room for one: it keeps the board alive indefinitely,
+        // which is exactly what a screensaver wants.
+        if self.w > 50 && self.h > 14 {
+            self.stamp(
+                GOSPER_GUN.0,
+                fastrand::usize(0..self.w / 3),
+                fastrand::usize(0..self.h / 2),
+            );
+        }
+
+        // Then a handful of patterns scattered around. Weighted towards the ones
+        // that move or keep producing, because a board of still lifes is a
+        // screensaver that has stopped.
+        let catalogue = [
+            GLIDER.0,
+            GLIDER.0,
+            GLIDER.0,
+            LWSS.0,
+            LWSS.0,
+            R_PENTOMINO.0,
+            R_PENTOMINO.0,
+            ACORN.0,
+            PULSAR.0,
+        ];
+        let n = ((self.w * self.h) / 900).clamp(3, 14);
+        for _ in 0..n {
+            let pattern = catalogue[fastrand::usize(..catalogue.len())];
+            let x = fastrand::usize(0..self.w);
+            let y = fastrand::usize(0..self.h);
+            self.stamp(pattern, x, y);
+        }
+
         self.stalled_for = 0;
+        self.last_population = 0;
+    }
+
+    /// Draw a pattern with its top-left at `(x, y)`, wrapping at the edges.
+    ///
+    /// Wrapping rather than clipping: the board is a torus for the neighbour
+    /// count too, so a pattern straddling the edge behaves exactly as it would
+    /// anywhere else, and patterns can be placed without bounds arithmetic.
+    fn stamp(&mut self, pattern: &[&str], x: usize, y: usize) {
+        for (dy, row) in pattern.iter().enumerate() {
+            for (dx, ch) in row.chars().enumerate() {
+                if ch != '#' {
+                    continue;
+                }
+                let px = (x + dx) % self.w;
+                let py = (y + dy) % self.h;
+                self.cells[py * self.w + px] = 1;
+            }
+        }
     }
 
     /// Neighbour count on a torus — wrapping keeps gliders from piling up on the

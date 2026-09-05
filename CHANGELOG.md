@@ -6,6 +6,27 @@ Notable changes, newest first. Versions follow the policy in
 ## Unreleased
 
 ### Added
+- **A real shell in every session.** `dmac-pty` hosts a child on a pseudo-terminal
+  (`portable-pty`, so ConPTY on Windows) and interprets its output with a proper
+  terminal emulator (`vt100`). `Ctrl-O` swaps between the panels and the shell —
+  the Norton Commander binding, now with an actual shell to reveal. A command
+  typed on the command line runs there and switches to the view, because a
+  command whose output you cannot see has not really run.
+
+  The shell starts in the active panel's directory, loads your rc files, and is
+  spawned on first use rather than at startup. While it is showing it owns the
+  keyboard, with exactly one binding reserved to get back out — otherwise half
+  the keys a shell needs would be eaten by the file manager. Keys are encoded the
+  way a terminal encodes them, so Ctrl-C interrupts, Ctrl-D ends input, arrows
+  reach history and Alt-b moves by word.
+
+  A hosted process never outlives its session, and a shell that dies is replaced
+  rather than silently accepting keys forever.
+- **Asteroids**, played by the computer. It is an arcade attract mode, so unlike
+  Snake it belongs in the idle rotation: it needs nobody watching. Pressing any
+  key still gives you your file manager back — taking over is deliberate, on
+  Space. Drawn as real wireframe vectors, which needed line and polygon drawing
+  on the effect canvas.
 - **Multiple live sessions.** `dmac-session` holds several workspaces at once,
   each with its own panels, focus, command line and current directory. They are
   live, not swapped: switching does not save one and load another, so nothing
@@ -47,6 +68,14 @@ Notable changes, newest first. Versions follow the policy in
 - `docs/VERSIONING.md` and this changelog.
 
 ### Fixed
+- **Typing `-`, `+` or `*` on the command line did nothing.** They were bound to
+  the Norton selection-mask actions before focus was consulted, so every hyphen
+  in a command was silently eaten — `uname -s` arrived as `uname s`. They are now
+  resolved under panel focus only.
+- **Life looked like television snow.** It was seeded with uniform random soup,
+  which never resolves into anything you can follow. It now starts from known
+  patterns on a mostly-empty board — gliders, spaceships, a pulsar, the
+  R-pentomino, the acorn, and a Gosper gun that emits a glider stream forever.
 - **The command-line cursor did not blink** in some terminals. The shape was
   asked for once at startup with DECSCUSR, and a terminal that resets it — or
   overrides it with its own cursor preference — left the cursor steady with

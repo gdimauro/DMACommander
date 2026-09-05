@@ -8,6 +8,7 @@ mod panel;
 pub(crate) mod picker;
 pub(crate) mod rail;
 mod screen;
+pub(crate) mod shell;
 mod splash;
 
 pub use screen::draw_canvas;
@@ -65,12 +66,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } = app;
     let session = sessions.current_mut();
     let (active, focus, panels_hidden) = (session.active, session.focus, session.panels_hidden);
-    let panels = &mut session.panels;
 
     layout.fkeys = rows[2];
     layout.command = rows[1];
 
-    if !panels_hidden {
+    // The shell replaces the panels rather than sitting beside them: it is the
+    // same session seen a different way, and splitting the screen would give
+    // both halves too little room to be useful.
+    if session.view == dmac_session::View::Shell {
+        if let Some(sh) = session.shell.as_ref() {
+            layout.shell = shell::draw(frame, body[1], sh, true, theme);
+            layout.panels = [ratatui::layout::Rect::default(); 2];
+        }
+    } else if !panels_hidden {
+        let panels = &mut session.panels;
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])

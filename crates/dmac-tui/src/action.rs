@@ -40,8 +40,10 @@ pub enum Action {
     // Panels
     SwitchPanel,
     SwapPanels,
-    /// Ctrl-O: hide both panels to reveal the shell underneath.
-    TogglePanels,
+    /// Ctrl-O: swap between the panels and the session's shell. In Norton
+    /// Commander this hid the panels to reveal the shell underneath; here there
+    /// is a real shell to reveal.
+    ToggleShell,
 
     // Selection
     /// Shift+Up/Down: grow or shrink an anchored selection by rows.

@@ -15,7 +15,20 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use dmac_core::{Panel, PanelId};
+use dmac_pty::Hosted;
 use dmac_vfs::VfsPath;
+
+/// What a session is showing.
+///
+/// The shell is not a separate window: it is an alternative view of the same
+/// session, exactly as Ctrl-O in Norton Commander revealed the shell underneath
+/// the panels. Which view you were in is session state, so switching sessions
+/// and coming back puts you where you were.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    Panels,
+    Shell,
+}
 
 /// Where the keyboard is within a session. Two places, never ambiguous.
 ///
@@ -72,6 +85,11 @@ pub struct Session {
     pub focus: Focus,
     pub command_line: String,
     pub panels_hidden: bool,
+    pub view: View,
+    /// The session's shell, spawned on first use rather than at startup: most
+    /// sessions never need one, and paying for a process per session up front
+    /// would be a cost for nothing.
+    pub shell: Option<Hosted>,
     pub last_used: std::time::Instant,
 }
 
@@ -88,6 +106,8 @@ impl Session {
             focus: Focus::Panel,
             command_line: String::new(),
             panels_hidden: false,
+            view: View::Panels,
+            shell: None,
             last_used: std::time::Instant::now(),
         }
     }
@@ -118,6 +138,36 @@ impl Session {
 
     pub fn active_cwd(&self) -> &VfsPath {
         &self.cwd[Self::index_of(self.active)]
+    }
+
+    /// The session's shell, starting it if this is the first time.
+    ///
+    /// Errors are returned rather than swallowed: a shell that failed to start
+    /// must say so, because the alternative is a blank pane the user cannot
+    /// explain.
+    pub fn shell(&mut self, cols: u16, rows: u16) -> dmac_pty::Result<&mut Hosted> {
+        // A shell whose process has gone is replaced, not reused: typing into a
+        // dead shell forever is worse than starting a new one.
+        if self.shell.as_ref().is_some_and(|s| s.finished()) {
+            self.shell = None;
+        }
+        if self.shell.is_none() {
+            let cwd = self.cwd[Self::index_of(self.active)].clone();
+            let dir = cwd.is_local().then(|| cwd.as_path().to_path_buf());
+            self.shell = Some(Hosted::shell(dir.as_deref(), cols, rows)?);
+        }
+        match self.shell.as_mut() {
+            Some(s) => {
+                s.resize(cols, rows)?;
+                Ok(s)
+            }
+            None => Err(dmac_pty::PtyError::Gone),
+        }
+    }
+
+    /// Whether a shell has been started and is still alive.
+    pub fn shell_running(&self) -> bool {
+        self.shell.as_ref().is_some_and(|s| !s.finished())
     }
 
     /// One line for the rail: what this session is looking at.

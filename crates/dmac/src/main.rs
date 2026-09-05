@@ -90,6 +90,7 @@ fn main() -> Result<()> {
         for e in dmac_fx::catalog() {
             let kind = match e.kind {
                 dmac_fx::Kind::Game => "  [game]",
+                dmac_fx::Kind::Demo => "  [demo]",
                 dmac_fx::Kind::Screensaver => "",
             };
             println!("{:<11} {}{}", e.name, e.blurb, kind);
