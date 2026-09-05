@@ -1171,14 +1171,18 @@ impl App {
         }
     }
 
-    /// Put the shell's selected text on the clipboard.
+    /// Put the selection on the clipboard — the shell's, or the command line.
     fn copy_selection(&mut self) {
-        let Some(sel) = self.shell_selection else {
-            self.status = "nothing selected — drag over the shell to select".into();
-            return;
-        };
-        let Some(text) = self.ses().hosted().map(|sh| sel.text(sh)) else {
-            return;
+        let text = match self.shell_selection.zip(self.ses().hosted()) {
+            Some((sel, sh)) => sel.text(sh),
+            // Nothing selected on a shell screen: the command line is the other
+            // thing on screen worth copying, and copying it is more useful than
+            // saying no.
+            None if !self.ses().command_line.is_empty() => self.ses().command_line.clone(),
+            None => {
+                self.status = "nothing to copy".into();
+                return;
+            }
         };
         if text.trim().is_empty() {
             self.status = "nothing selected".into();
@@ -1201,12 +1205,8 @@ impl App {
         }
     }
 
-    /// Paste the clipboard into the hosted shell.
+    /// Paste the clipboard wherever the keyboard is.
     fn paste_into_shell(&mut self) {
-        if self.ses().view != View::Shell {
-            self.status = "paste goes to the shell — Ctrl-O first".into();
-            return;
-        }
         let text = match dmac_core::clipboard::text() {
             Ok(t) => t,
             Err(e) => {
@@ -1214,6 +1214,26 @@ impl App {
                 return;
             }
         };
+        // On the panels there is no child to send bytes to, so it goes on the
+        // command line — which is where you were about to type it anyway.
+        // Refusing to paste unless a shell happens to be showing is not a
+        // safety measure, it is just a paste that does not work.
+        if self.ses().view != View::Shell {
+            let n = text.chars().count();
+            // Newlines would run as separate commands the moment Enter is
+            // pressed; a paste is text, not a decision to run three things.
+            let flat = text
+                .lines()
+                .map(str::trim_end)
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            self.ses_mut().command_line.push_str(&flat);
+            self.ses_mut().focus = Focus::CommandLine;
+            self.status = format!("pasted {n} characters");
+            return;
+        }
+
         let bracketed = self
             .ses()
             .hosted()

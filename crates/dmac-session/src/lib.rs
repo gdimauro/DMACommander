@@ -16,6 +16,7 @@
 
 pub mod store;
 
+pub mod agent;
 use dmac_core::{Panel, PanelId};
 use dmac_pty::Hosted;
 use dmac_vfs::VfsPath;
@@ -97,6 +98,12 @@ pub struct Session {
     /// on every visit — re-entering a directory you are already in still costs
     /// a line of scrollback and a wasted prompt.
     pub shell_cwd: Option<VfsPath>,
+    /// The conversation a hosted agent in this session belongs to.
+    ///
+    /// Generated once and then kept for the life of the session, because that
+    /// is the whole point: come back tomorrow and `claude` rejoins the
+    /// conversation you left, instead of starting a new one next to it.
+    pub conversation: Option<String>,
     pub last_used: std::time::Instant,
 }
 
@@ -116,6 +123,7 @@ impl Session {
             view: View::Panels,
             shell: None,
             shell_cwd: None,
+            conversation: None,
             last_used: std::time::Instant::now(),
         }
     }
@@ -172,7 +180,8 @@ impl Session {
         if self.shell.is_none() {
             let cwd = self.cwd[Self::index_of(self.active)].clone();
             let dir = cwd.is_local().then(|| cwd.as_path().to_path_buf());
-            self.shell = Some(Hosted::shell(dir.as_deref(), cols, rows, waker)?);
+            let env = self.agent_environment();
+            self.shell = Some(Hosted::shell(dir.as_deref(), cols, rows, waker, &env)?);
             // It started there, so it is already there: recording it is what
             // keeps the first Ctrl-O from writing a `cd` to where we already are.
             self.shell_cwd = cwd.is_local().then(|| cwd.clone());
@@ -187,6 +196,31 @@ impl Session {
     }
 
     /// Whether a shell has been started and is still alive.
+    /// The conversation id for this session, made on first ask.
+    ///
+    /// A UUID because that is what `claude --session-id` takes, and because it
+    /// is the same identifier `ps` will then show — which is how you tell, from
+    /// outside, which conversation a running process belongs to.
+    pub fn conversation_id(&mut self) -> &str {
+        self.conversation
+            .get_or_insert_with(dmac_core::tools::uuid_v4)
+    }
+
+    /// Environment for a shell started in this session: the shim directory on
+    /// `PATH`, and the ids in plain sight.
+    fn agent_environment(&mut self) -> Vec<(String, String)> {
+        let Some(root) = agent_root() else {
+            return Vec::new();
+        };
+        let (id, name) = (self.id.0.to_string(), self.name.clone());
+        let conversation = self.conversation_id().to_string();
+        match agent::prepare(&root, &id, &conversation) {
+            Some(dir) => agent::environment(&dir, &name, &conversation),
+            // No agent installed: no shim, and no PATH surgery for nothing.
+            None => Vec::new(),
+        }
+    }
+
     /// The session's shell if it has one, without starting one.
     pub fn hosted(&self) -> Option<&Hosted> {
         self.shell.as_ref()
@@ -423,6 +457,16 @@ fn abbreviate_home(path: &str) -> String {
         Some(h) if !h.is_empty() && path.starts_with(&h) => format!("~{}", &path[h.len()..]),
         _ => path.to_string(),
     }
+}
+
+/// Where per-session scratch belonging to DMACommander lives.
+///
+/// Beside the session file, so a session and the shims that serve it are
+/// removed together and a backup of one carries the other.
+fn agent_root() -> Option<std::path::PathBuf> {
+    crate::store::SessionStore::platform_default()
+        .ok()
+        .and_then(|s| s.path().parent().map(std::path::Path::to_path_buf))
 }
 
 #[cfg(test)]

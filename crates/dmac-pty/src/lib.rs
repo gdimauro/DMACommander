@@ -53,6 +53,41 @@ pub type Waker = Arc<dyn Fn() + Send + Sync>;
 /// attribute changes that only mean something once interpreted.
 pub type Screen<'a> = vt100::Screen;
 
+/// Everything needed to start a hosted child.
+///
+/// A struct rather than eight positional arguments, which is how two `u16`s
+/// next to each other end up swapped.
+pub struct Spawn<'a> {
+    pub program: &'a str,
+    pub args: &'a [String],
+    pub cwd: Option<&'a Path>,
+    pub cols: u16,
+    pub rows: u16,
+    pub scrollback: usize,
+    /// Extra environment for the child, applied over the defaults.
+    pub env: &'a [(String, String)],
+    /// Called whenever the child changes the screen. `None` gives a shell whose
+    /// output is still parsed correctly but which nothing will repaint on its
+    /// own — only tests want that.
+    pub waker: Option<Waker>,
+}
+
+impl<'a> Spawn<'a> {
+    /// A plain child: no extra environment, nothing listening for output.
+    pub fn new(program: &'a str, args: &'a [String], cols: u16, rows: u16) -> Self {
+        Self {
+            program,
+            args,
+            cwd: None,
+            cols,
+            rows,
+            scrollback: 100,
+            env: &[],
+            waker: None,
+        }
+    }
+}
+
 /// A child process running on a pseudo-terminal.
 ///
 /// Output is drained by a dedicated thread into a `vt100` parser behind a mutex,
@@ -83,20 +118,18 @@ pub struct Hosted {
 }
 
 impl Hosted {
-    /// Spawn `program` on a PTY of the given size, in `cwd`.
-    ///
-    /// `waker` is called whenever the child changes the screen. Passing `None`
-    /// gives a shell whose output is still parsed correctly but which nothing
-    /// will repaint on its own — only tests want that.
-    pub fn spawn(
-        program: &str,
-        args: &[String],
-        cwd: Option<&Path>,
-        cols: u16,
-        rows: u16,
-        scrollback: usize,
-        waker: Option<Waker>,
-    ) -> Result<Self> {
+    /// Spawn a child on a PTY, as described by `spec`.
+    pub fn spawn(spec: Spawn<'_>) -> Result<Self> {
+        let Spawn {
+            program,
+            args,
+            cwd,
+            cols,
+            rows,
+            scrollback,
+            env,
+            waker,
+        } = spec;
         let (cols, rows) = (cols.max(2), rows.max(2));
 
         let pty = native_pty_system()
@@ -121,6 +154,12 @@ impl Hosted {
         cmd.env("COLORTERM", "truecolor");
         // A marker so a shell's rc files, and the user, can tell where they are.
         cmd.env("DMAC", "1");
+        // Whatever the caller wants the child to know about — the session's
+        // agent id and the shim directory that uses it, in practice. Applied
+        // last so a caller can override anything set above.
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
 
         let child = pty.slave.spawn_command(cmd).map_err(|e| PtyError::Spawn {
             program: program.to_string(),
@@ -198,7 +237,13 @@ impl Hosted {
     }
 
     /// Spawn the user's login shell, interactively.
-    pub fn shell(cwd: Option<&Path>, cols: u16, rows: u16, waker: Option<Waker>) -> Result<Self> {
+    pub fn shell(
+        cwd: Option<&Path>,
+        cols: u16,
+        rows: u16,
+        waker: Option<Waker>,
+        env: &[(String, String)],
+    ) -> Result<Self> {
         let shell = default_shell();
         // `-i` so rc files load and the prompt appears: a shell without them is
         // not the shell the user configured, and they notice immediately.
@@ -207,7 +252,16 @@ impl Hosted {
         } else {
             vec!["-i".to_string()]
         };
-        Self::spawn(&shell, &args, cwd, cols, rows, 2000, waker)
+        Self::spawn(Spawn {
+            program: &shell,
+            args: &args,
+            cwd,
+            cols,
+            rows,
+            scrollback: 2000,
+            env,
+            waker,
+        })
     }
 
     pub fn program(&self) -> &str {
@@ -575,15 +629,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_hosted_command_produces_output_on_the_screen() {
-        let mut h = Hosted::spawn(
-            "/bin/sh",
-            &["-c".into(), "echo hello-from-pty".into()],
-            None,
-            40,
-            10,
-            100,
-            None,
-        )
+        let mut h = Hosted::spawn(Spawn {
+            program: "/bin/sh",
+            args: &["-c".into(), "echo hello-from-pty".into()],
+            cols: 40,
+            rows: 10,
+            scrollback: 100,
+            ..Spawn::new("", &[], 0, 0)
+        })
         .expect("spawn");
         let text = wait_for(&h, 3.0, |t| t.contains("hello-from-pty"));
         assert!(text.contains("hello-from-pty"), "got: {text:?}");
@@ -593,7 +646,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn input_reaches_the_child_and_its_reply_comes_back() {
-        let mut h = Hosted::spawn("/bin/sh", &[], None, 60, 12, 100, None).expect("spawn");
+        let mut h = Hosted::spawn(Spawn {
+            program: "/bin/sh",
+            args: &[],
+            cols: 60,
+            rows: 12,
+            scrollback: 100,
+            ..Spawn::new("", &[], 0, 0)
+        })
+        .expect("spawn");
         h.run("echo round-trip-ok").expect("write");
         let text = wait_for(&h, 3.0, |t| t.contains("round-trip-ok"));
         assert!(text.contains("round-trip-ok"), "got: {text:?}");
@@ -614,7 +675,16 @@ mod tests {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "tmp".into());
 
-        let mut h = Hosted::spawn("/bin/sh", &[], Some(&dir), 200, 10, 100, None).expect("spawn");
+        let mut h = Hosted::spawn(Spawn {
+            program: "/bin/sh",
+            args: &[],
+            cwd: Some(&dir),
+            cols: 200,
+            rows: 10,
+            scrollback: 100,
+            ..Spawn::new("", &[], 0, 0)
+        })
+        .expect("spawn");
         h.run("pwd").expect("write");
         let text = wait_for(&h, 3.0, |t| t.contains(&leaf));
         assert!(text.contains(&leaf), "expected {leaf:?} in: {text:?}");
@@ -626,15 +696,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_exiting_child_is_noticed() {
-        let h = Hosted::spawn(
-            "/bin/sh",
-            &["-c".into(), "true".into()],
-            None,
-            20,
-            5,
-            10,
-            None,
-        )
+        let h = Hosted::spawn(Spawn {
+            program: "/bin/sh",
+            args: &["-c".into(), "true".into()],
+            cols: 20,
+            rows: 5,
+            scrollback: 10,
+            ..Spawn::new("", &[], 0, 0)
+        })
         .expect("spawn");
         let deadline = Instant::now() + Duration::from_secs(3);
         while !h.finished() && Instant::now() < deadline {
@@ -646,15 +715,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn writing_to_a_dead_child_reports_it_rather_than_hanging() {
-        let mut h = Hosted::spawn(
-            "/bin/sh",
-            &["-c".into(), "true".into()],
-            None,
-            20,
-            5,
-            10,
-            None,
-        )
+        let mut h = Hosted::spawn(Spawn {
+            program: "/bin/sh",
+            args: &["-c".into(), "true".into()],
+            cols: 20,
+            rows: 5,
+            scrollback: 10,
+            ..Spawn::new("", &[], 0, 0)
+        })
         .expect("spawn");
         let deadline = Instant::now() + Duration::from_secs(3);
         while !h.finished() && Instant::now() < deadline {
@@ -666,7 +734,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn resizing_is_reflected_in_the_emulated_screen() {
-        let mut h = Hosted::spawn("/bin/sh", &[], None, 40, 10, 100, None).expect("spawn");
+        let mut h = Hosted::spawn(Spawn {
+            program: "/bin/sh",
+            args: &[],
+            cols: 40,
+            rows: 10,
+            scrollback: 100,
+            ..Spawn::new("", &[], 0, 0)
+        })
+        .expect("spawn");
         h.resize(100, 30).expect("resize");
         let (cols, rows) = h.size();
         assert_eq!((cols, rows), (100, 30));
@@ -677,22 +753,28 @@ mod tests {
 
     #[test]
     fn spawning_something_that_does_not_exist_is_an_error_not_a_panic() {
-        let r = Hosted::spawn(
-            "definitely-not-a-real-program-xyz",
-            &[],
-            None,
-            20,
-            5,
-            10,
-            None,
-        );
+        let r = Hosted::spawn(Spawn {
+            program: "definitely-not-a-real-program-xyz",
+            args: &[],
+            cols: 20,
+            rows: 5,
+            scrollback: 10,
+            ..Spawn::new("", &[], 0, 0)
+        });
         assert!(r.is_err());
     }
 
     #[test]
     fn a_degenerate_size_is_clamped_rather_than_rejected() {
         // A terminal really does report 0 columns mid-resize.
-        let h = Hosted::spawn(&default_shell(), &[], None, 0, 0, 10, None);
+        let h = Hosted::spawn(Spawn {
+            program: &default_shell(),
+            args: &[],
+            cols: 0,
+            rows: 0,
+            scrollback: 10,
+            ..Spawn::new("", &[], 0, 0)
+        });
         if let Ok(mut h) = h {
             assert_eq!(h.size(), (2, 2));
             h.kill();
@@ -707,15 +789,11 @@ mod tests {
     fn output_wakes_the_caller_without_any_input() {
         let woken = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&woken);
-        let h = Hosted::spawn(
-            "/bin/sh",
-            &["-c".into(), "sleep 0.2; echo late".into()],
-            None,
-            40,
-            10,
-            100,
-            Some(Arc::new(move || flag.store(true, Ordering::Relaxed))),
-        )
+        let args = ["-c".to_string(), "sleep 0.2; echo late".to_string()];
+        let h = Hosted::spawn(Spawn {
+            waker: Some(Arc::new(move || flag.store(true, Ordering::Relaxed))),
+            ..Spawn::new("/bin/sh", &args, 40, 10)
+        })
         .expect("spawn");
 
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -736,17 +814,16 @@ mod tests {
     fn a_flood_of_output_does_not_produce_a_flood_of_wake_ups() {
         let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let c = Arc::clone(&count);
-        let h = Hosted::spawn(
-            "/bin/sh",
-            &["-c".into(), "i=0; while [ $i -lt 4000 ]; do echo flooding-the-terminal-with-output; i=$((i+1)); done".into()],
-            None,
-            80,
-            24,
-            100,
-            Some(Arc::new(move || {
+        let args = [
+            "-c".to_string(),
+            "i=0; while [ $i -lt 4000 ]; do echo flooding-the-terminal-with-output; i=$((i+1)); done".to_string(),
+        ];
+        let h = Hosted::spawn(Spawn {
+            waker: Some(Arc::new(move || {
                 c.fetch_add(1, Ordering::Relaxed);
             })),
-        )
+            ..Spawn::new("/bin/sh", &args, 80, 24)
+        })
         .expect("spawn");
 
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -766,17 +843,12 @@ mod tests {
     fn marking_drawn_re_arms_the_waker() {
         let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let c = Arc::clone(&count);
-        let mut h = Hosted::spawn(
-            "/bin/sh",
-            &[],
-            None,
-            60,
-            12,
-            100,
-            Some(Arc::new(move || {
+        let mut h = Hosted::spawn(Spawn {
+            waker: Some(Arc::new(move || {
                 c.fetch_add(1, Ordering::Relaxed);
             })),
-        )
+            ..Spawn::new("/bin/sh", &[], 60, 12)
+        })
         .expect("spawn");
 
         wait_for(&h, 3.0, |_| h.dirty());
@@ -797,15 +869,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_exit_asks_for_a_repaint() {
-        let h = Hosted::spawn(
-            "/bin/sh",
-            &["-c".into(), "true".into()],
-            None,
-            20,
-            5,
-            10,
-            None,
-        )
+        let h = Hosted::spawn(Spawn {
+            program: "/bin/sh",
+            args: &["-c".into(), "true".into()],
+            cols: 20,
+            rows: 5,
+            scrollback: 10,
+            ..Spawn::new("", &[], 0, 0)
+        })
         .expect("spawn");
         let deadline = Instant::now() + Duration::from_secs(3);
         while !h.finished() && Instant::now() < deadline {
@@ -825,7 +896,16 @@ mod tests {
             return;
         }
 
-        let mut h = Hosted::spawn("/bin/sh", &[], Some(&base), 200, 10, 200, None).expect("spawn");
+        let mut h = Hosted::spawn(Spawn {
+            program: "/bin/sh",
+            args: &[],
+            cwd: Some(&base),
+            cols: 200,
+            rows: 10,
+            scrollback: 200,
+            ..Spawn::new("", &[], 0, 0)
+        })
+        .expect("spawn");
         wait_for(&h, 3.0, |t| !t.trim().is_empty());
         assert!(
             h.cd(&evil).expect("cd"),
@@ -851,7 +931,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_busy_shell_is_left_alone() {
-        let mut h = Hosted::spawn("/bin/sh", &[], None, 80, 10, 200, None).expect("spawn");
+        let mut h = Hosted::spawn(Spawn {
+            program: "/bin/sh",
+            args: &[],
+            cols: 80,
+            rows: 10,
+            scrollback: 200,
+            ..Spawn::new("", &[], 0, 0)
+        })
+        .expect("spawn");
         wait_for(&h, 3.0, |t| !t.trim().is_empty());
         assert!(h.at_prompt(), "a fresh shell should be at its prompt");
 
@@ -890,7 +978,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("temp dir");
         let pidfile = dir.join("job.pid");
 
-        let mut h = Hosted::shell(Some(&dir), 80, 24, None).expect("an interactive shell");
+        let mut h = Hosted::shell(Some(&dir), 80, 24, None, &[]).expect("an interactive shell");
         wait_for(&h, 5.0, |t| !t.trim().is_empty());
 
         // Backgrounded from an interactive shell, so job control puts it in its
@@ -944,18 +1032,17 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("temp dir");
         let pidfile = dir.join("grandchild.pid");
 
-        let mut h = Hosted::spawn(
-            "/bin/sh",
-            &[
+        let mut h = Hosted::spawn(Spawn {
+            program: "/bin/sh",
+            args: &[
                 "-c".into(),
                 format!("sleep 300 & echo $! > {}; wait", pidfile.to_string_lossy()),
             ],
-            None,
-            40,
-            10,
-            100,
-            None,
-        )
+            cols: 40,
+            rows: 10,
+            scrollback: 100,
+            ..Spawn::new("", &[], 0, 0)
+        })
         .expect("spawn");
 
         // Wait for the grandchild to exist and announce itself.
@@ -1002,18 +1089,17 @@ mod tests {
         let pidfile = dir.join("grandchild.pid");
 
         let grandchild = {
-            let _h = Hosted::spawn(
-                "/bin/sh",
-                &[
+            let _h = Hosted::spawn(Spawn {
+                program: "/bin/sh",
+                args: &[
                     "-c".into(),
                     format!("sleep 300 & echo $! > {}; wait", pidfile.to_string_lossy()),
                 ],
-                None,
-                40,
-                10,
-                100,
-                None,
-            )
+                cols: 40,
+                rows: 10,
+                scrollback: 100,
+                ..Spawn::new("", &[], 0, 0)
+            })
             .expect("spawn");
 
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -1041,15 +1127,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn something_that_ignores_a_hangup_is_still_killed() {
-        let mut h = Hosted::spawn(
-            "/bin/sh",
-            &["-c".into(), "trap '' HUP TERM; sleep 300".into()],
-            None,
-            40,
-            10,
-            100,
-            None,
-        )
+        let mut h = Hosted::spawn(Spawn {
+            program: "/bin/sh",
+            args: &["-c".into(), "trap '' HUP TERM; sleep 300".into()],
+            cols: 40,
+            rows: 10,
+            scrollback: 100,
+            ..Spawn::new("", &[], 0, 0)
+        })
         .expect("spawn");
         let pid = 0; // only the shell matters here
         let _ = pid;

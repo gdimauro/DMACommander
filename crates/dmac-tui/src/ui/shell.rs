@@ -454,16 +454,8 @@ mod tests {
 
     #[cfg(unix)]
     fn shell_showing(text: &str) -> Hosted {
-        let h = Hosted::spawn(
-            "/bin/sh",
-            &["-c".into(), format!("printf '{text}'")],
-            None,
-            40,
-            10,
-            100,
-            None,
-        )
-        .expect("spawn");
+        let args = ["-c".to_string(), format!("printf '{text}'")];
+        let h = Hosted::spawn(dmac_pty::Spawn::new("/bin/sh", &args, 40, 10)).expect("spawn");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         while !h.finished() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));

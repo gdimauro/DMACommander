@@ -72,6 +72,11 @@ struct PersistedSession {
     view_shell: bool,
     #[serde(default)]
     panels: [PersistedPanel; 2],
+    /// The agent conversation this session owns. Kept across restarts on
+    /// purpose: it is the one thing that lets a hosted `claude` come back to
+    /// what you were talking about rather than starting beside it.
+    #[serde(default)]
+    conversation: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -230,6 +235,7 @@ fn persist(s: &Session) -> PersistedSession {
         // process that no longer exists would show a dead screen. The shell is
         // respawned on demand, in the directory that was restored.
         view_shell: s.view == View::Shell,
+        conversation: s.conversation.clone(),
         panels: [
             PersistedPanel {
                 sort_key: Some(s.panels[0].sort_key),
@@ -260,6 +266,9 @@ fn apply(session: &mut Session, saved: &PersistedSession) {
     // Never restore straight into the shell view: there is no shell yet, and a
     // blank pane on startup is alarming. The directory is what mattered.
     session.view = View::Panels;
+    // The process is gone, the conversation is not. This is what makes the
+    // next `claude` in this session pick up where the last one left off.
+    session.conversation = saved.conversation.clone();
 
     for (i, p) in saved.panels.iter().enumerate() {
         if let Some(key) = p.sort_key {
