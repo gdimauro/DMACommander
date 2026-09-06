@@ -412,7 +412,13 @@ mod tests {
     /// agent — otherwise signals and job control read differently through it.
     #[test]
     fn the_shim_execs_rather_than_calling() {
-        let s = shim_script(claude(), Path::new("/bin/true"), "abc", Path::new("/tmp/m"), None);
+        let s = shim_script(
+            claude(),
+            Path::new("/bin/true"),
+            "abc",
+            Path::new("/tmp/m"),
+            None,
+        );
         for line in s.lines() {
             let line = line.trim();
             if line.contains("/bin/true") {

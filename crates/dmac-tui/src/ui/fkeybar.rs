@@ -32,7 +32,7 @@ pub const HISTORY: [(&str, &str); 10] = [
     ("1", "Recent"),
     ("2", "MostUsed"),
     ("3", "Session"),
-    ("4", ""),
+    ("4", "Sessions"),
     ("5", ""),
     ("6", ""),
     ("7", ""),
@@ -43,7 +43,13 @@ pub const HISTORY: [(&str, &str); 10] = [
 
 /// `active` marks the key whose mode is currently on — the bar doubles as the
 /// indicator, so there is no second place to look.
-pub fn draw(frame: &mut Frame, area: Rect, keys: &[(&str, &str)], active: Option<usize>, theme: &Theme) {
+pub fn draw(
+    frame: &mut Frame,
+    area: Rect,
+    keys: &[(&str, &str)],
+    active: Option<usize>,
+    theme: &Theme,
+) {
     let label = Style::default()
         .fg(theme.fkey_label_fg)
         .bg(theme.fkey_label_bg);
@@ -71,4 +77,28 @@ pub fn draw(frame: &mut Frame, area: Rect, keys: &[(&str, &str)], active: Option
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bar is the only place the views are named on screen. If the model
+    /// grows one and the bar does not, a key exists that nothing mentions.
+    #[test]
+    fn the_bar_names_every_history_view() {
+        for view in dmac_core::history::Order::ALL {
+            let key = (view.index() + 1).to_string();
+            let found = HISTORY
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, label)| *label);
+            assert_eq!(
+                found,
+                Some(view.label()),
+                "F{key} should be labelled {:?}",
+                view.label()
+            );
+        }
+    }
 }

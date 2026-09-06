@@ -237,7 +237,10 @@ fn content(value: &Value, is_error: bool) -> Value {
         "content": [{ "type": "text", "text": text }],
         "isError": is_error,
     });
-    if !is_error && !value.is_string() && let Some(obj) = result.as_object_mut() {
+    if !is_error
+        && !value.is_string()
+        && let Some(obj) = result.as_object_mut()
+    {
         obj.insert("structuredContent".to_string(), value.clone());
     }
     result
@@ -281,7 +284,10 @@ mod tests {
     #[test]
     fn initialize_reports_the_protocol_and_the_name() {
         let mut spy = Spy::default();
-        let r = ask(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#, &mut spy);
+        let r = ask(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+            &mut spy,
+        );
         assert_eq!(r["result"]["protocolVersion"], PROTOCOL_VERSION);
         assert_eq!(r["result"]["serverInfo"]["name"], "dmac");
         assert_eq!(r["id"], 1);
@@ -292,14 +298,23 @@ mod tests {
     #[test]
     fn a_notification_is_not_answered() {
         let mut spy = Spy::default();
-        assert!(dispatch(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#, &mut spy).is_none());
+        assert!(
+            dispatch(
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+                &mut spy
+            )
+            .is_none()
+        );
         assert!(dispatch("", &mut spy).is_none());
     }
 
     #[test]
     fn the_catalogue_comes_back_whole() {
         let mut spy = Spy::default();
-        let r = ask(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#, &mut spy);
+        let r = ask(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            &mut spy,
+        );
         let listed = r["result"]["tools"].as_array().expect("an array");
         assert_eq!(listed.len(), tools::catalogue().len());
         for t in listed {
@@ -370,7 +385,10 @@ mod tests {
     #[test]
     fn an_unknown_method_says_so() {
         let mut spy = Spy::default();
-        let r = ask(r#"{"jsonrpc":"2.0","id":6,"method":"resources/list"}"#, &mut spy);
+        let r = ask(
+            r#"{"jsonrpc":"2.0","id":6,"method":"resources/list"}"#,
+            &mut spy,
+        );
         assert_eq!(r["error"]["code"], METHOD_NOT_FOUND);
     }
 

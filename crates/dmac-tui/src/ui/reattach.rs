@@ -52,10 +52,7 @@ pub fn draw(
             format!(" {plural} going when dmac last exited."),
             Style::default().fg(theme.panel_fg),
         ))),
-        Rect {
-            height: 1,
-            ..inner
-        },
+        Rect { height: 1, ..inner },
     );
 
     let list = Rect {
@@ -86,7 +83,11 @@ fn row<'a>(p: &'a Pending, is_selected: bool, width: usize, theme: &Theme) -> Li
     // The first eight characters of the id are enough to tell two apart and
     // short enough to leave room for the command that will actually run.
     let short: String = p.conversation.chars().take(8).collect();
-    let text = format!(" {mark} {:<10} {}", truncate(&p.session_name, 10), p.command);
+    let text = format!(
+        " {mark} {:<10} {}",
+        truncate(&p.session_name, 10),
+        p.command
+    );
     let tail = format!("{short} ");
 
     let room = width.saturating_sub(tail.chars().count());
@@ -96,10 +97,7 @@ fn row<'a>(p: &'a Pending, is_selected: bool, width: usize, theme: &Theme) -> Li
     Line::from(vec![
         Span::styled(body, base),
         Span::styled(" ".repeat(pad), base),
-        Span::styled(
-            tail,
-            base.fg(theme.status_fg).add_modifier(Modifier::DIM),
-        ),
+        Span::styled(tail, base.fg(theme.status_fg).add_modifier(Modifier::DIM)),
     ])
 }
 

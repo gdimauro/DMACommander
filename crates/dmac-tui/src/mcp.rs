@@ -70,7 +70,9 @@ impl App {
 
     fn mcp_list(&mut self, args: &Value) -> Result<Value, String> {
         let index = self.mcp_index();
-        let limit = arg_usize(args, "limit").unwrap_or(DEFAULT_LIST).min(MAX_LIST);
+        let limit = arg_usize(args, "limit")
+            .unwrap_or(DEFAULT_LIST)
+            .min(MAX_LIST);
 
         // No path: answer from the panel itself. It is already loaded, it is
         // what the user is looking at, and it costs nothing.
@@ -229,7 +231,9 @@ impl App {
 
     fn mcp_command(&mut self, args: &Value) -> Result<Value, String> {
         let index = self.mcp_index();
-        let line = arg_str(args, "line").ok_or("command needs a line")?.to_string();
+        let line = arg_str(args, "line")
+            .ok_or("command needs a line")?
+            .to_string();
         let run = arg_bool(args, "run").unwrap_or(false);
 
         self.sessions.at_mut(index).command_line = line.clone();
@@ -340,7 +344,13 @@ impl App {
         let message = arg_str(args, "message").ok_or("notify needs a message")?;
         // One line: the status bar is one line, and a message that is silently
         // cut in half is a message that lied.
-        let message: String = message.lines().next().unwrap_or("").chars().take(200).collect();
+        let message: String = message
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(200)
+            .collect();
         self.status = message.clone();
         Ok(json!({ "shown": message }))
     }
@@ -393,7 +403,10 @@ impl App {
         }
         let i = dmac_session::Session::index_of(panel);
         let base = self.sessions.at(index).cwd[i].display();
-        Ok(normalise(&format!("{}/{expanded}", base.trim_end_matches('/'))))
+        Ok(normalise(&format!(
+            "{}/{expanded}",
+            base.trim_end_matches('/')
+        )))
     }
 }
 
@@ -443,7 +456,9 @@ fn kind_name(k: EntryKind) -> &'static str {
 }
 
 fn arg_str<'a>(args: &'a Value, name: &str) -> Option<&'a str> {
-    args.get(name).and_then(Value::as_str).filter(|s| !s.is_empty())
+    args.get(name)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
 }
 
 fn arg_usize(args: &Value, name: &str) -> Option<usize> {
@@ -528,8 +543,14 @@ mod tests {
             Ok(PanelId::Right),
             "absent means the active one"
         );
-        assert_eq!(arg_panel(&json!({"panel":"left"}), PanelId::Right), Ok(PanelId::Left));
-        assert_eq!(arg_panel(&json!({"panel":"other"}), PanelId::Right), Ok(PanelId::Left));
+        assert_eq!(
+            arg_panel(&json!({"panel":"left"}), PanelId::Right),
+            Ok(PanelId::Left)
+        );
+        assert_eq!(
+            arg_panel(&json!({"panel":"other"}), PanelId::Right),
+            Ok(PanelId::Left)
+        );
         assert!(arg_panel(&json!({"panel":"middle"}), PanelId::Left).is_err());
     }
 }
@@ -673,7 +694,11 @@ mod tool_tests {
             .call("navigate", &json!({ "path": "/definitely/not/here" }))
             .expect_err("should refuse");
         assert!(e.contains("not a directory"), "{e}");
-        assert_eq!(app.ses().cwd[0], VfsPath::local("/left"), "and did not move");
+        assert_eq!(
+            app.ses().cwd[0],
+            VfsPath::local("/left"),
+            "and did not move"
+        );
     }
 
     #[tokio::test]
@@ -682,8 +707,16 @@ mod tool_tests {
         app.call("navigate", &json!({ "path": "/tmp", "panel": "right" }))
             .expect("right panel");
         assert_eq!(app.ses().cwd[1], VfsPath::local("/tmp"));
-        assert_eq!(app.ses().cwd[0], VfsPath::local("/left"), "left is untouched");
-        assert_eq!(app.ses().active, PanelId::Left, "and still has the keyboard");
+        assert_eq!(
+            app.ses().cwd[0],
+            VfsPath::local("/left"),
+            "left is untouched"
+        );
+        assert_eq!(
+            app.ses().active,
+            PanelId::Left,
+            "and still has the keyboard"
+        );
     }
 
     /// A name that is not in the directory is silently nothing, so the answer
@@ -706,7 +739,8 @@ mod tool_tests {
             "`..` is never selectable"
         );
 
-        app.call("select", &json!({ "mode": "clear" })).expect("clear");
+        app.call("select", &json!({ "mode": "clear" }))
+            .expect("clear");
         assert!(app.ses().panels[0].entries.iter().all(|e| !e.selected));
     }
 
@@ -732,7 +766,10 @@ mod tool_tests {
 
         let all = app.mcp_history(&json!({}));
         assert_eq!(all["rows"].as_array().map(Vec::len), Some(2));
-        assert_eq!(all["rows"][0]["path"], "/home/me/prj/dmac-tui", "newest first");
+        assert_eq!(
+            all["rows"][0]["path"], "/home/me/prj/dmac-tui",
+            "newest first"
+        );
 
         let filtered = app.mcp_history(&json!({ "filter": "log" }));
         assert_eq!(filtered["rows"].as_array().map(Vec::len), Some(1));
@@ -802,7 +839,10 @@ mod tool_tests {
     #[tokio::test]
     async fn a_relative_path_is_resolved_against_the_panel() {
         let app = crate::app::App::for_test();
-        assert_eq!(app.mcp_resolve(0, "sub/dir").as_deref(), Ok("/left/sub/dir"));
+        assert_eq!(
+            app.mcp_resolve(0, "sub/dir").as_deref(),
+            Ok("/left/sub/dir")
+        );
         assert_eq!(app.mcp_resolve(0, "../other").as_deref(), Ok("/other"));
         assert_eq!(app.mcp_resolve(0, "/abs").as_deref(), Ok("/abs"));
     }

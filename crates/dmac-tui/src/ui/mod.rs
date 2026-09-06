@@ -193,10 +193,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if fkey_rows > 0 {
         let (keys, active) = if history_open {
-            (
-                &fkeybar::HISTORY[..],
-                Some(app.history_order.index()),
-            )
+            (&fkeybar::HISTORY[..], Some(app.history_order.index()))
         } else {
             (&fkeybar::NORMAL[..], None)
         };

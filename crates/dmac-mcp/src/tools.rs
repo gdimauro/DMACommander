@@ -41,16 +41,36 @@ const TOOLS: &[Tool] = &[
         description: "The entries of a directory, with kind and size. Defaults to the active \
                       panel's directory, which is usually what is meant by \"here\".",
         args: &[
-            ("path", "string", false, "Directory to list. Defaults to the active panel's."),
-            ("limit", "integer", false, "Maximum entries to return. Defaults to 200."),
+            (
+                "path",
+                "string",
+                false,
+                "Directory to list. Defaults to the active panel's.",
+            ),
+            (
+                "limit",
+                "integer",
+                false,
+                "Maximum entries to return. Defaults to 200.",
+            ),
         ],
     },
     Tool {
         name: "navigate",
         description: "Take a panel to a directory. The user sees it move.",
         args: &[
-            ("path", "string", true, "Absolute path, or one relative to the panel's directory."),
-            ("panel", "string", false, "\"left\", \"right\", or \"active\" (the default)."),
+            (
+                "path",
+                "string",
+                true,
+                "Absolute path, or one relative to the panel's directory.",
+            ),
+            (
+                "panel",
+                "string",
+                false,
+                "\"left\", \"right\", or \"active\" (the default).",
+            ),
         ],
     },
     Tool {
@@ -58,9 +78,24 @@ const TOOLS: &[Tool] = &[
         description: "Set, add to, or clear a panel's selection by name. This is the selection \
                       the user's own F5/F6/F8 keys would act on, so say what you selected.",
         args: &[
-            ("names", "array", false, "Entry names in the panel's directory."),
-            ("mode", "string", false, "\"set\" (default), \"add\", or \"clear\"."),
-            ("panel", "string", false, "\"left\", \"right\", or \"active\" (the default)."),
+            (
+                "names",
+                "array",
+                false,
+                "Entry names in the panel's directory.",
+            ),
+            (
+                "mode",
+                "string",
+                false,
+                "\"set\" (default), \"add\", or \"clear\".",
+            ),
+            (
+                "panel",
+                "string",
+                false,
+                "\"left\", \"right\", or \"active\" (the default).",
+            ),
         ],
     },
     Tool {
@@ -70,7 +105,12 @@ const TOOLS: &[Tool] = &[
                       the user's directory. Prefer run=false and let them press Enter.",
         args: &[
             ("line", "string", true, "The command line."),
-            ("run", "boolean", false, "Run it. Defaults to false: typing it is not running it."),
+            (
+                "run",
+                "boolean",
+                false,
+                "Run it. Defaults to false: typing it is not running it.",
+            ),
         ],
     },
     Tool {
@@ -78,8 +118,18 @@ const TOOLS: &[Tool] = &[
         description: "Directories the panels have visited, across every session and across \
                       restarts. Good for \"where was that project again\".",
         args: &[
-            ("order", "string", false, "\"recent\" (default), \"frequent\", or \"session\"."),
-            ("filter", "string", false, "Fuzzy filter, as the user's own Ctrl-H box does it."),
+            (
+                "order",
+                "string",
+                false,
+                "\"recent\" (default), \"frequent\", or \"session\".",
+            ),
+            (
+                "filter",
+                "string",
+                false,
+                "Fuzzy filter, as the user's own Ctrl-H box does it.",
+            ),
             ("limit", "integer", false, "Maximum rows. Defaults to 30."),
         ],
     },
@@ -94,7 +144,12 @@ const TOOLS: &[Tool] = &[
         description: "Bring a session to the screen, by name or by position.",
         args: &[
             ("name", "string", false, "Session name."),
-            ("index", "integer", false, "Zero-based position, if you have no name."),
+            (
+                "index",
+                "integer",
+                false,
+                "Zero-based position, if you have no name.",
+            ),
         ],
     },
     Tool {
@@ -129,7 +184,9 @@ pub fn catalogue() -> Vec<Value> {
                 let mut schema = json!({ "type": kind, "description": description });
                 // An array of what? A schema without it is one a strict client
                 // refuses and a lenient one guesses at.
-                if *kind == "array" && let Some(obj) = schema.as_object_mut() {
+                if *kind == "array"
+                    && let Some(obj) = schema.as_object_mut()
+                {
                     obj.insert("items".to_string(), json!({ "type": "string" }));
                 }
                 properties.insert((*name).to_string(), schema);
@@ -200,7 +257,10 @@ mod tests {
     #[test]
     fn an_array_argument_says_what_it_holds() {
         let listed = catalogue();
-        let select = listed.iter().find(|t| t["name"] == "select").expect("select");
+        let select = listed
+            .iter()
+            .find(|t| t["name"] == "select")
+            .expect("select");
         assert_eq!(
             select["inputSchema"]["properties"]["names"]["items"]["type"],
             "string"

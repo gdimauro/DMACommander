@@ -1393,8 +1393,16 @@ impl App {
                 self.decline_pending()
             }
             KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => self.resume_pending(),
-            KeyCode::Up => self.mode = Mode::Reattach { selected: selected.saturating_sub(1) },
-            KeyCode::Down => self.mode = Mode::Reattach { selected: (selected + 1).min(last) },
+            KeyCode::Up => {
+                self.mode = Mode::Reattach {
+                    selected: selected.saturating_sub(1),
+                }
+            }
+            KeyCode::Down => {
+                self.mode = Mode::Reattach {
+                    selected: (selected + 1).min(last),
+                }
+            }
             // Space unticks one without answering for the rest: on a restart
             // with several sessions going, the answer is often "that one, not
             // the other three".
@@ -2613,6 +2621,38 @@ impl App {
         self.mode = Mode::History { selected: 0 };
     }
 
+    /// The sessions as rows of the same list, most recently used first.
+    ///
+    /// Shown as `name — directory` so the filter reaches both: typing part of a
+    /// name or part of a path finds the session either way, which is the whole
+    /// point of putting them in a list you can type at.
+    fn session_rows(&self) -> Vec<dmac_core::history::Row> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut rows: Vec<dmac_core::history::Row> = self
+            .sessions
+            .all()
+            .iter()
+            .map(|s| dmac_core::history::Row {
+                path: format!(
+                    "{} — {}",
+                    s.name,
+                    s.cwd[Session::index_of(s.active)].display()
+                ),
+                // `last_used` is an Instant, which has no calendar meaning; the
+                // list prints ages, so it wants one anyway.
+                at: now.saturating_sub(s.last_used.elapsed().as_secs()),
+                hits: 0,
+                session: Some(s.id.0),
+            })
+            .collect();
+        // Most recently used first, which is what a session list is for.
+        rows.sort_by_key(|r| std::cmp::Reverse(r.at));
+        rows
+    }
+
     fn set_history_order(&mut self, order: dmac_core::history::Order) {
         self.history_order = order;
         // Back to the top: the row that was under the cursor means something
@@ -2627,7 +2667,11 @@ impl App {
     /// cache would be one more thing that can disagree with what is on screen.
     pub(crate) fn history_rows(&self) -> Vec<crate::ui::history::Shown> {
         let session = self.ses().id.0;
-        let rows = self.sessions.history.view(self.history_order, session);
+        let rows = if self.history_order == dmac_core::history::Order::Sessions {
+            self.session_rows()
+        } else {
+            self.sessions.history.view(self.history_order, session)
+        };
         let filter = self.history_filter.as_str();
         let mut scored: Vec<(i32, crate::ui::history::Shown)> = rows
             .into_iter()
@@ -2665,24 +2709,54 @@ impl App {
             KeyCode::F(1) => self.set_history_order(Order::Recent),
             KeyCode::F(2) => self.set_history_order(Order::Frequent),
             KeyCode::F(3) => self.set_history_order(Order::Session),
+            KeyCode::F(4) => self.set_history_order(Order::Sessions),
             // ...and one key that reaches all three, for anyone whose terminal
             // eats function keys.
             KeyCode::Tab => self.set_history_order(self.history_order.next()),
 
-            KeyCode::Up => self.mode = Mode::History { selected: selected.saturating_sub(1) },
-            KeyCode::Down => self.mode = Mode::History { selected: (selected + 1).min(last) },
-            KeyCode::PageUp => self.mode = Mode::History { selected: selected.saturating_sub(10) },
+            KeyCode::Up => {
+                self.mode = Mode::History {
+                    selected: selected.saturating_sub(1),
+                }
+            }
+            KeyCode::Down => {
+                self.mode = Mode::History {
+                    selected: (selected + 1).min(last),
+                }
+            }
+            KeyCode::PageUp => {
+                self.mode = Mode::History {
+                    selected: selected.saturating_sub(10),
+                }
+            }
             KeyCode::PageDown => {
-                self.mode = Mode::History { selected: (selected + 10).min(last) }
+                self.mode = Mode::History {
+                    selected: (selected + 10).min(last),
+                }
             }
             KeyCode::Home => self.mode = Mode::History { selected: 0 },
             KeyCode::End => self.mode = Mode::History { selected: last },
 
             KeyCode::Enter => {
                 if let Some(shown) = rows.get(selected) {
-                    let path = VfsPath::local(&shown.row.path);
-                    self.close_history();
-                    self.go_to(path);
+                    // A session row switches to that session; a directory row
+                    // goes there. Same list, same keys, two kinds of destination
+                    // — and the row itself says which it is.
+                    match shown.row.session {
+                        Some(id) => {
+                            let target = self.sessions.all().iter().position(|s| s.id.0 == id);
+                            self.close_history();
+                            if let Some(i) = target {
+                                self.sessions.switch_to(i);
+                                self.after_session_switch();
+                            }
+                        }
+                        None => {
+                            let path = VfsPath::local(&shown.row.path);
+                            self.close_history();
+                            self.go_to(path);
+                        }
+                    }
                 }
             }
 
@@ -2741,11 +2815,8 @@ impl App {
                     self.close_history();
                     return;
                 }
-                let top = crate::ui::history::first_visible(
-                    selected,
-                    rows.len(),
-                    area.height as usize,
-                );
+                let top =
+                    crate::ui::history::first_visible(selected, rows.len(), area.height as usize);
                 let clicked = top + (m.row - area.y) as usize;
                 if clicked > last {
                     return;
@@ -2822,8 +2893,8 @@ pub async fn run(mut start: Startup) -> anyhow::Result<()> {
     // running inside. The socket is named by pid and advertised to hosted
     // shells through the environment, so a `claude` started here finds it
     // without anyone configuring anything.
-    let mcp_socket = dmac_session::agent_root()
-        .map(|root| dmac_mcp::socket_path(&root, std::process::id()));
+    let mcp_socket =
+        dmac_session::agent_root().map(|root| dmac_mcp::socket_path(&root, std::process::id()));
     if let Some(socket) = mcp_socket.clone() {
         // Sockets left by runs that are no longer here: one file accumulates
         // per run, and a stale one is a path an agent can be pointed at and
@@ -3634,7 +3705,7 @@ mod tests {
 
     /// Three readings of the same history, on the three keys the bar advertises.
     #[tokio::test]
-    async fn the_function_keys_switch_between_the_three_orders() {
+    async fn the_function_keys_switch_between_the_views() {
         use dmac_core::history::Order;
         let mut app = fixture();
         let now = dmac_core::history::now();
@@ -3643,7 +3714,9 @@ mod tests {
             app.sessions.history.record("/often", 99, now - 10_000);
         }
         // Visited once, just now, by this one.
-        app.sessions.history.record("/just-now", app.ses().id.0, now);
+        app.sessions
+            .history
+            .record("/just-now", app.ses().id.0, now);
 
         app.handle(Action::DirectoryHistory);
         app.on_key(key(KeyCode::F(1)));
@@ -3656,16 +3729,60 @@ mod tests {
 
         app.on_key(key(KeyCode::F(3)));
         assert_eq!(app.history_order, Order::Session);
-        let mine: Vec<String> = app
-            .history_rows()
-            .into_iter()
-            .map(|r| r.row.path)
-            .collect();
+        let mine: Vec<String> = app.history_rows().into_iter().map(|r| r.row.path).collect();
         assert_eq!(mine, ["/just-now"], "another session's rows are not mine");
 
-        // Tab reaches all three, for terminals that eat function keys.
+        app.on_key(key(KeyCode::F(4)));
+        assert_eq!(app.history_order, Order::Sessions);
+
+        // Tab reaches every view, for terminals that eat function keys.
         app.on_key(key(KeyCode::Tab));
         assert_eq!(app.history_order, Order::Recent);
+    }
+
+    /// The fourth view lists the sessions themselves, filtered the same way and
+    /// reached by the same keys — one picker for "where have I been", whether
+    /// the answer is a directory or a session.
+    #[tokio::test]
+    async fn the_fourth_view_lists_sessions_and_switches_to_one() {
+        use dmac_core::history::Order;
+        let mut app = fixture();
+        app.handle(Action::NewSession);
+        app.mode = Mode::Normal;
+        let _ = app.sessions.rename(1, "backend");
+        let backend = app.sessions.all()[1].id.0;
+        app.sessions.switch_to(0);
+
+        app.handle(Action::DirectoryHistory);
+        app.on_key(key(KeyCode::F(4)));
+        assert_eq!(app.history_order, Order::Sessions);
+
+        let rows = app.history_rows();
+        assert_eq!(rows.len(), app.sessions.len(), "every session is listed");
+        assert!(
+            rows.iter().all(|r| r.row.session.is_some()),
+            "a session row has to say which session it is"
+        );
+
+        // Typing filters by name, so a session is reachable without counting.
+        app.on_key(key(KeyCode::Char('b')));
+        app.on_key(key(KeyCode::Char('a')));
+        let filtered = app.history_rows();
+        assert!(
+            filtered.iter().any(|r| r.row.path.starts_with("backend")),
+            "the filter lost the session it should have found: {:?}",
+            filtered.iter().map(|r| &r.row.path).collect::<Vec<_>>()
+        );
+
+        // Enter on a session row switches to it rather than navigating.
+        let i = filtered
+            .iter()
+            .position(|r| r.row.session == Some(backend))
+            .expect("backend is in the filtered list");
+        app.mode = Mode::History { selected: i };
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.sessions.current().id.0, backend);
+        assert_eq!(app.mode, Mode::Normal, "the picker should have closed");
     }
 
     /// Changing the order must move the highlight back to the top: the row that

@@ -32,10 +32,21 @@ pub enum Order {
     Recent,
     Frequent,
     Session,
+    /// Not a directory order at all: the sessions themselves, most recently
+    /// used first. It shares this list because it answers the same question —
+    /// *where have I been?* — and sharing it means one picker, one filter and
+    /// one set of keys rather than two that drift apart. [`Store::view`]
+    /// refuses it; the rows come from whoever knows about sessions.
+    Sessions,
 }
 
 impl Order {
-    pub const ALL: [Order; 3] = [Order::Recent, Order::Frequent, Order::Session];
+    pub const ALL: [Order; 4] = [
+        Order::Recent,
+        Order::Frequent,
+        Order::Session,
+        Order::Sessions,
+    ];
 
     /// What the F-key bar calls it.
     pub fn label(self) -> &'static str {
@@ -43,6 +54,7 @@ impl Order {
             Order::Recent => "Recent",
             Order::Frequent => "MostUsed",
             Order::Session => "Session",
+            Order::Sessions => "Sessions",
         }
     }
 
@@ -52,6 +64,7 @@ impl Order {
             Order::Recent => "recent, newest first",
             Order::Frequent => "most used, everywhere",
             Order::Session => "this session only",
+            Order::Sessions => "every session, most recently used first",
         }
     }
 
@@ -60,6 +73,7 @@ impl Order {
             Order::Recent => 0,
             Order::Frequent => 1,
             Order::Session => 2,
+            Order::Sessions => 3,
         }
     }
 
@@ -76,6 +90,9 @@ pub struct Row {
     pub path: String,
     pub at: u64,
     pub hits: u32,
+    /// The session this row *is*, when the list is showing sessions rather than
+    /// directories. `None` for a directory, which is every row the store makes.
+    pub session: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -152,7 +169,14 @@ impl History {
     /// directory two sessions have both used appears once, with both their
     /// visits counted.
     pub fn view(&self, order: Order, session: u64) -> Vec<Row> {
+        // The sessions view is not made from visits, so there is nothing here
+        // to answer with. Returning an empty list rather than something
+        // plausible keeps a miswired caller obvious instead of subtly wrong.
+        if order == Order::Sessions {
+            return Vec::new();
+        }
         let mut rows: Vec<Row> = match order {
+            Order::Sessions => Vec::new(),
             Order::Session => self
                 .visits
                 .iter()
@@ -161,6 +185,7 @@ impl History {
                     path: v.path.clone(),
                     at: v.at,
                     hits: v.hits,
+                    session: None,
                 })
                 .collect(),
             Order::Recent | Order::Frequent => {
@@ -175,6 +200,7 @@ impl History {
                             path: v.path.clone(),
                             at: v.at,
                             hits: v.hits,
+                            session: None,
                         }),
                     }
                 }
@@ -192,7 +218,10 @@ impl History {
                     .then(b.at.cmp(&a.at))
                     .then(a.path.cmp(&b.path))
             }),
-            Order::Recent | Order::Session => {
+            // `Sessions` never reaches here — it was refused above — but the
+            // compiler wants it named, and naming it beside `Recent` says what
+            // it would do if it ever did.
+            Order::Recent | Order::Session | Order::Sessions => {
                 rows.sort_by(|a, b| b.at.cmp(&a.at).then(a.path.cmp(&b.path)))
             }
         }
@@ -324,11 +353,47 @@ mod tests {
     }
 
     #[test]
-    fn order_cycles_through_all_three() {
+    fn one_key_reaches_every_view_and_comes_back() {
         let mut o = Order::Recent;
-        for _ in 0..3 {
+        let mut seen = vec![o];
+        for _ in 0..Order::ALL.len() {
             o = o.next();
+            seen.push(o);
         }
-        assert_eq!(o, Order::Recent);
+        assert_eq!(o, Order::Recent, "cycling must come back to the start");
+        for view in Order::ALL {
+            assert!(seen.contains(&view), "{view:?} is unreachable by Tab");
+        }
+    }
+
+    /// Every view has to name itself in the bar and in the heading, or a key
+    /// exists that nothing on screen mentions.
+    #[test]
+    fn every_view_says_what_it_is() {
+        let mut labels = std::collections::HashSet::new();
+        for view in Order::ALL {
+            assert!(!view.label().is_empty(), "{view:?}");
+            assert!(!view.title().is_empty(), "{view:?}");
+            assert!(
+                labels.insert(view.label()),
+                "two views called {:?}",
+                view.label()
+            );
+            assert_eq!(
+                Order::ALL[view.index()],
+                view,
+                "index disagrees for {view:?}"
+            );
+        }
+    }
+
+    /// The sessions view is not made of visits, and answering with something
+    /// plausible would make a miswired caller subtly wrong instead of obvious.
+    #[test]
+    fn the_sessions_view_has_nothing_to_say_about_directories() {
+        let mut store = History::default();
+        store.record("/tmp", 1, 100);
+        assert!(store.view(Order::Sessions, 1).is_empty());
+        assert!(!store.view(Order::Recent, 1).is_empty());
     }
 }

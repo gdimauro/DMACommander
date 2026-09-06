@@ -80,13 +80,7 @@ pub fn draw(
         ),
         Span::styled("\u{2588}", Style::default().fg(theme.selected_fg)),
     ]);
-    frame.render_widget(
-        Paragraph::new(filter_line),
-        Rect {
-            height: 1,
-            ..inner
-        },
-    );
+    frame.render_widget(Paragraph::new(filter_line), Rect { height: 1, ..inner });
 
     let list = Rect {
         y: inner.y + 1,
