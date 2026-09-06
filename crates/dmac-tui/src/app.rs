@@ -1287,6 +1287,21 @@ impl App {
     /// program's own author does dozens of times an hour, and each restart
     /// silently spawning an agent — which reads its history back and may act on
     /// it — is not a thing to do behind someone's back.
+    /// List a session's panels, if that has not happened yet.
+    ///
+    /// Listing every panel of every session at startup is a directory walk per
+    /// panel before the first frame — a cost that grows with how many sessions
+    /// you keep and buys nothing, because you can only look at one of them.
+    /// Listings still stay in memory once made, so switching back is instant.
+    pub(crate) fn ensure_loaded(&mut self, index: usize) {
+        if index >= self.sessions.len() || self.sessions.at_mut(index).loaded {
+            return;
+        }
+        self.sessions.at_mut(index).loaded = true;
+        self.reload_session(index, PanelId::Left);
+        self.reload_session(index, PanelId::Right);
+    }
+
     pub(crate) fn reattach_agents(&mut self) {
         self.pending.clear();
         for i in 0..self.sessions.len() {
@@ -1703,6 +1718,7 @@ impl App {
     /// point of holding them all live. Only the transient, per-view state that
     /// belonged to the session we just left is cleared.
     pub(crate) fn after_session_switch(&mut self) {
+        self.ensure_loaded(self.sessions.current_index());
         self.touch_sessions();
         self.quick_search.clear();
         // Close an overlay that belonged to the session we left — but not the
@@ -2789,10 +2805,10 @@ pub async fn run(mut start: Startup) -> anyhow::Result<()> {
             app.status =
                 "previous run did not exit cleanly — sessions restored from the last save".into();
         }
-        for i in 0..count {
-            app.reload_session(i, PanelId::Left);
-            app.reload_session(i, PanelId::Right);
-        }
+        // Only the one on screen; the rest are listed when first visited.
+        let _ = count;
+        let current = app.sessions.current_index();
+        app.ensure_loaded(current);
     } else {
         app.reload(PanelId::Left);
         app.reload(PanelId::Right);
@@ -2809,6 +2825,12 @@ pub async fn run(mut start: Startup) -> anyhow::Result<()> {
     let mcp_socket = dmac_session::agent_root()
         .map(|root| dmac_mcp::socket_path(&root, std::process::id()));
     if let Some(socket) = mcp_socket.clone() {
+        // Sockets left by runs that are no longer here: one file accumulates
+        // per run, and a stale one is a path an agent can be pointed at and
+        // get nothing from.
+        if let Some(root) = dmac_session::agent_root() {
+            dmac_mcp::clear_stale_sockets(&root);
+        }
         crate::mcp::listen(socket, app.tx.clone());
     }
 

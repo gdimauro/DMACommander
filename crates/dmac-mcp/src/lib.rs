@@ -31,7 +31,61 @@ pub mod tools;
 /// Where a running commander listens: one socket per process, named by pid so
 /// two commanders on one machine never fight over it.
 pub fn socket_path(root: &std::path::Path, pid: u32) -> std::path::PathBuf {
-    root.join("mcp").join(format!("{pid}.sock"))
+    let preferred = root.join("mcp").join(format!("{pid}.sock"));
+    // A Unix socket path lives in a fixed-size field — 104 bytes on macOS, 108
+    // on Linux — and binding past it fails. The config directory is usually
+    // well inside that, but a long user name or a deep XDG root is not, and the
+    // failure is silent: the socket simply never appears and the agent that
+    // was told about it finds nothing. Falling back to the temporary directory
+    // keeps the path short enough to bind.
+    const LIMIT: usize = 100;
+    if preferred.as_os_str().len() <= LIMIT {
+        return preferred;
+    }
+    std::env::temp_dir().join(format!("dmac-{pid}.sock"))
+}
+
+/// Remove sockets left by runs that are no longer here.
+///
+/// One file per run accumulates otherwise, and a stale one is worse than
+/// clutter: it is a path an agent can be pointed at and get nothing from.
+/// Returns how many were removed.
+#[cfg(unix)]
+pub fn clear_stale_sockets(root: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(root.join("mcp")) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for e in entries.flatten() {
+        let path = e.path();
+        let Some(pid) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if pid == std::process::id() as i32 || alive(pid) {
+            continue;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+#[cfg(not(unix))]
+pub fn clear_stale_sockets(_root: &std::path::Path) -> usize {
+    0
+}
+
+/// Whether a process exists. Signal 0 asks without disturbing it.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn alive(pid: i32) -> bool {
+    // SAFETY: two integers in, one out; signal 0 delivers nothing.
+    unsafe { libc::kill(pid, 0) == 0 }
 }
 
 /// The handshake a bridge sends first, naming the session it belongs to.

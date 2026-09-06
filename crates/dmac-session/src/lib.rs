@@ -104,6 +104,14 @@ pub struct Session {
     /// is the whole point: come back tomorrow and `claude` rejoins the
     /// conversation you left, instead of starting a new one next to it.
     pub conversation: Option<String>,
+    /// Whether this session's panels have been listed yet.
+    ///
+    /// Restored sessions start `false`: listing every panel of every session at
+    /// startup means a directory walk per panel before the first frame, which
+    /// is a cost that grows with how many sessions you keep and buys nothing —
+    /// you can only look at one of them. They are listed when first visited,
+    /// and stay in memory afterwards, so switching is still instant.
+    pub loaded: bool,
     /// An agent that was running when this session was last saved, waiting to
     /// be started again. Cleared once it has been.
     pub reattach: Option<String>,
@@ -131,6 +139,8 @@ impl Session {
             shell: None,
             shell_cwd: None,
             conversation: None,
+            // A session made now is listed by whoever made it.
+            loaded: true,
             reattach: None,
             agent: None,
             last_used: std::time::Instant::now(),

@@ -283,6 +283,8 @@ fn apply(session: &mut Session, saved: &PersistedSession) {
     // The process is gone, the conversation is not. This is what makes the
     // next `claude` in this session pick up where the last one left off.
     session.conversation = saved.conversation.clone();
+    // Nothing has been listed yet; the first visit does that.
+    session.loaded = false;
     session.command_line = saved.command_line.clone();
     // Not started here — the store does not spawn processes. Recorded so the
     // caller, which owns the event loop and the waker, can put it back.

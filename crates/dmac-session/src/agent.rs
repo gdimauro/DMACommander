@@ -210,6 +210,15 @@ fn write_mcp_config(root: &Path, dir: &Path, session_id: &str) -> Option<PathBuf
         return None;
     }
     let socket = dmac_mcp::socket_path(root, std::process::id());
+    // Only advertise a server that is actually there. Binding can fail — a path
+    // too long for a socket address, a read-only directory — and it fails
+    // silently, so writing the configuration anyway hands the agent a path
+    // nothing answers on. An MCP server that is absent is better than one that
+    // is present and dead: the second wastes the user's time working out why
+    // the tools do not respond.
+    if !socket.exists() {
+        return None;
+    }
     let config = dir.join("mcp.json");
     let json = serde_json::json!({
         "mcpServers": {
