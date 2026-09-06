@@ -126,8 +126,9 @@ pub fn resolve(key: KeyEvent, focus: Focus) -> Option<Action> {
         (Char('u'), false, true) => Action::SwapPanels,
         (Char('o'), true, false) => Action::ToggleShell,
         (Char('r'), true, false) => Action::Refresh,
-        // Backspace goes up a directory only with a modifier now, because plain
-        // Backspace edits the quick-search buffer while a panel has focus.
+        // Backspace with a modifier always goes up a directory. Plain Backspace
+        // does too, unless a quick search is in progress — then it deletes a
+        // character, and goes up once the buffer is empty again.
         (Backspace, true, false) | (Backspace, false, true) => Action::GoParent,
 
         // --- The clipboard. Ctrl-Shift-C/V is what every modern terminal uses

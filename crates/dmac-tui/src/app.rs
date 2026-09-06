@@ -838,6 +838,11 @@ impl App {
             CommandSubmit => self.run_command(),
 
             QuickSearch(c) => self.quick_search(c),
+            // Backspace with an empty search buffer goes up a directory, the
+            // way every file manager since Norton has. The search only owns the
+            // key while it has something to delete: erase what you typed, and
+            // the next Backspace leaves the directory.
+            QuickSearchBackspace if self.quick_search.is_empty() => self.go_parent(),
             QuickSearchBackspace => {
                 self.quick_search.pop();
                 if self.quick_search.is_empty() {
@@ -2998,6 +3003,42 @@ mod tests {
     // ---- sessions ----
 
     // Creating a session spawns its directory listing, so this needs a runtime.
+    /// Backspace is the key everyone reaches for to leave a directory. It only
+    /// belongs to the quick search while the search has something to delete.
+    // Leaving a directory starts a listing, so this needs a runtime.
+    #[tokio::test]
+    async fn backspace_leaves_the_directory_when_nothing_is_being_searched() {
+        let mut app = fixture();
+        assert_eq!(app.ses().cwd[0], VfsPath::local("/left"));
+
+        app.handle(Action::QuickSearchBackspace);
+        assert_eq!(
+            app.ses().cwd[0],
+            VfsPath::local("/"),
+            "an empty search buffer means Backspace goes up"
+        );
+    }
+
+    /// The other half of the same rule: a search in progress keeps the key, so
+    /// a typo does not throw you out of the directory you were searching.
+    #[tokio::test]
+    async fn backspace_edits_the_search_before_it_leaves() {
+        let mut app = fixture();
+        app.handle(Action::QuickSearch('s'));
+        app.handle(Action::QuickSearch('r'));
+
+        app.handle(Action::QuickSearchBackspace);
+        assert_eq!(app.quick_search, "s", "it deletes a character first");
+        assert_eq!(app.ses().cwd[0], VfsPath::local("/left"), "and stays put");
+
+        app.handle(Action::QuickSearchBackspace);
+        assert_eq!(app.quick_search, "", "the buffer empties");
+        assert_eq!(app.ses().cwd[0], VfsPath::local("/left"), "still put");
+
+        app.handle(Action::QuickSearchBackspace);
+        assert_eq!(app.ses().cwd[0], VfsPath::local("/"), "now it goes up");
+    }
+
     #[tokio::test]
     async fn a_new_session_opens_on_the_current_directory() {
         let mut app = fixture();
