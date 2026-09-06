@@ -260,8 +260,7 @@ pub fn prepare(root: &Path, session_id: &str, conversation: &str) -> Option<Path
     // directories; without this the marker silently never appears and every
     // run looks like the first one.
     let _ = std::fs::create_dir_all(root.join("agents"));
-    // Written before the shims, because a shim names it.
-    let mcp = write_mcp_config(root, &dir, session_id);
+    let mcp = mcp_config(root, session_id);
     let mut wrote_any = false;
     for a in ATTACHED {
         let Some(real) = resolve(a.program, &dir) else {
@@ -278,42 +277,43 @@ pub fn prepare(root: &Path, session_id: &str, conversation: &str) -> Option<Path
 
 /// Describe this commander as an MCP server the hosted agent can call.
 ///
-/// Returns the path of the configuration file, or `None` when there is nothing
-/// to describe — no socket, or no binary to point at. Absent, everything else
-/// still works: the agent simply cannot see the panels.
-fn write_mcp_config(root: &Path, dir: &Path, session_id: &str) -> Option<PathBuf> {
+/// Returned as the JSON `--mcp-config` takes directly — it accepts strings as
+/// well as files. Nothing is written to disk: a file would have to live
+/// somewhere, and wherever that somewhere is, a second commander wants it too.
+/// The description belongs to the run, so it travels inside the run's own shim
+/// rather than in a file both runs can see.
+///
+/// `None` when there is nothing to describe — no socket, or no binary to point
+/// at. Absent, everything else still works: the agent simply cannot see the
+/// panels.
+fn mcp_config(root: &Path, session_id: &str) -> Option<String> {
     let binary = std::env::current_exe().ok()?;
     // A test binary is not a commander. Without this, a `cargo test` run would
-    // leave a configuration behind pointing a real agent at something in
-    // `target/debug/deps` that the next build deletes — and the agent would
-    // report a broken MCP server it was never meant to have.
+    // hand a real agent something in `target/debug/deps` that the next build
+    // deletes — and the agent would report a broken MCP server it was never
+    // meant to have.
     if binary.file_stem().is_none_or(|n| n != "dmac") {
         return None;
     }
     let socket = dmac_mcp::socket_path(root, std::process::id());
     // Only advertise a server that is actually there. Binding can fail — a path
     // too long for a socket address, a read-only directory — and it fails
-    // silently, so writing the configuration anyway hands the agent a path
-    // nothing answers on. An MCP server that is absent is better than one that
-    // is present and dead: the second wastes the user's time working out why
-    // the tools do not respond.
+    // silently, so describing it anyway hands the agent a path nothing answers
+    // on. An MCP server that is absent is better than one that is present and
+    // dead: the second wastes the user's time working out why the tools do not
+    // respond.
     if !socket.exists() {
         return None;
     }
-    let config = dir.join("mcp.json");
-    let json = serde_json::json!({
+    serde_json::to_string(&serde_json::json!({
         "mcpServers": {
             "dmac": {
                 "command": binary,
                 "args": ["--mcp", socket, "--mcp-session", session_id],
             }
         }
-    });
-    if let Some(parent) = config.parent() {
-        std::fs::create_dir_all(parent).ok()?;
-    }
-    std::fs::write(&config, serde_json::to_vec_pretty(&json).ok()?).ok()?;
-    Some(config)
+    }))
+    .ok()
 }
 
 /// The environment a hosted shell needs so the shim is found and the id is
@@ -385,14 +385,18 @@ fn shim_script(
     real: &Path,
     conversation: &str,
     marker: &Path,
-    mcp_config: Option<&Path>,
+    mcp_config: Option<&str>,
 ) -> String {
     let (real, marker) = (real.display(), marker.display());
     let (program, new_flag, resume_flag) = (a.program, a.new_flag, a.resume_flag);
     // Empty when there is nothing to add, so the exec lines below read the same
-    // either way rather than needing two versions of each.
+    // either way rather than needing two versions of each. Quoted properly and
+    // not just wrapped in apostrophes: this is JSON carrying filesystem paths,
+    // and a home directory can be called `O'Brien`.
     let mcp = match (a.mcp_flag, mcp_config) {
-        (Some(flag), Some(path)) => format!("{flag} '{}' ", path.display()),
+        (Some(flag), Some(json)) => {
+            format!("{flag} {} ", dmac_core::tools::shell_quote(json))
+        }
         _ => String::new(),
     };
     let explicit = a
@@ -409,7 +413,9 @@ fn shim_script(
 #   rm '{marker}'
 #
 # The commander also describes itself to {program} as an MCP server, so it can
-# see the panels, the history and the sessions it is running inside.
+# see the panels, the history and the sessions it is running inside. The
+# description is passed inline rather than through a file, so several
+# commanders can be open at once without sharing anything writable.
 #
 # An explicit choice on the command line always wins; this only fills in a gap.
 for arg in "$@"; do
@@ -453,6 +459,32 @@ mod tests {
         &ATTACHED[0]
     }
 
+    /// The description is JSON carrying filesystem paths, and a home directory
+    /// can be called `O'Brien`. Wrapped in bare apostrophes that would end the
+    /// quoting early and hand the rest of the JSON to the shell as code.
+    #[test]
+    fn an_apostrophe_in_the_description_cannot_escape_its_quotes() {
+        let json = r#"{"command":"/Users/O'Brien/dmac"}"#;
+        let s = shim_script(
+            claude(),
+            Path::new("/usr/local/bin/claude"),
+            "abc",
+            Path::new("/tmp/m"),
+            Some(json),
+        );
+        assert!(
+            s.contains(r#"'{"command":"/Users/O'\''Brien/dmac"}'"#),
+            "the apostrophe was not closed and reopened: {s}"
+        );
+        // And what a shell would actually read back is the JSON we started with.
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf %s {}", dmac_core::tools::shell_quote(json)))
+            .output()
+            .expect("sh");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), json);
+    }
+
     /// Two commanders both have a session `0`. When they shared a directory the
     /// second one to start rewrote the first one's `mcp.json` to name its own
     /// socket, and the first commander — still running, still listening — had
@@ -465,20 +497,20 @@ mod tests {
         // therefore land.
         let theirs = root.path().join("shims").join("0");
         std::fs::create_dir_all(&theirs).expect("their directory");
-        std::fs::write(theirs.join("mcp.json"), b"theirs").expect("their config");
+        std::fs::write(theirs.join("claude"), b"theirs").expect("their shim");
 
         let _ = prepare(root.path(), "0", "11111111-2222-4333-8444-555555555555");
 
         assert_eq!(
-            std::fs::read(theirs.join("mcp.json")).expect("still there"),
+            std::fs::read(theirs.join("claude")).expect("still there"),
             b"theirs",
-            "another commander's configuration was overwritten"
+            "another commander's shim was overwritten"
         );
         assert!(
             shim_dir(root.path(), "0")
                 .to_string_lossy()
-                .contains(&std::process::id().to_string()),
-            "the directory must be named by the pid that owns it"
+                .contains(&format!("{RUN_PREFIX}{}", std::process::id())),
+            "the directory must be named by the run that owns it"
         );
     }
 
@@ -619,13 +651,10 @@ mod tests {
     #[test]
     fn a_test_binary_never_advertises_itself_as_the_commander() {
         let root = tempfile::tempdir().expect("a temp dir");
-        let dir = root.path().join("shims").join("s1");
-        std::fs::create_dir_all(&dir).expect("mkdir");
         assert!(
-            write_mcp_config(root.path(), &dir, "s1").is_none(),
+            mcp_config(root.path(), "s1").is_none(),
             "current_exe() here is a test binary"
         );
-        assert!(!dir.join("mcp.json").exists(), "and nothing was written");
     }
 
     /// The commander describes itself to the agent it hosts. Without this the
@@ -637,9 +666,12 @@ mod tests {
             Path::new("/usr/local/bin/claude"),
             "abcd-1234",
             Path::new("/tmp/m"),
-            Some(Path::new("/tmp/shims/s1/mcp.json")),
+            Some(r#"{"mcpServers":{"dmac":{"command":"/usr/bin/dmac"}}}"#),
         );
-        assert!(s.contains("--mcp-config '/tmp/shims/s1/mcp.json'"), "{s}");
+        assert!(
+            s.contains(r#"--mcp-config '{"mcpServers":{"dmac":{"command":"/usr/bin/dmac"}}}'"#),
+            "the description travels inline, not as a path: {s}"
+        );
         // On every route out, including the one the user's own flags take:
         // choosing a conversation is not choosing to be blind.
         assert_eq!(

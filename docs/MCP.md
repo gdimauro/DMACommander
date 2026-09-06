@@ -12,12 +12,12 @@ screen.
 ```
 
 DMACommander listens on `<config>/mcp/<pid>.sock` for as long as it runs. When
-it starts a shell for a session it writes an MCP configuration next to that
-session's shims, in `<config>/shims/run-<pid>/<session>/`, and points the agent
-at it, so:
+it starts a shell for a session it writes a shim in
+`<config>/shims/run-<pid>/<session>/` carrying the MCP description inline —
+`--mcp-config` takes JSON as readily as a filename — so:
 
 ```sh
-claude              # becomes: claude --mcp-config .../shims/<id>/mcp.json --resume <uuid>
+claude              # becomes: claude --mcp-config '{"mcpServers":{...}}' --resume <uuid>
 ```
 
 Nothing to install and nothing to configure. `dmac --mcp <socket>` is a few
@@ -25,11 +25,15 @@ dozen lines of pipe: MCP clients start their servers themselves, as child
 processes with pipes, and this is what puts one of them in touch with the
 commander already on screen rather than a fresh one.
 
-Both paths carry the pid, and for the same reason. Session ids are indices, so
-two commanders each have a session `0`; when they shared a shim directory the
-second one to start rewrote the first one's configuration to name *its* socket,
-and every agent the first commander hosted was left pointed at a socket that
-died with the other commander. Configured, and answering nothing. Directories
+Nothing describing the server is written to a file. A file has to live
+somewhere, and wherever that somewhere is a second commander wants it too:
+session ids are indices, so two commanders each have a session `0`. When they
+shared one, the second to start rewrote the first one's configuration to name
+*its* socket, and every agent the first commander hosted was left pointed at a
+socket that died with the other commander — configured, and answering nothing.
+The description belongs to the run, so it travels inside the run's own shim.
+
+The shim directory carries the pid for the same reason, and directories
 belonging to runs that have ended are swept at startup.
 
 The one thing that does *not* move with the run is the marker recording that a

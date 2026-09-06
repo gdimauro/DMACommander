@@ -39,7 +39,6 @@ and there is nothing the application can do about that from its side.
 | iTerm2 | yes | everything works |
 | foot, Alacritty (recent) | yes | everything works |
 | Apple Terminal | **no** | use `Ctrl-O` chords or `F9`/`F12` |
-| Warp | partial | if `Ctrl-Shift-*` does nothing, use the chords |
 
 On macOS there is a second trap: `Cmd-H` is *Hide Application*, handled by the
 system before any terminal sees it. Where `Cmd` bindings are listed they only
