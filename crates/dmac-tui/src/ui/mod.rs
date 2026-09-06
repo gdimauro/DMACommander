@@ -161,6 +161,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     caret: shell_caret,
                     cwd: here.as_deref(),
                     pending,
+                    // The rail is a strip of dots in this view; the border is
+                    // where the session gets to say its name.
+                    session: Some((session.name.as_str(), rail::colour(session.color))),
                 },
                 theme,
             );

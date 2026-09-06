@@ -59,7 +59,12 @@ pub fn detailed(width: u16) -> bool {
     width >= DETAILED_FROM
 }
 
-fn colour(c: SessionColor) -> Color {
+/// The colour a session answers to, here and anywhere else that names one.
+///
+/// Shared rather than looked up twice: the shell's border carries the session
+/// name in this colour, and a second copy of the mapping is a second thing to
+/// remember to change.
+pub(crate) fn colour(c: SessionColor) -> Color {
     match c {
         SessionColor::Cyan => Color::Cyan,
         SessionColor::Green => Color::LightGreen,

@@ -11,7 +11,7 @@ use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Span;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders};
 
 /// A position over the hosted pane: a column, and a row counted from the top of
@@ -165,34 +165,68 @@ pub struct Chrome<'a> {
     /// something is running, because a `cd` cannot be typed at it.
     pub cwd: Option<&'a str>,
     pub pending: Option<&'a str>,
+    /// Which session this shell belongs to, and the colour the rail gives it.
+    /// `None` draws the border the way it was drawn before there were sessions
+    /// to name, which is what a caller with nothing to say should get.
+    pub session: Option<(&'a str, Color)>,
     /// Where the keyboard is selecting from, while a Shift-selection is being
     /// made. Drawn so it is obvious which end of the highlight moves next.
     pub caret: Option<Cell>,
 }
 
-/// What the top border says: the program, and where it is.
+/// What the top border says: which session, which program, and where it is.
 ///
-/// Both, because either alone leaves a question. The program without the
-/// directory is the state this view was in for months — the one place you type
-/// commands and the only one that would not tell you where they would land.
-/// The directory without the program would not say what has the keyboard.
+/// The session first, in the colour the rail gives its dot. In this view the
+/// rail is three columns of dots, so the name is nowhere else on the screen —
+/// and a command typed into the wrong session is not something you notice while
+/// you are typing it. The colour comes from the rail rather than being chosen
+/// again here, so the dot and the name cannot drift apart.
+///
+/// Then the program and the directory, both, because either alone leaves a
+/// question. The program without the directory is the state this view was in
+/// for months — the one place you type commands and the only one that would not
+/// tell you where they would land. The directory without the program would not
+/// say what has the keyboard.
 ///
 /// An arrow appears when the panels have gone somewhere the shell could not
 /// follow, which is exactly when something is running in it: the answer to
 /// "did it come with me?" belongs on the screen, not in the user's head.
-fn title_for(shell: &Hosted, cwd: Option<&str>, pending: Option<&str>) -> String {
-    let mut title = format!(" {}", shell.program());
-    if shell.finished() {
-        title.push_str(" (exited)");
+///
+/// Given the two facts it needs from the shell rather than the shell itself, so
+/// that what the border says can be asserted without starting a process — and
+/// on a platform where the process would be a different one.
+fn title_for(
+    program: &str,
+    finished: bool,
+    session: Option<(&str, Color)>,
+    cwd: Option<&str>,
+    pending: Option<&str>,
+    base: Style,
+) -> Line<'static> {
+    let mut rest = format!(" {program}");
+    if finished {
+        rest.push_str(" (exited)");
     }
     if let Some(cwd) = cwd {
-        title.push_str(&format!(" \u{b7} {cwd}"));
+        rest.push_str(&format!(" \u{b7} {cwd}"));
     }
     if let Some(pending) = pending {
-        title.push_str(&format!(" \u{2192} {pending}"));
+        rest.push_str(&format!(" \u{2192} {pending}"));
     }
-    title.push(' ');
-    title
+    rest.push(' ');
+    match session {
+        // Bold as well as coloured: this is the one word on the border that is
+        // not about the program, and a terminal with no colour must still be
+        // able to tell them apart.
+        Some((name, colour)) => Line::from(vec![
+            Span::styled(
+                format!(" {name}"),
+                base.fg(colour).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" \u{b7}{rest}"), base),
+        ]),
+        None => Line::from(Span::styled(rest, base)),
+    }
 }
 
 /// Draw the hosted screen into `area`, returning the interior rect so the caller
@@ -206,8 +240,16 @@ pub fn draw(frame: &mut Frame, area: Rect, shell: &Hosted, c: &Chrome<'_>, theme
         caret,
         cwd,
         pending,
+        session,
     } = *c;
-    let title = title_for(shell, cwd, pending);
+    let title = title_for(
+        shell.program(),
+        shell.finished(),
+        session,
+        cwd,
+        pending,
+        theme.border(focused),
+    );
 
     let block = Block::default()
         .borders(if bordered {
@@ -225,7 +267,7 @@ pub fn draw(frame: &mut Frame, area: Rect, shell: &Hosted, c: &Chrome<'_>, theme
 
     let block = if bordered {
         block
-            .title(Span::styled(title, theme.border(focused)))
+            .title(title)
             // The F-key bar is gone in this view, so this line is the only
             // documentation of the keys that still reach the commander from
             // inside a hosted program. It has to name all of them.
@@ -701,5 +743,59 @@ mod tests {
         let mut sel = Selection::new(0, 20);
         sel.expand_to_word(&h);
         assert!(sel.is_empty(), "got {:?}", sel.text(&h));
+    }
+
+    fn text_of(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// The one thing on this border that is not about the program. The rail is
+    /// three columns of dots in this view, so a name that is not here is
+    /// nowhere — and a command typed into the wrong session is not something
+    /// anyone notices while they are typing it.
+    #[test]
+    fn the_border_says_which_session_this_is() {
+        let title = title_for(
+            "/bin/zsh",
+            false,
+            Some(("DMAC", Color::Cyan)),
+            Some("~/prj/DimaCommander"),
+            None,
+            Style::default(),
+        );
+        assert_eq!(
+            text_of(&title),
+            " DMAC \u{b7} /bin/zsh \u{b7} ~/prj/DimaCommander "
+        );
+        assert_eq!(
+            title.spans.first().map(|s| s.style.fg),
+            Some(Some(Color::Cyan)),
+            "the name wears the colour the rail gives that session"
+        );
+    }
+
+    /// Adding the session must not cost the border anything it already said.
+    #[test]
+    fn the_border_still_says_the_program_and_where_it_is() {
+        let title = title_for(
+            "sh",
+            true,
+            Some(("MAIN", Color::Green)),
+            Some("/tmp"),
+            Some("/etc"),
+            Style::default(),
+        );
+        assert_eq!(
+            text_of(&title),
+            " MAIN \u{b7} sh (exited) \u{b7} /tmp \u{2192} /etc "
+        );
+    }
+
+    /// A caller with no session to name gets the border it had before there
+    /// were sessions to name, and not one with a gap where the name goes.
+    #[test]
+    fn no_session_leaves_the_border_as_it_was() {
+        let title = title_for("sh", false, None, Some("/tmp"), None, Style::default());
+        assert_eq!(text_of(&title), " sh \u{b7} /tmp ");
     }
 }

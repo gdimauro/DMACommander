@@ -100,6 +100,12 @@ Notable changes, newest first. Versions follow the policy in
   shell's own call: a `cd` sent to something that is running is not a command,
   it is a line handed to whatever has the keyboard, so a busy shell is left
   alone and catches up at the next `Ctrl-O`.
+- **The shell's border says which session you are in.** The name first, in the
+  colour the rail gives that session's dot. This is the view where the rail is
+  three columns of dots, so until now the name was nowhere on the screen at all
+  — and a command typed into the wrong session is not something anyone notices
+  while they are typing it. The colour is the rail's own rather than a second
+  copy of the mapping, so the dot and the name cannot drift apart.
 - **The shell's border says where it is, not just what it is running.** The one
   view where you type commands was the one view that would not tell you where
   they would land. The directory is asked of the system rather than remembered:
