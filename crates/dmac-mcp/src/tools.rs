@@ -159,6 +159,16 @@ const TOOLS: &[Tool] = &[
         args: &[("message", "string", true, "One short line.")],
     },
     Tool {
+        name: "recycle",
+        description: "Rebuild the commander and restart it in place, keeping the same terminal,                       the same sessions and the same conversation. Only rebuilds when it is                       running from its own source tree; a released binary just restarts.                       Nothing is torn down unless the build succeeds — a failed build leaves                       everything exactly as it was, with the compiler's complaint in the status                       bar. Note that this restarts whatever is hosted inside it, including you:                       say what you are doing before you call it.",
+        args: &[(
+            "build",
+            "boolean",
+            false,
+            "Rebuild first. Defaults to true when running from a source tree, false otherwise.",
+        )],
+    },
+    Tool {
         name: "screen",
         description: "The commander's screen as text, exactly as rendered. Use it to see what \
                       the user is seeing — including the output of whatever is running in the \

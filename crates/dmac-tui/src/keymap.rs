@@ -174,6 +174,16 @@ pub fn resolve(key: KeyEvent, focus: Focus) -> Option<Action> {
         // Hidden files move to Alt-H and Alt-period, which is where `mc` has
         // always kept them.
         (Char(c), true, false) if shift && c.eq_ignore_ascii_case(&'h') => Action::DirectoryHistory,
+        // Ctrl-Shift-H, and Cmd-Shift-H where the Command key is forwarded.
+        // Plain Ctrl-H is kept but is not the binding to rely on: it is byte
+        // 0x08, which every terminal also sends for Backspace, so only ones
+        // that encode modifiers separately can tell the two apart at all.
+        (Char(c), true, false) if shift && c.eq_ignore_ascii_case(&'h') => Action::DirectoryHistory,
+        (Char(c), _, _)
+            if key.modifiers.contains(KeyModifiers::SUPER) && c.eq_ignore_ascii_case(&'h') =>
+        {
+            Action::DirectoryHistory
+        }
         (Char('h'), true, false) => Action::DirectoryHistory,
         (Char('h'), false, true) | (Char('.'), false, true) => Action::ToggleHidden,
 

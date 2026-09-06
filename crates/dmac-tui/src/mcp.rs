@@ -33,6 +33,10 @@ impl Commander for App {
             "switch_session" => self.mcp_switch_session(args),
             "notify" => self.mcp_notify(args),
             "screen" => Ok(self.mcp_screen()),
+            "recycle" => {
+                let build = args.get("build").and_then(serde_json::Value::as_bool);
+                self.recycle(build).map(serde_json::Value::String)
+            }
             // Unreachable: the protocol layer checks the catalogue first. Said
             // out loud anyway, because "silently did nothing" is the worst
             // possible answer to give a model.

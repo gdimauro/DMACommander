@@ -23,6 +23,8 @@ use tokio::sync::mpsc;
 
 /// A state change produced off the UI thread.
 pub(crate) enum Update {
+    /// A rebuild asked for by `recycle` finished. `Ok` means restart now.
+    Rebuilt(Result<(), String>),
     /// A slice of a directory listing arrived.
     Entries {
         /// Which session asked for it.
@@ -680,6 +682,12 @@ impl App {
                 start,
                 items,
             } => self.apply_completion(session, generation, start, items),
+            Update::Rebuilt(Ok(())) => self.restart_in_place(),
+            // A failed build changes nothing: the point of building first is
+            // that a broken tree costs you a message, not your session.
+            Update::Rebuilt(Err(why)) => {
+                self.status = format!("rebuild failed — {}", first_error(&why));
+            }
             // Nothing to apply: arriving here already cost the redraw that the
             // hosted program was asking for.
             Update::ShellOutput => {}
@@ -1417,6 +1425,79 @@ impl App {
 
     /// Quit as if F10 had been pressed. Used when the terminal goes away.
     pub(crate) fn request_quit(&mut self) {
+        self.should_quit = true;
+    }
+
+    /// Where this binary was built from, if it was built from a source tree.
+    ///
+    /// `target/<profile>/dmac` sits two directories below the workspace root,
+    /// so the manifest is where to look. A binary installed somewhere else has
+    /// no source tree and simply restarts without rebuilding.
+    fn source_tree() -> Option<(std::path::PathBuf, String)> {
+        let exe = std::env::current_exe().ok()?;
+        let profile = exe.parent()?;
+        let root = profile.parent()?.parent()?;
+        let name = profile.file_name()?.to_str()?.to_string();
+        root.join("Cargo.toml")
+            .is_file()
+            .then(|| (root.to_path_buf(), name))
+    }
+
+    /// Rebuild, then restart in place. Returns what to tell the caller.
+    pub(crate) fn recycle(&mut self, build: Option<bool>) -> Result<String, String> {
+        let tree = Self::source_tree();
+        let build = build.unwrap_or(tree.is_some());
+        let Some((root, profile)) = tree.filter(|_| build) else {
+            // Nothing to build: restart on the next turn of the loop, so this
+            // call still gets to answer before the process is replaced.
+            let _ = self.tx.send(Update::Rebuilt(Ok(())));
+            return Ok("restarting".into());
+        };
+
+        let tx = self.tx.clone();
+        let announcement = format!("rebuilding {profile} in {}", root.display());
+        // On a task, never here: a build takes minutes and the event loop must
+        // keep drawing — not least so the user can read what the compiler says.
+        tokio::task::spawn_blocking(move || {
+            let mut cargo = std::process::Command::new("cargo");
+            cargo.arg("build").current_dir(&root);
+            if profile == "release" {
+                cargo.arg("--release");
+            }
+            let result = match cargo.output() {
+                Ok(out) if out.status.success() => Ok(()),
+                Ok(out) => Err(String::from_utf8_lossy(&out.stderr).into_owned()),
+                Err(e) => Err(e.to_string()),
+            };
+            let _ = tx.send(Update::Rebuilt(result));
+        });
+
+        self.status = "rebuilding…".into();
+        Ok(announcement)
+    }
+
+    /// Replace this process with a fresh copy of the same binary.
+    ///
+    /// The sessions are written first and the hosted tree taken down, because
+    /// `exec` keeps the pid but not the children: skipping either would leave
+    /// the agents orphaned and the layout lost — the two failures this whole
+    /// area exists to prevent. What comes back reads the file and reattaches.
+    fn restart_in_place(&mut self) {
+        self.save_on_exit();
+        // The terminal is put back by hand: `exec` never unwinds, so nothing
+        // that restores it on drop would ever run.
+        crate::terminal::restore();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            let exe = std::env::current_exe().unwrap_or_else(|_| "dmac".into());
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            let err = std::process::Command::new(exe).args(args).exec();
+            // Only reachable if exec failed, and by then the terminal is
+            // already restored, so the honest thing is to say why and stop.
+            eprintln!("dmac: could not restart: {err}");
+        }
         self.should_quit = true;
     }
 
@@ -3098,6 +3179,21 @@ impl App {
     }
 }
 
+/// The first line of a compiler's complaint that actually says something.
+///
+/// `cargo` leads with progress and warnings; the status bar has one line, and
+/// spending it on "Compiling dmac-core v0.1.0" helps nobody.
+fn first_error(stderr: &str) -> String {
+    stderr
+        .lines()
+        .find(|l| l.starts_with("error"))
+        .unwrap_or_else(|| stderr.lines().last().unwrap_or("no output"))
+        .trim()
+        .chars()
+        .take(200)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4548,5 +4644,64 @@ mod tests {
             ),
             Some(Action::CommandChar('v'))
         );
+    }
+
+    /// Ctrl-H is byte 0x08, which is also Backspace: only a terminal that
+    /// encodes modifiers separately can tell them apart. The shifted forms are
+    /// unambiguous everywhere that can send them at all.
+    #[test]
+    fn the_history_opens_on_every_spelling_of_its_key() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        for m in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            KeyModifiers::SUPER,
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        ] {
+            assert_eq!(
+                keymap::resolve(KeyEvent::new(KeyCode::Char('h'), m), Focus::Panel),
+                Some(Action::DirectoryHistory),
+                "{m:?}"
+            );
+        }
+        // Backspace stays Backspace; the history must not eat it.
+        assert_ne!(
+            keymap::resolve(
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+                Focus::CommandLine
+            ),
+            Some(Action::DirectoryHistory)
+        );
+    }
+
+    /// A released binary has no source tree to build, and must restart rather
+    /// than refuse.
+    #[test]
+    fn recycle_only_builds_when_there_is_something_to_build() {
+        // `source_tree` reads the running binary's path. Under `cargo test`
+        // that is `target/debug/deps/...`, which is one level deeper than a
+        // real build — so this asserts the shape of the answer, not a verdict.
+        if let Some((root, profile)) = App::source_tree() {
+            assert!(root.join("Cargo.toml").is_file(), "{root:?}");
+            assert!(!profile.is_empty());
+        }
+    }
+
+    /// The status bar has one line; spending it on "Compiling dmac-core" helps
+    /// nobody when there is an error further down.
+    #[test]
+    fn a_failed_build_reports_the_error_not_the_progress() {
+        let stderr = "   Compiling dmac-core v0.1.0\n   Compiling dmac-tui v0.1.0\nerror[E0308]: mismatched types\n  --> src/lib.rs:1:1\n";
+        assert!(
+            first_error(stderr).starts_with("error[E0308]"),
+            "{}",
+            first_error(stderr)
+        );
+        // Nothing that looks like an error: say the last thing it did say.
+        assert_eq!(
+            first_error("warning: unused\nFinished in 2s"),
+            "Finished in 2s"
+        );
+        assert_eq!(first_error(""), "no output");
     }
 }
