@@ -24,6 +24,19 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
+/// Below this a panel cannot show a name together with its size and date, and
+/// two of them side by side show neither.
+///
+/// Deliberately low. Norton Commander drew two panels side by side on an 80x25
+/// screen and so must this: 80 columns is the canonical size, not a narrow
+/// window, and stacking there would be a surprise rather than a rescue. The
+/// size and date field is about 22 columns, so at this width a name still gets
+/// ten — cramped, which is what 80 columns has always been, and legible.
+const MIN_PANEL_WIDTH: u16 = 34;
+
+/// ...but stacking costs rows, and below this there are not enough to split.
+const MIN_STACK_HEIGHT: u16 = 16;
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
@@ -142,8 +155,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
     } else if !panels_hidden {
         let panels = &mut session.panels;
+        // Narrow enough and the two panels stop being two panels: a name, a
+        // size and a date do not fit in half of a small window, so both columns
+        // show truncated names and nothing else. Stacked, each keeps the full
+        // width and pays in rows instead — the cheaper thing to lose, because a
+        // listing scrolls and a filename does not.
+        //
+        // Only while there are rows to spend, though: two panels three rows
+        // tall are worse than two narrow ones.
+        let stacked = body[1].width < MIN_PANEL_WIDTH * 2 && body[1].height >= MIN_STACK_HEIGHT;
         let cols = Layout::default()
-            .direction(Direction::Horizontal)
+            .direction(if stacked {
+                Direction::Vertical
+            } else {
+                Direction::Horizontal
+            })
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(body[1]);
 

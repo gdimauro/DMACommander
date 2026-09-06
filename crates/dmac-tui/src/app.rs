@@ -4317,6 +4317,63 @@ mod tests {
         assert_eq!(blue, 0, "{blue} cells are still Norton blue");
     }
 
+    /// Half of a narrow window is not a panel. A name, a size and a date do not
+    /// fit in it, so side by side both columns show truncated names and nothing
+    /// else — while stacked, each keeps the full width and pays in rows, which
+    /// is the cheaper thing to lose: a listing scrolls, a filename does not.
+    #[test]
+    fn a_narrow_window_stacks_the_panels_instead_of_shrinking_them() {
+        let mut app = fixture();
+
+        let mut wide = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        wide.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let [l, r] = app.layout.panels;
+        assert_eq!(l.y, r.y, "at 120 columns they must sit side by side");
+        assert!(l.x < r.x, "and left really is on the left");
+
+        let mut narrow = Terminal::new(TestBackend::new(60, 30)).unwrap();
+        narrow.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let [top, bottom] = app.layout.panels;
+        assert_eq!(top.x, bottom.x, "at 60 columns they must stack");
+        assert!(top.y < bottom.y, "and left becomes the top one");
+        assert_eq!(
+            top.width, bottom.width,
+            "stacked panels each take the whole width"
+        );
+        // Half of 60 columns is 30, and a panel that narrow shows a truncated
+        // name and nothing else. Stacked it keeps very nearly the whole window.
+        assert!(
+            top.width > 45,
+            "a stacked panel got only {} of 60 columns",
+            top.width
+        );
+    }
+
+    /// 80x24 is the canonical size, not a narrow window. Norton Commander drew
+    /// two panels side by side on it and so must this — stacking there would be
+    /// a surprise rather than a rescue.
+    #[test]
+    fn eighty_columns_is_still_two_panels_side_by_side() {
+        let mut app = fixture();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let [l, r] = app.layout.panels;
+        assert_eq!(l.y, r.y, "80 columns must stay side by side");
+        assert!(l.x < r.x);
+    }
+
+    /// Stacking spends rows, and there is a point below which there are none to
+    /// spend. Two panels three rows tall are worse than two narrow ones.
+    #[test]
+    fn a_window_with_no_rows_to_spare_stays_side_by_side() {
+        let mut app = fixture();
+        let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let [l, r] = app.layout.panels;
+        assert_eq!(l.y, r.y, "too short to stack, so side by side it stays");
+        assert!(l.x < r.x);
+    }
+
     /// The row the F-key bar gave up has to go to the listing, or the mode costs
     /// a border and buys nothing.
     #[test]
