@@ -13,6 +13,8 @@
 pub mod clipboard;
 pub mod complete;
 pub mod entry;
+pub mod fuzzy;
+pub mod history;
 pub mod panel;
 pub mod tools;
 

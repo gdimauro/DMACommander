@@ -126,10 +126,15 @@ pub fn resolve(key: KeyEvent, focus: Focus) -> Option<Action> {
         (Char('u'), false, true) => Action::SwapPanels,
         (Char('o'), true, false) => Action::ToggleShell,
         (Char('r'), true, false) => Action::Refresh,
-        // Backspace with a modifier always goes up a directory. Plain Backspace
-        // does too, unless a quick search is in progress — then it deletes a
-        // character, and goes up once the buffer is empty again.
-        (Backspace, true, false) | (Backspace, false, true) => Action::GoParent,
+        // Backspace goes up a directory. Plain Backspace does too, unless a
+        // quick search is in progress — then it deletes a character, and goes
+        // up once the buffer is empty again.
+        //
+        // Ctrl-Backspace is the history, not the parent: a terminal that cannot
+        // report Ctrl-H sends it as exactly this, and the two must agree or the
+        // binding would depend on which terminal you happened to open.
+        (Backspace, true, false) => Action::DirectoryHistory,
+        (Backspace, false, true) => Action::GoParent,
 
         // --- The clipboard. Ctrl-Shift-C/V is what every modern terminal uses
         //     and what people try first; Ctrl-Insert / Shift-Insert is what
@@ -164,7 +169,13 @@ pub fn resolve(key: KeyEvent, focus: Focus) -> Option<Action> {
         //     here would silently eat every hyphen in a command line. ---
         (Insert, _, _) => Action::ToggleSelection,
 
-        (Char('h'), true, false) => Action::ToggleHidden,
+        // Ctrl-H is the directory history, and Ctrl-Shift-H is the same thing
+        // from inside a hosted shell, where a bare Ctrl-H belongs to the child.
+        // Hidden files move to Alt-H and Alt-period, which is where `mc` has
+        // always kept them.
+        (Char(c), true, false) if shift && c.eq_ignore_ascii_case(&'h') => Action::DirectoryHistory,
+        (Char('h'), true, false) => Action::DirectoryHistory,
+        (Char('h'), false, true) | (Char('.'), false, true) => Action::ToggleHidden,
 
         // --- Modern additions, on keys the canon left free. ---
         (Char('p'), true, true) => Action::Unimplemented("command palette"),

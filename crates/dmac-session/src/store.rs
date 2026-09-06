@@ -55,6 +55,11 @@ struct Persisted {
     /// Which session was on screen.
     current: usize,
     sessions: Vec<PersistedSession>,
+    /// Every directory visited, so the history survives a restart. Absent in
+    /// files written before it existed, which is a first run for the history
+    /// and nothing else.
+    #[serde(default)]
+    history: Vec<dmac_core::history::Visit>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,6 +187,7 @@ impl SessionStore {
             apply(manager.at_mut(i), &s);
         }
 
+        manager.history = dmac_core::history::History::from_visits(saved.history);
         manager.switch_to(saved.current.min(manager.len() - 1));
         Ok(Some((manager, saved.clean_exit)))
     }
@@ -197,6 +203,7 @@ impl SessionStore {
             clean_exit,
             current: manager.current_index(),
             sessions: manager.all().iter().map(persist).collect(),
+            history: manager.history.visits().to_vec(),
         };
         let json = serde_json::to_string_pretty(&saved).map_err(|source| StoreError::Corrupt {
             path: self.path.display().to_string(),

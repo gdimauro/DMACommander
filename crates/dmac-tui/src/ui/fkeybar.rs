@@ -11,7 +11,10 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-const KEYS: [(&str, &str); 10] = [
+/// What the keys do with nothing open. Anything that takes over the keyboard
+/// supplies its own set, because a bar that still advertises Copy while a
+/// directory list is up is a bar that lies.
+pub const NORMAL: [(&str, &str); 10] = [
     ("1", "Help"),
     ("2", "Menu"),
     ("3", "View"),
@@ -24,7 +27,23 @@ const KEYS: [(&str, &str); 10] = [
     ("10", "Quit"),
 ];
 
-pub fn draw(frame: &mut Frame, area: Rect, theme: &Theme) {
+/// The bar for the directory history: the three orders, and the way out.
+pub const HISTORY: [(&str, &str); 10] = [
+    ("1", "Recent"),
+    ("2", "MostUsed"),
+    ("3", "Session"),
+    ("4", ""),
+    ("5", ""),
+    ("6", ""),
+    ("7", ""),
+    ("8", ""),
+    ("9", ""),
+    ("10", "Close"),
+];
+
+/// `active` marks the key whose mode is currently on — the bar doubles as the
+/// indicator, so there is no second place to look.
+pub fn draw(frame: &mut Frame, area: Rect, keys: &[(&str, &str)], active: Option<usize>, theme: &Theme) {
     let label = Style::default()
         .fg(theme.fkey_label_fg)
         .bg(theme.fkey_label_bg);
@@ -34,11 +53,19 @@ pub fn draw(frame: &mut Frame, area: Rect, theme: &Theme) {
 
     // Each cell gets an equal share of the width; the name is padded to fill it
     // so the coloured blocks line up into a solid bar.
-    let cell = (area.width as usize / KEYS.len()).max(4);
+    let cell = (area.width as usize / keys.len().max(1)).max(4);
     let name_w = cell.saturating_sub(2).max(1);
 
-    let mut spans = Vec::with_capacity(KEYS.len() * 2);
-    for (k, n) in KEYS {
+    let mut spans = Vec::with_capacity(keys.len() * 2);
+    for (i, (k, n)) in keys.iter().enumerate() {
+        let name = if active == Some(i) {
+            Style::default()
+                .fg(theme.fkey_name_bg)
+                .bg(theme.fkey_name_fg)
+                .add_modifier(ratatui::style::Modifier::BOLD)
+        } else {
+            name
+        };
         spans.push(Span::styled(format!("{k:>2}"), label));
         spans.push(Span::styled(format!("{n:<name_w$}"), name));
     }

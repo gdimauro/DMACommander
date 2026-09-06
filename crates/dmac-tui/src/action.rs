@@ -16,6 +16,10 @@ pub enum Action {
     /// Enter a directory, or open the file under the cursor.
     Activate,
     GoParent,
+    /// Ctrl-H: everywhere the panels have been, filtered and jumped to.
+    DirectoryHistory,
+    /// Which of the three readings of the history is showing.
+    HistoryOrder(dmac_core::history::Order),
 
     // Focus. The keyboard is either on a panel or on the command line, never
     // ambiguously between them.

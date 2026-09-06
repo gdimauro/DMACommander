@@ -281,6 +281,11 @@ pub struct SessionManager {
     sessions: Vec<Session>,
     current: usize,
     next_id: u64,
+    /// Every directory the panels have landed in, across every session. It
+    /// lives here rather than on a `Session` because two of its three views
+    /// span all of them, and a per-session list would have to be re-merged on
+    /// every keystroke of the filter.
+    pub history: dmac_core::history::History,
 }
 
 impl SessionManager {
@@ -290,6 +295,7 @@ impl SessionManager {
             sessions: vec![first],
             current: 0,
             next_id: 1,
+            history: dmac_core::history::History::default(),
         }
     }
 

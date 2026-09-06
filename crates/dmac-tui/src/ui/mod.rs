@@ -3,6 +3,7 @@
 //! same frame from the exact same state.
 
 mod fkeybar;
+pub(crate) mod history;
 pub(crate) mod menu;
 mod panel;
 pub(crate) mod picker;
@@ -58,7 +59,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let in_shell = app.sessions.current().view == dmac_session::View::Shell;
     let command_rows = u16::from(!in_shell);
     let status_rows = u16::from(in_shell && !app.status.is_empty());
-    let fkey_rows = u16::from(!full && !in_shell);
+    // The history puts its three orders on the F-keys, so its bar is shown even
+    // where there would normally be none: over a shell, and in full screen.
+    let history_open = matches!(app.mode, crate::app::Mode::History { .. });
+    let fkey_rows = u16::from(history_open || (!full && !in_shell));
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -186,7 +190,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_command_line(frame, rows[1], app);
     }
     if fkey_rows > 0 {
-        fkeybar::draw(frame, rows[2], theme);
+        let (keys, active) = if history_open {
+            (
+                &fkeybar::HISTORY[..],
+                Some(app.history_order.index()),
+            )
+        } else {
+            (&fkeybar::NORMAL[..], None)
+        };
+        fkeybar::draw(frame, rows[2], keys, active, theme);
     }
 
     match app.mode {
@@ -210,6 +222,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 anchor,
                 &crate::utilities::items(),
                 selected,
+                theme,
+            );
+        }
+        crate::app::Mode::History { selected } => {
+            let shown = app.history_rows();
+            app.layout.history = history::draw(
+                frame,
+                area,
+                &shown,
+                &history::State {
+                    filter: &app.history_filter,
+                    order: app.history_order,
+                    selected,
+                    now: dmac_core::history::now(),
+                },
                 theme,
             );
         }

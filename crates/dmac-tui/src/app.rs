@@ -103,6 +103,11 @@ pub(crate) enum Mode {
     Utilities {
         selected: usize,
     },
+    /// The directory history. Which of the three orders is showing lives on
+    /// `App`, not here: it should survive closing and reopening the list.
+    History {
+        selected: usize,
+    },
 }
 
 /// What a prompt is collecting. The value itself lives on `App`, because a
@@ -149,6 +154,8 @@ pub(crate) struct LayoutCache {
     pub menu: Rect,
     /// Interior of the screensaver picker while it is open.
     pub picker: Rect,
+    /// Interior of the directory history's list, while it is open.
+    pub history: Rect,
 }
 
 pub struct App {
@@ -169,6 +176,14 @@ pub struct App {
     dirty_at: Option<std::time::Instant>,
     /// Full screen: the frame stripped off, leaving only contents on black.
     pub(crate) fullscreen: bool,
+    /// What has been typed into the directory history's filter.
+    pub(crate) history_filter: String,
+    /// The last row clicked in the history, and when — a second click on the
+    /// same row is what goes there.
+    last_history_click: Option<(usize, std::time::Instant)>,
+    /// Which reading of the history is showing. On `App` rather than in the
+    /// mode, so choosing one is remembered the next time it is opened.
+    pub(crate) history_order: dmac_core::history::Order,
     /// Bumped on every completion request, so a result for a word the user has
     /// already typed past is dropped instead of rewriting the line.
     completion_gen: u64,
@@ -388,6 +403,9 @@ impl App {
                 .then(|| std::time::Instant::now() + std::time::Duration::from_millis(1800)),
             should_quit: false,
             fullscreen: false,
+            history_filter: String::new(),
+            last_history_click: None,
+            history_order: dmac_core::history::Order::default(),
             completion_gen: 0,
             pending_terminal_write: String::new(),
             last_shell_click: None,
@@ -648,6 +666,8 @@ impl App {
 
             Activate => self.activate(),
             GoParent => self.go_parent(),
+            DirectoryHistory => self.open_history(),
+            HistoryOrder(order) => self.set_history_order(order),
 
             // Tab visits all three stops in order. This costs the strict
             // Tab-alternates-two-panels reflex from Norton Commander; Esc is the
@@ -1732,6 +1752,7 @@ impl App {
             Mode::Rail { selected } => return self.rail_key(k, selected),
             Mode::Prompt { intent } => return self.prompt_key(k, intent),
             Mode::Utilities { selected } => return self.utilities_key(k, selected),
+            Mode::History { selected } => return self.history_key(k, selected),
             Mode::Normal => {}
         }
 
@@ -1771,6 +1792,15 @@ impl App {
                         .intersects(KeyModifiers::SHIFT | KeyModifiers::SUPER) =>
                 {
                     self.handle(Action::UtilitiesMenu);
+                    return;
+                }
+                // Ctrl-Shift-H, never plain Ctrl-H: bare Ctrl-H is backspace to
+                // every program a shell hosts.
+                Some(Action::DirectoryHistory)
+                    if k.modifiers
+                        .intersects(KeyModifiers::SHIFT | KeyModifiers::SUPER) =>
+                {
+                    self.handle(Action::DirectoryHistory);
                     return;
                 }
                 _ => {}
@@ -2287,6 +2317,9 @@ impl App {
         if let Mode::Context { .. } = self.mode {
             return self.mouse_context(m);
         }
+        if let Mode::History { selected } = self.mode {
+            return self.mouse_history(m, selected);
+        }
         let Mode::Picker { selected } = self.mode else {
             return;
         };
@@ -2348,9 +2381,7 @@ impl App {
                 // `join` rejects traversal, so a hostile listing entry named
                 // `../..` cannot walk us out of the tree.
                 if let Some(next) = self.ses().cwd[i].join(&entry.name) {
-                    self.ses_mut().cwd[i] = next;
-                    self.reload(self.ses().active);
-                    self.touch_sessions();
+                    self.go_to(next);
                 } else {
                     self.status = format!("refusing to enter suspicious name: {}", entry.name);
                 }
@@ -2364,9 +2395,203 @@ impl App {
     fn go_parent(&mut self) {
         let i = Self::idx(self.ses().active);
         if let Some(parent) = self.ses().cwd[i].parent() {
-            self.ses_mut().cwd[i] = parent;
-            self.reload(self.ses().active);
-            self.touch_sessions();
+            self.go_to(parent);
+        }
+    }
+
+    /// Take the active panel somewhere, and remember that we went.
+    ///
+    /// Every navigation goes through here. One door means the history cannot
+    /// quietly miss a route into a directory, which is exactly how a history
+    /// ends up with holes nobody can explain.
+    fn go_to(&mut self, path: VfsPath) {
+        let i = Self::idx(self.ses().active);
+        self.ses_mut().cwd[i] = path;
+        self.reload(self.ses().active);
+        self.touch_sessions();
+        self.remember_here();
+    }
+
+    /// Record where the active panel is now.
+    fn remember_here(&mut self) {
+        let i = Self::idx(self.ses().active);
+        let path = self.ses().cwd[i].display();
+        let session = self.ses().id.0;
+        self.sessions
+            .history
+            .record(&path, session, dmac_core::history::now());
+    }
+
+    /// Record where every session already is. Called once, at startup.
+    fn seed_history(&mut self) {
+        let now = dmac_core::history::now();
+        let seen: Vec<(u64, String)> = self
+            .sessions
+            .all()
+            .iter()
+            .flat_map(|s| s.cwd.iter().map(move |p| (s.id.0, p.display())))
+            .collect();
+        for (session, path) in seen {
+            self.sessions.history.record(&path, session, now);
+        }
+    }
+
+    // --- The directory history. ---------------------------------------------
+
+    fn open_history(&mut self) {
+        self.history_filter.clear();
+        self.mode = Mode::History { selected: 0 };
+    }
+
+    fn set_history_order(&mut self, order: dmac_core::history::Order) {
+        self.history_order = order;
+        // Back to the top: the row that was under the cursor means something
+        // different in a differently ordered list, and leaving the highlight
+        // where it was would silently move it to an unrelated directory.
+        self.mode = Mode::History { selected: 0 };
+    }
+
+    /// The rows the history is showing, filtered and ranked.
+    ///
+    /// Recomputed rather than cached: it is a few hundred short strings, and a
+    /// cache would be one more thing that can disagree with what is on screen.
+    pub(crate) fn history_rows(&self) -> Vec<crate::ui::history::Shown> {
+        let session = self.ses().id.0;
+        let rows = self.sessions.history.view(self.history_order, session);
+        let filter = self.history_filter.as_str();
+        let mut scored: Vec<(i32, crate::ui::history::Shown)> = rows
+            .into_iter()
+            .filter_map(|row| {
+                let m = dmac_core::fuzzy::score(filter, &row.path)?;
+                Some((
+                    m.score,
+                    crate::ui::history::Shown {
+                        row,
+                        hit: m.positions,
+                    },
+                ))
+            })
+            .collect();
+        // A filtered list is ranked by how well each row matched; an unfiltered
+        // one keeps the order the user asked for. The sort is stable, so rows
+        // that score the same stay in that order.
+        if !filter.is_empty() {
+            scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+        }
+        scored.into_iter().map(|(_, shown)| shown).collect()
+    }
+
+    /// Driving the history.
+    fn history_key(&mut self, k: KeyEvent, selected: usize) {
+        use dmac_core::history::Order;
+        let rows = self.history_rows();
+        let last = rows.len().saturating_sub(1);
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = k.modifiers.contains(KeyModifiers::ALT);
+
+        match k.code {
+            KeyCode::Esc | KeyCode::F(10) => self.close_history(),
+            // The three orders, on the three keys the bar below says they are on.
+            KeyCode::F(1) => self.set_history_order(Order::Recent),
+            KeyCode::F(2) => self.set_history_order(Order::Frequent),
+            KeyCode::F(3) => self.set_history_order(Order::Session),
+            // ...and one key that reaches all three, for anyone whose terminal
+            // eats function keys.
+            KeyCode::Tab => self.set_history_order(self.history_order.next()),
+
+            KeyCode::Up => self.mode = Mode::History { selected: selected.saturating_sub(1) },
+            KeyCode::Down => self.mode = Mode::History { selected: (selected + 1).min(last) },
+            KeyCode::PageUp => self.mode = Mode::History { selected: selected.saturating_sub(10) },
+            KeyCode::PageDown => {
+                self.mode = Mode::History { selected: (selected + 10).min(last) }
+            }
+            KeyCode::Home => self.mode = Mode::History { selected: 0 },
+            KeyCode::End => self.mode = Mode::History { selected: last },
+
+            KeyCode::Enter => {
+                if let Some(shown) = rows.get(selected) {
+                    let path = VfsPath::local(&shown.row.path);
+                    self.close_history();
+                    self.go_to(path);
+                }
+            }
+
+            // Typing filters. Every printable character, because a directory
+            // name can contain any of them — including the ones that are menu
+            // accelerators everywhere else in this program.
+            KeyCode::Backspace => {
+                self.history_filter.pop();
+                self.mode = Mode::History { selected: 0 };
+            }
+            KeyCode::Char('u') if ctrl => {
+                self.history_filter.clear();
+                self.mode = Mode::History { selected: 0 };
+            }
+            KeyCode::Char(c) if !ctrl && !alt => {
+                self.history_filter.push(c);
+                self.mode = Mode::History { selected: 0 };
+            }
+            _ => {}
+        }
+    }
+
+    fn close_history(&mut self) {
+        self.history_filter.clear();
+        self.mode = Mode::Normal;
+    }
+
+    /// Clicking the history: one click highlights, a second on the same row
+    /// goes there. The same gesture a panel uses, so there is nothing new to
+    /// learn.
+    fn mouse_history(&mut self, m: MouseEvent, selected: usize) {
+        let rows = self.history_rows();
+        let last = rows.len().saturating_sub(1);
+        let area = self.layout.history;
+
+        match m.kind {
+            MouseEventKind::ScrollUp => {
+                self.mode = Mode::History {
+                    selected: selected.saturating_sub(3),
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                self.mode = Mode::History {
+                    selected: (selected + 3).min(last),
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let inside = area.width > 0
+                    && m.column >= area.x
+                    && m.column < area.x + area.width
+                    && m.row >= area.y
+                    && m.row < area.y + area.height;
+                if !inside {
+                    // Clicking outside closes it, as it does for every other
+                    // overlay here.
+                    self.close_history();
+                    return;
+                }
+                let top = crate::ui::history::first_visible(
+                    selected,
+                    rows.len(),
+                    area.height as usize,
+                );
+                let clicked = top + (m.row - area.y) as usize;
+                if clicked > last {
+                    return;
+                }
+                let again = self
+                    .last_history_click
+                    .is_some_and(|(row, at)| row == clicked && at.elapsed() < DOUBLE_CLICK);
+                self.last_history_click = Some((clicked, std::time::Instant::now()));
+                self.mode = Mode::History { selected: clicked };
+                if again && let Some(shown) = rows.get(clicked) {
+                    let path = VfsPath::local(&shown.row.path);
+                    self.close_history();
+                    self.go_to(path);
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -2418,6 +2643,10 @@ pub async fn run(mut start: Startup) -> anyhow::Result<()> {
         app.reload(PanelId::Left);
         app.reload(PanelId::Right);
     }
+    // Where every session already is counts as somewhere we have been. Without
+    // this the history is empty on the first press of Ctrl-H, which reads as a
+    // feature that does not work rather than one with nothing to say yet.
+    app.seed_history();
 
     // Input lives on its own thread doing a blocking read. Cheaper and more
     // portable than an async event stream, and it keeps the loop below free of
@@ -2562,6 +2791,11 @@ mod tests {
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    /// A plain key press, the way the terminal delivers one.
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
 
     /// Build an App without a terminal, with a listing already in place.
     fn fixture() -> App {
@@ -3003,6 +3237,176 @@ mod tests {
     // ---- sessions ----
 
     // Creating a session spawns its directory listing, so this needs a runtime.
+    // --- The directory history. ---------------------------------------------
+
+    /// Navigating is what fills the history. Without this the list is a feature
+    /// with nothing in it.
+    #[tokio::test]
+    async fn walking_around_fills_the_history() {
+        let mut app = fixture();
+        app.seed_history();
+        app.handle(Action::GoParent);
+
+        let paths: Vec<String> = app
+            .sessions
+            .history
+            .visits()
+            .iter()
+            .map(|v| v.path.clone())
+            .collect();
+        assert!(paths.contains(&"/left".to_string()), "where we started");
+        assert!(paths.contains(&"/".to_string()), "and where we went");
+    }
+
+    #[tokio::test]
+    async fn ctrl_h_opens_the_history() {
+        let mut app = fixture();
+        app.handle(Action::DirectoryHistory);
+        assert!(matches!(app.mode, Mode::History { selected: 0 }));
+    }
+
+    /// Typing filters, and the filter is fuzzy: `dt` finds `dmac-tui` without
+    /// the two letters being next to each other.
+    #[tokio::test]
+    async fn typing_filters_the_list() {
+        let mut app = fixture();
+        let now = dmac_core::history::now();
+        for p in ["/home/me/prj/dmac-tui", "/home/me/documents", "/tmp"] {
+            app.sessions.history.record(p, 0, now);
+        }
+        app.handle(Action::DirectoryHistory);
+
+        assert_eq!(app.history_rows().len(), 3, "everything, before filtering");
+
+        for c in "dt".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        let rows = app.history_rows();
+        assert!(
+            rows.iter().any(|r| r.row.path.ends_with("dmac-tui")),
+            "a fuzzy match, not a prefix one"
+        );
+        assert!(
+            !rows.iter().any(|r| r.row.path == "/tmp"),
+            "and it excludes what does not match"
+        );
+
+        app.on_key(key(KeyCode::Backspace));
+        app.on_key(key(KeyCode::Backspace));
+        assert_eq!(app.history_rows().len(), 3, "backspace puts them back");
+    }
+
+    /// The point of the whole thing: choosing a row changes directory.
+    #[tokio::test]
+    async fn enter_goes_to_the_chosen_directory() {
+        let mut app = fixture();
+        app.sessions
+            .history
+            .record("/somewhere/else", 0, dmac_core::history::now());
+        app.handle(Action::DirectoryHistory);
+
+        // The list is newest first and nothing else has been recorded, so the
+        // only row is the one just added.
+        assert_eq!(app.history_rows()[0].row.path, "/somewhere/else");
+        app.on_key(key(KeyCode::Enter));
+
+        assert_eq!(app.ses().cwd[0], VfsPath::local("/somewhere/else"));
+        assert_eq!(app.mode, Mode::Normal, "and the list closes behind you");
+    }
+
+    /// Three readings of the same history, on the three keys the bar advertises.
+    #[tokio::test]
+    async fn the_function_keys_switch_between_the_three_orders() {
+        use dmac_core::history::Order;
+        let mut app = fixture();
+        let now = dmac_core::history::now();
+        // Used often, long ago, by another session.
+        for _ in 0..5 {
+            app.sessions.history.record("/often", 99, now - 10_000);
+        }
+        // Visited once, just now, by this one.
+        app.sessions.history.record("/just-now", app.ses().id.0, now);
+
+        app.handle(Action::DirectoryHistory);
+        app.on_key(key(KeyCode::F(1)));
+        assert_eq!(app.history_order, Order::Recent);
+        assert_eq!(app.history_rows()[0].row.path, "/just-now");
+
+        app.on_key(key(KeyCode::F(2)));
+        assert_eq!(app.history_order, Order::Frequent);
+        assert_eq!(app.history_rows()[0].row.path, "/often");
+
+        app.on_key(key(KeyCode::F(3)));
+        assert_eq!(app.history_order, Order::Session);
+        let mine: Vec<String> = app
+            .history_rows()
+            .into_iter()
+            .map(|r| r.row.path)
+            .collect();
+        assert_eq!(mine, ["/just-now"], "another session's rows are not mine");
+
+        // Tab reaches all three, for terminals that eat function keys.
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.history_order, Order::Recent);
+    }
+
+    /// Changing the order must move the highlight back to the top: the row that
+    /// was under it means something else in a differently ordered list.
+    #[tokio::test]
+    async fn reordering_resets_the_highlight() {
+        let mut app = fixture();
+        let now = dmac_core::history::now();
+        for p in ["/a", "/b", "/c"] {
+            app.sessions.history.record(p, 0, now);
+        }
+        app.handle(Action::DirectoryHistory);
+        app.on_key(key(KeyCode::Down));
+        assert!(matches!(app.mode, Mode::History { selected: 1 }));
+        app.on_key(key(KeyCode::F(2)));
+        assert!(matches!(app.mode, Mode::History { selected: 0 }));
+    }
+
+    #[tokio::test]
+    async fn escape_closes_it_and_forgets_the_filter() {
+        let mut app = fixture();
+        app.handle(Action::DirectoryHistory);
+        app.on_key(key(KeyCode::Char('x')));
+        assert_eq!(app.history_filter, "x");
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.history_filter.is_empty(), "next time starts clean");
+    }
+
+    /// The history draws over whatever was there, and brings its own F-key bar
+    /// — including over a shell, where there normally is none.
+    #[tokio::test]
+    async fn the_history_renders_with_its_own_key_bar() {
+        let mut app = fixture();
+        app.sessions
+            .history
+            .record("/home/me/prj", 0, dmac_core::history::now());
+        app.handle(Action::DirectoryHistory);
+
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        assert!(text.contains("Directories"), "the list is on screen");
+        assert!(text.contains("Recent"), "and so are its own F-keys");
+        assert!(text.contains("MostUsed"));
+        assert!(text.contains("Session"));
+        assert!(
+            !text.contains("MkDir"),
+            "the normal bar is gone: it would be advertising keys the list has taken"
+        );
+    }
+
     /// Backspace is the key everyone reaches for to leave a directory. It only
     /// belongs to the quick search while the search has something to delete.
     // Leaving a directory starts a listing, so this needs a runtime.
