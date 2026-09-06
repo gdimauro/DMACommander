@@ -108,6 +108,32 @@ pub(crate) enum Mode {
     History {
         selected: usize,
     },
+    /// "Pick up where you left off?" — shown at startup when the last run had
+    /// agents going. The list itself is on `App`.
+    Reattach {
+        selected: usize,
+    },
+}
+
+/// An agent the last run was hosting, waiting to be resumed.
+///
+/// Resuming is not automatic. Coming back into a conversation is a thing a
+/// person should agree to: the agent picks up context, may act on it, and costs
+/// money to run. So it is offered, with its name and its arguments in plain
+/// sight, and nothing starts until the answer is yes.
+#[derive(Debug, Clone)]
+pub(crate) struct Pending {
+    /// Index into the session list.
+    pub session: usize,
+    pub session_name: String,
+    /// `claude`, `codex`, whatever it was.
+    pub program: String,
+    /// The command line, already rewritten to resume rather than create.
+    pub command: String,
+    pub conversation: String,
+    /// Unticked rows are left alone: their conversation id is kept, so running
+    /// the agent by hand later still comes back to it.
+    pub chosen: bool,
 }
 
 /// What a prompt is collecting. The value itself lives on `App`, because a
@@ -176,6 +202,8 @@ pub struct App {
     dirty_at: Option<std::time::Instant>,
     /// Full screen: the frame stripped off, leaving only contents on black.
     pub(crate) fullscreen: bool,
+    /// Agents from the last run, waiting for an answer to "resume?".
+    pub(crate) pending: Vec<Pending>,
     /// What has been typed into the directory history's filter.
     pub(crate) history_filter: String,
     /// The last row clicked in the history, and when — a second click on the
@@ -403,6 +431,7 @@ impl App {
                 .then(|| std::time::Instant::now() + std::time::Duration::from_millis(1800)),
             should_quit: false,
             fullscreen: false,
+            pending: Vec::new(),
             history_filter: String::new(),
             last_history_click: None,
             history_order: dmac_core::history::Order::default(),
@@ -1207,7 +1236,14 @@ impl App {
     /// Started after the first frame, never before it: a cold start has 80ms to
     /// show something, and spawning shells inside that budget would spend it on
     /// work the user cannot see yet.
+    /// Collect what the last run was hosting, and ask.
+    ///
+    /// Nothing is started here. Rebuilding and restarting is something this
+    /// program's own author does dozens of times an hour, and each restart
+    /// silently spawning an agent — which reads its history back and may act on
+    /// it — is not a thing to do behind someone's back.
     pub(crate) fn reattach_agents(&mut self) {
+        self.pending.clear();
         for i in 0..self.sessions.len() {
             let Some(saved) = self.sessions.at_mut(i).reattach.take() else {
                 continue;
@@ -1222,33 +1258,92 @@ impl App {
                 .and_then(|w| w.rsplit('/').next())
                 .unwrap_or("agent")
                 .to_string();
+            let session = self.sessions.at_mut(i);
+            self.pending.push(Pending {
+                session: i,
+                session_name: session.name.clone(),
+                program,
+                command,
+                conversation: session.conversation_id().to_string(),
+                chosen: true,
+            });
+        }
+        if !self.pending.is_empty() {
+            self.mode = Mode::Reattach { selected: 0 };
+        }
+    }
+
+    /// Start the agents that were ticked.
+    fn resume_pending(&mut self) {
+        let wanted: Vec<Pending> = self.pending.drain(..).filter(|p| p.chosen).collect();
+        self.mode = Mode::Normal;
+        let mut started = 0;
+        let mut cleared = 0;
+
+        for p in &wanted {
             // Anything still holding this conversation is an orphan from a run
             // that did not get to clean up, and it is holding exactly what we
             // are about to ask for. Left alone it produces "that session is
             // already in use" on a fresh start.
-            let conversation = self.sessions.at_mut(i).conversation_id().to_string();
-            let cleared = dmac_session::agent::clear_orphans(&conversation);
+            cleared += dmac_session::agent::clear_orphans(&p.conversation);
 
             let waker = self.waker();
             let (cols, rows) = self.shell_size();
-            let session = self.sessions.at_mut(i);
+            if p.session >= self.sessions.len() {
+                continue;
+            }
+            let session = self.sessions.at_mut(p.session);
             match session.shell(cols, rows, waker) {
                 Ok(shell) => {
-                    // Just the program name: the shim on PATH turns it into a
-                    // resume of this session's conversation.
-                    if shell.run(&command).is_ok() {
+                    if shell.run(&p.command).is_ok() {
                         // Show the shell: reattaching something and leaving the
                         // user on the panels hides the very thing just started.
                         session.view = dmac_session::View::Shell;
-                        self.status = if cleared > 0 {
-                            format!("{program} reattached — cleared {cleared} left over")
-                        } else {
-                            format!("{program} reattached")
-                        };
+                        started += 1;
                     }
                 }
-                Err(e) => self.status = format!("could not reattach {program}: {e}"),
+                Err(e) => self.status = format!("could not resume {}: {e}", p.program),
             }
+        }
+
+        if started > 0 {
+            self.status = match cleared {
+                0 => format!("resumed {started}"),
+                n => format!("resumed {started} — cleared {n} left over"),
+            };
+        }
+    }
+
+    /// Say no. The conversation ids are kept either way: running the agent by
+    /// hand later still comes back to where it was.
+    fn decline_pending(&mut self) {
+        let n = self.pending.len();
+        self.pending.clear();
+        self.mode = Mode::Normal;
+        if n > 0 {
+            self.status = format!("left {n} conversation(s) alone — run the agent to pick one up");
+        }
+    }
+
+    /// Driving the "resume?" question.
+    fn reattach_key(&mut self, k: KeyEvent, selected: usize) {
+        let last = self.pending.len().saturating_sub(1);
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::F(10) => {
+                self.decline_pending()
+            }
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => self.resume_pending(),
+            KeyCode::Up => self.mode = Mode::Reattach { selected: selected.saturating_sub(1) },
+            KeyCode::Down => self.mode = Mode::Reattach { selected: (selected + 1).min(last) },
+            // Space unticks one without answering for the rest: on a restart
+            // with several sessions going, the answer is often "that one, not
+            // the other three".
+            KeyCode::Char(' ') => {
+                if let Some(p) = self.pending.get_mut(selected) {
+                    p.chosen = !p.chosen;
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1753,6 +1848,7 @@ impl App {
             Mode::Prompt { intent } => return self.prompt_key(k, intent),
             Mode::Utilities { selected } => return self.utilities_key(k, selected),
             Mode::History { selected } => return self.history_key(k, selected),
+            Mode::Reattach { selected } => return self.reattach_key(k, selected),
             Mode::Normal => {}
         }
 
@@ -3237,6 +3333,121 @@ mod tests {
     // ---- sessions ----
 
     // Creating a session spawns its directory listing, so this needs a runtime.
+    // --- Resuming an agent, on purpose. -------------------------------------
+
+    /// The whole point: a restart offers, it does not start. Rebuilding and
+    /// relaunching happens dozens of times an hour, and each one silently
+    /// spawning an agent is not a thing to do behind someone's back.
+    #[tokio::test]
+    async fn a_restart_asks_before_resuming_anything() {
+        let mut app = fixture();
+        app.sessions.current_mut().reattach = Some("claude --model opus".into());
+
+        app.reattach_agents();
+
+        assert!(matches!(app.mode, Mode::Reattach { selected: 0 }));
+        assert_eq!(app.pending.len(), 1);
+        assert_eq!(app.pending[0].program, "claude");
+        assert!(
+            app.ses().hosted().is_none(),
+            "nothing may be running before the answer"
+        );
+    }
+
+    /// The saved line named the conversation it *created*; replaying it
+    /// verbatim would ask for one that already exists, which is exactly the
+    /// "session id is already in use" everyone hits.
+    #[tokio::test]
+    async fn the_offer_is_a_resume_not_a_second_creation() {
+        let mut app = fixture();
+        let id = app.sessions.current_mut().conversation_id().to_string();
+        app.sessions.current_mut().reattach = Some(format!("claude --session-id {id} --verbose"));
+
+        app.reattach_agents();
+
+        let command = &app.pending[0].command;
+        assert!(command.contains("--resume"), "{command}");
+        assert!(!command.contains("--session-id"), "{command}");
+        assert!(command.contains("--verbose"), "the rest is kept: {command}");
+    }
+
+    /// Saying no starts nothing and loses nothing: the conversation id stays on
+    /// the session, so running the agent by hand still comes back to it.
+    #[tokio::test]
+    async fn saying_no_keeps_the_conversation_for_later() {
+        let mut app = fixture();
+        let id = app.sessions.current_mut().conversation_id().to_string();
+        app.sessions.current_mut().reattach = Some("claude".into());
+        app.reattach_agents();
+
+        app.on_key(key(KeyCode::Char('n')));
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.pending.is_empty());
+        assert!(app.ses().hosted().is_none(), "nothing started");
+        assert_eq!(
+            app.sessions.current_mut().conversation_id(),
+            id,
+            "the conversation is still ours to come back to"
+        );
+    }
+
+    /// Space unticks one row without answering for the others: on a restart
+    /// with several going, the answer is often "that one, not the rest".
+    #[tokio::test]
+    async fn rows_can_be_picked_one_by_one() {
+        let mut app = fixture();
+        app.sessions.current_mut().reattach = Some("claude".into());
+        app.handle(Action::NewSession);
+        app.sessions.at_mut(1).reattach = Some("claude".into());
+        app.reattach_agents();
+        assert_eq!(app.pending.len(), 2);
+        assert!(app.pending.iter().all(|p| p.chosen), "ticked by default");
+
+        app.on_key(key(KeyCode::Char(' ')));
+        assert!(!app.pending[0].chosen);
+        assert!(app.pending[1].chosen, "and only that one");
+
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char(' ')));
+        assert!(!app.pending[1].chosen);
+
+        // With nothing ticked, yes starts nothing at all.
+        app.on_key(key(KeyCode::Char('y')));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.ses().hosted().is_none());
+    }
+
+    /// A run with no agents must not put a dialog in the way of a cold start.
+    #[tokio::test]
+    async fn nothing_to_resume_asks_nothing() {
+        let mut app = fixture();
+        app.reattach_agents();
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_question_says_what_it_would_run() {
+        let mut app = fixture();
+        app.sessions.current_mut().reattach = Some("claude --model opus".into());
+        app.reattach_agents();
+
+        let mut term = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        assert!(text.contains("Resume?"));
+        assert!(text.contains("--model opus"), "the arguments are shown");
+        assert!(text.contains("y resume"), "and how to answer");
+    }
+
     // --- The directory history. ---------------------------------------------
 
     /// Navigating is what fills the history. Without this the list is a feature

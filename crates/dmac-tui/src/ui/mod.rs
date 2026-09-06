@@ -9,6 +9,7 @@ mod panel;
 pub(crate) mod picker;
 pub(crate) mod prompt;
 pub(crate) mod rail;
+pub(crate) mod reattach;
 mod screen;
 pub(crate) mod shell;
 mod splash;
@@ -239,6 +240,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 },
                 theme,
             );
+        }
+        crate::app::Mode::Reattach { selected } => {
+            reattach::draw(frame, area, &app.pending, selected, theme);
         }
         crate::app::Mode::Rail { .. } | crate::app::Mode::Normal => {
             app.layout.picker = ratatui::layout::Rect::default();
