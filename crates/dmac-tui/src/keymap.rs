@@ -173,11 +173,13 @@ pub fn resolve(key: KeyEvent, focus: Focus) -> Option<Action> {
         // from inside a hosted shell, where a bare Ctrl-H belongs to the child.
         // Hidden files move to Alt-H and Alt-period, which is where `mc` has
         // always kept them.
-        (Char(c), true, false) if shift && c.eq_ignore_ascii_case(&'h') => Action::DirectoryHistory,
-        // Ctrl-Shift-H, and Cmd-Shift-H where the Command key is forwarded.
-        // Plain Ctrl-H is kept but is not the binding to rely on: it is byte
-        // 0x08, which every terminal also sends for Backspace, so only ones
-        // that encode modifiers separately can tell the two apart at all.
+        //
+        // Ctrl-Shift-H, and Cmd-H or Cmd-Shift-H where the Command key is
+        // forwarded rather than kept by the terminal. None of these is the
+        // binding to rely on everywhere: plain Ctrl-H is byte 0x08, which is
+        // also Backspace, so only a terminal that reports modifiers separately
+        // can tell them apart — and Apple's Terminal cannot. Where they cannot
+        // arrive, `Ctrl-O h` and F12 do the same job; see `App::on_key`.
         (Char(c), true, false) if shift && c.eq_ignore_ascii_case(&'h') => Action::DirectoryHistory,
         (Char(c), _, _)
             if key.modifiers.contains(KeyModifiers::SUPER) && c.eq_ignore_ascii_case(&'h') =>

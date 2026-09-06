@@ -44,6 +44,9 @@ agent that owns each one, with the rules it works under.
 - **[docs/PLAN.md](docs/PLAN.md)** — phases, acceptance gates, risks. Start here.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the shape and the dependency choices.
 - [docs/ROADMAP.md](docs/ROADMAP.md) — the item list.
+- [docs/TERMINAL-KEYS.md](docs/TERMINAL-KEYS.md) — which keys your terminal can
+  actually send, and what to press when it cannot send them.
+- [docs/MCP.md](docs/MCP.md) — the commander as a tool an agent can call.
 - [docs/adr/](docs/adr/) — why the non-obvious decisions were made.
 
 ## Licence

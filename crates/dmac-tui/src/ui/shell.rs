@@ -156,7 +156,13 @@ pub fn draw(frame: &mut Frame, area: Rect, shell: &Hosted, c: &Chrome, theme: &T
     let block = if bordered {
         block
             .title(Span::styled(title, theme.border(focused)))
-            .title_bottom(Span::styled(" Ctrl-O panels ", theme.border(false)))
+            // The F-key bar is gone in this view, so this line is the only
+            // documentation of the keys that still reach the commander from
+            // inside a hosted program. It has to name all of them.
+            .title_bottom(Span::styled(
+                " Ctrl-O panels · F9 utilities · F12 history ",
+                theme.border(false),
+            ))
     } else {
         block
     };

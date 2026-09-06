@@ -209,6 +209,14 @@ pub struct App {
     /// Whether the session rail is expanded. Collapsed it is a narrow strip, so
     /// you can always see how many sessions you have without opening anything.
     pub(crate) rail_open: bool,
+    /// Set for exactly one keypress after Ctrl-O has brought you out of a
+    /// shell, so `Ctrl-O h` reaches the history and `Ctrl-O u` the utilities.
+    ///
+    /// The escape hatch for terminals that cannot encode Ctrl with Shift —
+    /// Apple's Terminal among them, where Ctrl-Shift-H is byte `0x08`, exactly
+    /// what Ctrl-H and Backspace send. Ctrl-O is already reserved and no shell
+    /// wants it, so a chord built on it needs no modifier support at all.
+    chord: bool,
     /// Text being typed into the current prompt.
     pub(crate) prompt_value: String,
     /// Where sessions are written. `None` disables persistence entirely, which
@@ -432,6 +440,7 @@ impl App {
         Self {
             sessions: SessionManager::new(session_name, left, right),
             rail_open: false,
+            chord: false,
             prompt_value: String::new(),
             store,
             dirty_at: None,
@@ -957,7 +966,11 @@ impl App {
 
             // Everything below is claimed by the keymap but owned by an agent
             // that has not built it yet. Say so out loud rather than doing nothing.
-            Help => self.status = "F1 help — not implemented yet".into(),
+            // Until there is a help window, say the one thing people are
+            // most often stuck on: which keys their terminal can send.
+            Help => {
+                self.status = "F1 help — not implemented yet · keys: docs/TERMINAL-KEYS.md".into();
+            }
             UserMenu => self.status = "F2 user menu — not implemented yet".into(),
             View => self.status = "F3 viewer — dmac-view, not implemented yet".into(),
             Edit => self.status = "F4 editor — dmac-view, not implemented yet".into(),
@@ -1730,6 +1743,10 @@ impl App {
         if self.ses().view == View::Shell {
             self.ses_mut().view = View::Panels;
             self.status.clear();
+            // Only on the way out, and only for the next key: coming *into* a
+            // shell there is nothing to escape from, and a chord that stayed
+            // armed would eat the first letter of a quick search.
+            self.chord = true;
             return;
         }
         let (cols, rows) = self.shell_size();
@@ -1742,6 +1759,9 @@ impl App {
                 // is never typed into behind your back.
                 self.ses_mut().follow_panel_cwd();
                 self.ses_mut().view = View::Shell;
+                // The keys that still reach the commander are named on the
+                // shell's own bottom border, which is always there; a status
+                // line saying the same thing would only compete with it.
                 self.status.clear();
             }
             // A shell that will not start must say why. A blank pane the user
@@ -2016,6 +2036,25 @@ impl App {
         // how the screen is drawn — a display mode that stopped working in one
         // view would be a worse surprise than a hosted program losing F11.
         if self.ses().view == View::Shell {
+            // F9 and F12 reach the commander from inside a shell, where every
+            // other F-key goes to the child. In the panels they keep their
+            // canon meanings — F9 the menu, F12 the screensavers — and this is
+            // the only place the two differ. It is also the only place where a
+            // terminal that cannot encode Ctrl with Shift has no other way in:
+            // Apple's Terminal sends Ctrl-Shift-H as byte 0x08, which is what
+            // Ctrl-H and Backspace send, so nothing can tell them apart. The
+            // cost is that a hosted program never sees these two keys.
+            match k.code {
+                KeyCode::F(9) => {
+                    self.handle(Action::UtilitiesMenu);
+                    return;
+                }
+                KeyCode::F(12) => {
+                    self.handle(Action::DirectoryHistory);
+                    return;
+                }
+                _ => {}
+            }
             match keymap::resolve(k, self.ses().focus) {
                 Some(Action::ToggleShell) => {
                     self.toggle_shell();
@@ -2061,6 +2100,32 @@ impl App {
             }
             self.send_to_shell(k);
             return;
+        }
+
+        // Exactly one key after Ctrl-O has brought us out of a shell. Anything
+        // not in the chord falls through and is handled normally, so this costs
+        // nothing but two letters, and only in the instant after leaving a
+        // shell — where a quick search is the least likely thing to be starting.
+        if std::mem::take(&mut self.chord) {
+            match k.code {
+                KeyCode::Char(c) if c.eq_ignore_ascii_case(&'h') => {
+                    self.handle(Action::DirectoryHistory);
+                    return;
+                }
+                KeyCode::Char(c) if c.eq_ignore_ascii_case(&'u') => {
+                    self.handle(Action::UtilitiesMenu);
+                    return;
+                }
+                KeyCode::Tab => {
+                    self.handle(Action::CycleSession(1));
+                    return;
+                }
+                KeyCode::BackTab => {
+                    self.handle(Action::CycleSession(-1));
+                    return;
+                }
+                _ => {}
+            }
         }
 
         if let Some(action) = keymap::resolve(k, self.ses().focus) {
@@ -4306,6 +4371,97 @@ mod tests {
 
     /// A hosted CLI you cannot see the cursor of is a CLI you cannot tell is
     /// waiting for you. The style is re-asserted every frame that shows one, so
+    /// Apple's Terminal sends Ctrl-Shift-H as byte `0x08` — exactly what Ctrl-H
+    /// and Backspace send — so from inside a shell, where `0x08` belongs to the
+    /// child, the history had no way of being reached at all. These two are the
+    /// way in for terminals that cannot report a modifier they were never told
+    /// about.
+    #[cfg(unix)]
+    #[test]
+    fn the_history_is_reachable_from_a_shell_without_modifier_support() {
+        let mut app = fixture();
+        app.handle(Action::ToggleShell);
+        assert_eq!(app.ses().view, View::Shell);
+
+        app.on_key(key(KeyCode::F(12)));
+        assert!(
+            matches!(app.mode, Mode::History { .. }),
+            "F12 did not open the history from inside a shell"
+        );
+        app.mode = Mode::Normal;
+
+        app.on_key(key(KeyCode::F(9)));
+        assert!(
+            matches!(app.mode, Mode::Utilities { .. }),
+            "F9 did not open the utilities from inside a shell"
+        );
+    }
+
+    /// Ctrl-O, then one letter. Ctrl-O is already reserved and no shell wants
+    /// it, so a chord built on it needs no modifier support whatsoever.
+    #[cfg(unix)]
+    #[test]
+    fn ctrl_o_then_a_letter_reaches_the_history_and_the_utilities() {
+        for (letter, opens_history) in [('h', true), ('u', false)] {
+            let mut app = fixture();
+            app.handle(Action::ToggleShell);
+            assert_eq!(app.ses().view, View::Shell);
+
+            app.handle(Action::ToggleShell); // Ctrl-O, back to the panels
+            assert_eq!(app.ses().view, View::Panels);
+            app.on_key(key(KeyCode::Char(letter)));
+
+            if opens_history {
+                assert!(
+                    matches!(app.mode, Mode::History { .. }),
+                    "Ctrl-O h did not open the history"
+                );
+            } else {
+                assert!(
+                    matches!(app.mode, Mode::Utilities { .. }),
+                    "Ctrl-O u did not open the utilities"
+                );
+            }
+        }
+    }
+
+    /// The chord lasts one key and claims only the letters it names. Everything
+    /// else has to behave exactly as though it had never been armed, or leaving
+    /// a shell would quietly swallow the start of a quick search.
+    #[cfg(unix)]
+    #[test]
+    fn the_chord_lasts_one_key_and_lets_everything_else_through() {
+        let mut app = fixture();
+        app.handle(Action::ToggleShell);
+        app.handle(Action::ToggleShell);
+        assert!(app.chord, "leaving a shell arms the chord");
+
+        app.on_key(key(KeyCode::Char('c')));
+        assert!(!app.chord, "the chord did not disarm after one key");
+        assert!(
+            matches!(app.mode, Mode::Normal),
+            "an unrelated letter must not open anything"
+        );
+
+        // And a second `h`, with nothing armed, is an ordinary keypress again.
+        app.on_key(key(KeyCode::Char('h')));
+        assert!(
+            matches!(app.mode, Mode::Normal),
+            "the chord fired without Ctrl-O having been pressed"
+        );
+    }
+
+    /// Coming *into* a shell there is nothing to escape from, and an armed
+    /// chord would eat the first letter typed at the prompt.
+    #[cfg(unix)]
+    #[test]
+    fn entering_a_shell_arms_nothing() {
+        let mut app = fixture();
+        app.handle(Action::ToggleShell);
+        assert_eq!(app.ses().view, View::Shell);
+        assert!(!app.chord, "entering a shell must not arm the chord");
+    }
+
     /// this predicate is also what makes it blink.
     #[cfg(unix)]
     #[test]
