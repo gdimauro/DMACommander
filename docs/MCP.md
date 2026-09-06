@@ -34,8 +34,13 @@ Nothing on `PATH` is touched, so this is something you ask for — one line, in 
 shell DMACommander is hosting:
 
 ```sh
-claude --mcp-config "$DMAC_MCP_CONFIG" --session-id "$DMAC_CONVERSATION"
+claude --session-id "$DMAC_CONVERSATION" --mcp-config "$DMAC_MCP_CONFIG"
 ```
+
+`--mcp-config` last, and not as a matter of taste: it takes *several* values, so
+it swallows every following word that does not begin with a dash. Put it earlier
+and a plain argument — a directory, a prompt — is read as another configuration
+file, and the agent refuses to start over a path nobody wrote.
 
 That is exactly what the utilities menu types for you (`F9`, then `c`) — with
 `--resume` in place of `--session-id` once that conversation exists, so closing

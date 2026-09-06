@@ -240,12 +240,16 @@ const CONVERSATION_VAR: &str = "DMAC_CONVERSATION";
 /// where it can be seen and corrected before Enter.
 ///
 /// `theirs` is whatever the user chose themselves — a model, a permission mode,
-/// a directory — kept and put last, so it is the part that reads like theirs.
+/// a directory — kept, and put where it reads first.
+///
+/// `--mcp-config` goes **last**, and that is not a matter of taste: it takes
+/// *several* values, space-separated, so it swallows every following word that
+/// does not begin with a dash. With it earlier, a plain argument of theirs — a
+/// directory, a prompt — would be read as another configuration file, and the
+/// agent would refuse to start over a path nobody wrote. At the end of the line
+/// there is nothing left for it to take.
 pub fn start_command(session_id: &str, conversation: &str, theirs: &str) -> String {
     let mut line = attached_program().to_string();
-    if mcp_config(session_id).is_some() {
-        line.push_str(&format!(" --mcp-config \"${MCP_CONFIG_VAR}\""));
-    }
     if !conversation.is_empty() {
         line.push_str(&format!(
             " {} \"${CONVERSATION_VAR}\"",
@@ -256,6 +260,9 @@ pub fn start_command(session_id: &str, conversation: &str, theirs: &str) -> Stri
     if !theirs.is_empty() {
         line.push(' ');
         line.push_str(theirs);
+    }
+    if mcp_config(session_id).is_some() {
+        line.push_str(&format!(" --mcp-config \"${MCP_CONFIG_VAR}\""));
     }
     line
 }
@@ -432,6 +439,25 @@ mod tests {
         let line = start_command("3", "11111111-2222-3333-4444-555555555555", "");
         for c in ['{', '}', '\''] {
             assert!(!line.contains(c), "{c:?} in the typed line: {line}");
+        }
+    }
+
+    /// `--mcp-config` takes several values, so it eats every following word that
+    /// does not start with a dash. A plain argument of the user's after it — a
+    /// directory, a prompt — is read as another configuration file, and the
+    /// agent refuses to start over a path nobody wrote. It has to be last.
+    #[test]
+    fn nothing_follows_the_configuration_that_it_could_swallow() {
+        for theirs in ["", "--model opus", "/some/directory", "--verbose /a/dir"] {
+            let line = start_command("3", "ffffffff-0000-4000-8000-000000000000", theirs);
+            let Some(at) = line.find("--mcp-config") else {
+                continue;
+            };
+            let after: Vec<&str> = line[at..].split_whitespace().skip(2).collect();
+            assert!(
+                after.is_empty(),
+                "{after:?} would be read as more configuration files: {line}"
+            );
         }
     }
 

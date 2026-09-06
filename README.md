@@ -41,7 +41,7 @@ running inside. `F9` then `c` starts `claude` already connected to it — by
 typing the line at the shell, where you can read it before it runs:
 
 ```sh
-claude --mcp-config "$DMAC_MCP_CONFIG" --session-id "$DMAC_CONVERSATION"
+claude --session-id "$DMAC_CONVERSATION" --mcp-config "$DMAC_MCP_CONFIG"
 ```
 
 It rejoins the same conversation every time rather than starting a fresh one —
