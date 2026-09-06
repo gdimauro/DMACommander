@@ -94,6 +94,17 @@ pub struct Startup {
     /// Sessions already read back from the store, and whether the last run
     /// exited cleanly.
     pub restored: Option<(SessionManager, bool)>,
+    /// Rail widths asked for on the command line, overriding what was saved.
+    pub rail: RailOverride,
+}
+
+/// Rail widths given on the command line. `None` keeps whatever was saved,
+/// which is what almost every run wants: a width the user dragged into place is
+/// theirs, and a flag that silently reset it every morning would be a bug.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RailOverride {
+    pub collapsed: Option<u16>,
+    pub expanded: Option<u16>,
 }
 
 /// Which overlay, if any, owns the keyboard.
@@ -171,6 +182,17 @@ impl PromptIntent {
     }
 }
 
+/// One movement of the keyboard caret over the hosted shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// Signed, so one enum arm covers up, down and both page keys.
+    Rows(i32),
+    Left,
+    Right,
+    LineStart,
+    LineEnd,
+}
+
 /// A left-button drag in progress: the row it started on, so the swept range is
 /// recomputed from scratch on every move rather than accumulated — a fast drag
 /// skips rows, and accumulating would leave holes in the selection.
@@ -192,6 +214,9 @@ pub(crate) struct LayoutCache {
     pub command: Rect,
     /// Interior of the session rail.
     pub rail: Rect,
+    /// The rail including its border. The last column of it is the grip the
+    /// pointer drags to resize, and the interior deliberately excludes it.
+    pub rail_outer: Rect,
     /// Interior of the shell view while it is showing.
     pub shell: Rect,
     /// Interior of the context menu while it is open.
@@ -213,6 +238,10 @@ pub struct App {
     /// Whether the session rail is expanded. Collapsed it is a narrow strip, so
     /// you can always see how many sessions you have without opening anything.
     pub(crate) rail_open: bool,
+    /// Whether the left button went down on the rail's grip, and whether it has
+    /// moved since. A press that never moves is a click on the session under
+    /// it, so the last column is not a dead strip.
+    rail_grip: Option<bool>,
     /// Set for exactly one keypress after Ctrl-O has brought you out of a
     /// shell, so `Ctrl-O h` reaches the history and `Ctrl-O u` the utilities.
     ///
@@ -268,6 +297,11 @@ pub struct App {
     pub(crate) command_selection: Option<(usize, usize)>,
     /// Text selected in the hosted shell, if any.
     pub(crate) shell_selection: Option<crate::ui::shell::Selection>,
+    /// Where the keyboard is selecting from over that shell, in the same
+    /// visible coordinates as the selection. `None` whenever nothing is being
+    /// selected by hand, which is also what makes the child's own cursor the
+    /// one on screen the rest of the time.
+    pub(crate) shell_caret: Option<crate::ui::shell::Cell>,
     /// Whether the left button is still down on that selection. A drag in
     /// progress is protected from the repaint that would otherwise drop it.
     selecting: bool,
@@ -437,13 +471,16 @@ impl App {
             splash,
             cursor,
             store,
-            // Handled by `run`, which needs the terminal up before it can list
-            // the restored sessions.
+            // Both handled by `run`, which needs the terminal up before it can
+            // list the restored sessions and has to apply the overrides after
+            // the saved widths have been read back.
             restored: _,
+            rail: _,
         } = start;
         Self {
             sessions: SessionManager::new(session_name, left, right),
             rail_open: false,
+            rail_grip: None,
             chord: false,
             prompt_value: String::new(),
             store,
@@ -476,6 +513,7 @@ impl App {
             last_shell_click: None,
             command_selection: None,
             shell_selection: None,
+            shell_caret: None,
             selecting: false,
             last_shell_frame: std::time::Instant::now(),
             tx,
@@ -1035,6 +1073,54 @@ impl App {
             .shutdown(std::time::Duration::from_millis(400));
     }
 
+    /// Switch to whichever session the pointer is over in the rail.
+    fn pick_rail_session(&mut self, row: u16) {
+        let rail = self.layout.rail;
+        let detail = crate::ui::rail::detailed(self.layout.rail_outer.width);
+        if let Some(i) = crate::ui::rail::session_at_row(&self.sessions, rail, detail, row)
+            && self.sessions.switch_to(i)
+        {
+            self.after_session_switch();
+        }
+    }
+
+    /// Set the width of whichever rail is on screen — the resting strip or the
+    /// opened list. They are remembered separately: they answer different
+    /// questions, and one width would make one of them wrong.
+    fn set_rail_width(&mut self, want: u16) {
+        let most = crate::ui::rail::max_width(self.layout.screen.width);
+        let want = want.min(most);
+        let rail = &mut self.sessions.rail;
+        let before = *rail;
+        if self.rail_open {
+            rail.expanded = want.max(1);
+        } else {
+            // Zero is allowed at rest, and means it: someone who wants the
+            // columns back can have them, and Ctrl-T still opens the list.
+            rail.collapsed = want;
+        }
+        if self.sessions.rail != before {
+            self.touch_sessions();
+        }
+    }
+
+    /// Widen or narrow the rail by `by` columns.
+    fn resize_rail(&mut self, by: i16) {
+        let now = if self.rail_open {
+            self.sessions.rail.expanded
+        } else {
+            self.sessions.rail.collapsed
+        };
+        let want = i32::from(now) + i32::from(by);
+        self.set_rail_width(u16::try_from(want.max(0)).unwrap_or(u16::MAX));
+        let now = if self.rail_open {
+            self.sessions.rail.expanded
+        } else {
+            self.sessions.rail.collapsed
+        };
+        self.status = format!("rail {now} columns \u{2014} \u{2190}/\u{2192} to resize");
+    }
+
     fn close_rail(&mut self) {
         self.rail_open = false;
         if matches!(self.mode, Mode::Rail { .. }) {
@@ -1064,6 +1150,11 @@ impl App {
                 }
                 self.close_rail();
             }
+            // Nothing to the left or right of a one-column list, so the
+            // horizontal arrows resize it. `-` and `+` do the same, for
+            // terminals that eat modified arrows.
+            KeyCode::Left | KeyCode::Char('-') => self.resize_rail(-1),
+            KeyCode::Right | KeyCode::Char('+' | '=') => self.resize_rail(1),
             KeyCode::Char('n') => self.open_prompt(PromptIntent::NewSession, String::new()),
             KeyCode::Char('r') => {
                 let current = self
@@ -1273,14 +1364,22 @@ impl App {
         if self.ses().view != View::Shell || self.last_shell_frame.elapsed() < SHELL_FRAME_FLOOR {
             return;
         }
-        // The screen is about to change under the selection, and the selection
-        // is in screen coordinates: keeping it would highlight whatever landed
-        // in those cells. A drag in progress is the user's, and is left alone.
+        // The screen is about to change under the selection, which is held in
+        // visible coordinates. At the live bottom the text scrolls out from
+        // under it, so it goes: keeping it would highlight whatever landed in
+        // those cells. Scrolled back, `vt100` holds the visible rows still and
+        // the highlight stays on its own characters, so there is nothing to do
+        // — which is the whole reason reading back is worth having. A drag in
+        // progress is the user's, and is left alone either way.
         if !self.selecting
             && self.shell_selection.is_some()
-            && self.ses().hosted().is_some_and(|s| s.dirty())
+            && self
+                .ses()
+                .hosted()
+                .is_some_and(|s| s.dirty() && s.scroll_offset() == 0)
         {
             self.shell_selection = None;
+            self.shell_caret = None;
         }
         self.last_shell_frame = std::time::Instant::now();
         if let Some(s) = self.ses().hosted() {
@@ -1535,10 +1634,19 @@ impl App {
             return;
         }
         let (cols, rows) = self.shell_size();
+        let reflowed = self
+            .ses()
+            .hosted()
+            .is_some_and(|sh| sh.size() != (cols, rows));
         if let Some(sh) = self.ses_mut().shell.as_mut() {
             // `resize` is a no-op when the size already matches, so this costs
             // nothing on the overwhelming majority of frames.
             let _ = sh.resize(cols, rows);
+        }
+        // A resize rewraps every line, so a selection and a scroll position
+        // expressed in rows no longer point at what they were put on.
+        if reflowed {
+            self.shell_to_live();
         }
     }
 
@@ -1616,18 +1724,29 @@ impl App {
             return;
         }
         let n = text.chars().count();
-        match dmac_core::clipboard::set_text(&text) {
-            Ok(()) => self.status = format!("copied {n} characters"),
-            // No local clipboard: ask the terminal for its own. Over SSH this
-            // is not a fallback but the only correct answer — the system
-            // clipboard here belongs to the wrong machine, and the terminal at
-            // the far end is the one the user is looking at.
-            Err(e) => match dmac_core::clipboard::osc52(&text) {
+        match self.copy_out(&text) {
+            Ok(how) => self.status = format!("copied {n} characters{how}"),
+            Err(e) => self.status = format!("could not copy: {e}"),
+        }
+    }
+
+    /// Put `text` on the clipboard by whichever route this terminal has, and
+    /// say which one it was.
+    ///
+    /// The local clipboard first. When there is none — a bare Linux box, or
+    /// anywhere over SSH — ask the terminal for its own: over SSH that is not a
+    /// fallback but the only correct answer, because the system clipboard on
+    /// this side belongs to the wrong machine and the terminal at the far end
+    /// is the one the user is looking at.
+    fn copy_out(&mut self, text: &str) -> Result<&'static str, String> {
+        match dmac_core::clipboard::set_text(text) {
+            Ok(()) => Ok(""),
+            Err(e) => match dmac_core::clipboard::osc52(text) {
                 Some(seq) => {
                     self.pending_terminal_write.push_str(&seq);
-                    self.status = format!("copied {n} characters via the terminal");
+                    Ok(" via the terminal")
                 }
-                None => self.status = format!("could not copy: {e}"),
+                None => Err(e.to_string()),
             },
         }
     }
@@ -1676,22 +1795,34 @@ impl App {
             return;
         }
 
+        let n = text.chars().count();
+        match self.write_to_child(&text) {
+            Ok(true) => self.status = format!("pasted {n} characters"),
+            Ok(false) => self.status = format!("pasted {n} characters — press Enter to run"),
+            Err(e) => self.status = format!("paste: {e}"),
+        }
+    }
+
+    /// Hand `text` to the hosted child as if it had been pasted into it, and
+    /// say whether the child took it bracketed.
+    ///
+    /// Bracketed paste tells the shell "this is text, not typing", so a pasted
+    /// newline lands as a newline instead of running the line. When the shell
+    /// has not asked for it there is no way to say that, so the trailing
+    /// newline is dropped: the command arrives ready to run and the user still
+    /// has to press Enter. Pasting something that executes itself is the one
+    /// outcome worth engineering against.
+    fn write_to_child(&mut self, text: &str) -> Result<bool, String> {
         let bracketed = self
             .ses()
             .hosted()
             .and_then(|sh| sh.with_screen(|s| s.bracketed_paste()))
             .unwrap_or(false);
 
-        // Bracketed paste tells the shell "this is text, not typing", so a
-        // pasted newline lands as a newline instead of running the line. When
-        // the shell has not asked for it there is no way to say that, so the
-        // trailing newline is dropped: the command arrives ready to run and the
-        // user still has to press Enter. Pasting something that executes itself
-        // is the one outcome worth engineering against.
         let mut payload = String::new();
         if bracketed {
             payload.push_str("\x1b[200~");
-            payload.push_str(&text);
+            payload.push_str(text);
             payload.push_str("\x1b[201~");
         } else {
             payload.push_str(text.trim_end_matches(['\n', '\r']));
@@ -1699,20 +1830,12 @@ impl App {
 
         let waker = self.waker();
         let (cols, rows) = self.shell_size();
-        match self.ses_mut().shell(cols, rows, waker) {
-            Ok(sh) => match sh.write(payload.as_bytes()) {
-                Ok(()) => {
-                    let n = text.chars().count();
-                    self.status = if bracketed {
-                        format!("pasted {n} characters")
-                    } else {
-                        format!("pasted {n} characters — press Enter to run")
-                    };
-                }
-                Err(e) => self.status = format!("paste: {e}"),
-            },
-            Err(e) => self.status = format!("paste: {e}"),
-        }
+        let sh = self
+            .ses_mut()
+            .shell(cols, rows, waker)
+            .map_err(|e| e.to_string())?;
+        sh.write(payload.as_bytes()).map_err(|e| e.to_string())?;
+        Ok(bracketed)
     }
 
     /// Escape sequences owed to the real terminal, taken for writing.
@@ -2041,6 +2164,13 @@ impl App {
         // how the screen is drawn — a display mode that stopped working in one
         // view would be a worse surprise than a hosted program losing F11.
         if self.ses().view == View::Shell {
+            // Reading back through what the shell has printed, and selecting
+            // it, comes first: these are Shift and Ctrl-Shift combinations that
+            // no shell wants, and that the keymap would otherwise resolve to
+            // panel actions with no panel on screen to act on.
+            if self.shell_scrollback_key(k) {
+                return;
+            }
             // F9 and F12 reach the commander from inside a shell, where every
             // other F-key goes to the child. In the panels they keep their
             // canon meanings — F9 the menu, F12 the screensavers — and this is
@@ -2210,8 +2340,8 @@ impl App {
             selected_paths: paths,
         };
 
-        match crate::utilities::run(u, &cx) {
-            Outcome::Insert(text) => {
+        let text = match crate::utilities::run(u, &cx) {
+            Outcome::Insert(text) if self.ses().view != View::Shell => {
                 let line = &mut self.ses_mut().command_line;
                 // A separating space, but only where one is wanted: after
                 // `cd ` there is already one, and at the start there is nothing
@@ -2220,23 +2350,58 @@ impl App {
                     line.push(' ');
                 }
                 line.push_str(&text);
-                self.after_utility(u);
+                text
             }
-            Outcome::Replace(text) => {
-                self.ses_mut().command_line = text;
-                self.after_utility(u);
+            Outcome::Replace(text) if self.ses().view != View::Shell => {
+                self.ses_mut().command_line = text.clone();
+                text
+            }
+            // In the shell view the command line is not even drawn, so putting
+            // the answer there is putting it nowhere: the user asked for a
+            // uuid while talking to an agent and had to go and find it in the
+            // commander afterwards. Type it in front of them instead — where
+            // the cursor is, in whatever the shell is running.
+            Outcome::Insert(text) | Outcome::Replace(text) => {
+                if let Err(e) = self.write_to_child(&text) {
+                    self.mode = Mode::Normal;
+                    self.status = format!("{}: {e}", u.label());
+                    return;
+                }
+                text
             }
             // Left open on purpose: the menu is still there to pick something
             // else, which is what you want when you picked the wrong entry.
-            Outcome::Nothing(why) => self.status = why.to_string(),
-        }
+            Outcome::Nothing(why) => {
+                self.status = why.to_string();
+                return;
+            }
+        };
+        // And on the clipboard as well, always. A utility exists to produce
+        // something you are about to use somewhere — often in another window
+        // entirely — and having to select what was just generated in order to
+        // copy it is the step this menu was meant to remove.
+        let copied = self.copy_out(&text);
+        self.after_utility(u, copied);
     }
 
     /// Close the menu and put the keyboard where the text landed.
-    fn after_utility(&mut self, u: crate::utilities::Utility) {
+    fn after_utility(&mut self, u: crate::utilities::Utility, copied: Result<&str, String>) {
         self.mode = Mode::Normal;
-        self.ses_mut().focus = Focus::CommandLine;
-        self.status = format!("{} — Enter to run, Ctrl-Y to clear", u.label());
+        let label = u.label();
+        self.status = if self.ses().view == View::Shell {
+            match copied {
+                Ok(how) => format!("{label} — typed into the shell, copied{how}"),
+                Err(e) => format!("{label} — typed into the shell, but not copied: {e}"),
+            }
+        } else {
+            // The keyboard follows the text: it landed on the command line, so
+            // that is where the next keystroke belongs.
+            self.ses_mut().focus = Focus::CommandLine;
+            match copied {
+                Ok(how) => format!("{label} — copied{how}; Enter to run, Ctrl-Y to clear"),
+                Err(_) => format!("{label} — Enter to run, Ctrl-Y to clear"),
+            }
+        };
         self.touch_sessions();
     }
 
@@ -2269,6 +2434,10 @@ impl App {
         let Some(bytes) = crate::ui::shell::encode(k) else {
             return;
         };
+        // Typing means you have finished reading. Every terminal snaps back to
+        // the live screen on the first keystroke, and one that did not would
+        // hide the echo of what was just typed somewhere below the view.
+        self.shell_to_live();
         let (cols, rows) = self.shell_size();
         let waker = self.waker();
         match self.ses_mut().shell(cols, rows, waker) {
@@ -2285,6 +2454,198 @@ impl App {
                 self.ses_mut().view = View::Panels;
             }
         }
+    }
+
+    /// How many rows a page-sized movement over the hosted pane covers.
+    ///
+    /// One short of the pane, the way every pager does it: the line you were
+    /// reading when you pressed the key stays on screen, and without it you
+    /// have to guess whether anything went past unread.
+    fn shell_page(&self) -> i32 {
+        i32::from(self.layout.shell.height.max(2)) - 1
+    }
+
+    /// How far the hosted view has been pushed back from the live screen.
+    fn shell_back(&self) -> i32 {
+        self.ses().hosted().map_or(0, |sh| {
+            i32::try_from(sh.scroll_offset()).unwrap_or(i32::MAX)
+        })
+    }
+
+    /// Move the hosted view by `delta` lines — positive goes back into history
+    /// — keeping any selection and caret on the text they were put on.
+    ///
+    /// Moved by what the buffer actually gave and not by what was asked for: at
+    /// either end of the scrollback the request is clamped, and shifting a
+    /// highlight by the request would slide it off its own characters while
+    /// still looking exactly right.
+    fn scroll_shell(&mut self, delta: i32) -> i32 {
+        let moved = self.ses().hosted().map_or(0, |sh| sh.scroll_by(delta));
+        if moved != 0 {
+            if let Some(sel) = self.shell_selection.as_mut() {
+                sel.shift(moved);
+            }
+            if let Some(caret) = self.shell_caret.as_mut() {
+                caret.0 += moved;
+            }
+        }
+        moved
+    }
+
+    /// Back to the live screen, with nothing selected.
+    fn shell_to_live(&mut self) {
+        if let Some(sh) = self.ses().hosted() {
+            sh.scroll_to_bottom();
+        }
+        self.shell_selection = None;
+        self.shell_caret = None;
+    }
+
+    /// Where the child's own cursor is, in the pane's visible coordinates.
+    fn shell_cursor_cell(&self) -> crate::ui::shell::Cell {
+        let back = self.shell_back();
+        self.ses()
+            .hosted()
+            .and_then(|sh| sh.with_screen(|s| s.cursor_position()))
+            .map_or((back, 0), |(row, col)| (i32::from(row) + back, col))
+    }
+
+    /// Reading back through what the shell has already printed, and selecting
+    /// it. Returns whether the key was ours; everything else belongs to the
+    /// child.
+    ///
+    /// The split is the whole design: **Ctrl-Shift looks, Shift selects**.
+    /// Shift-PageUp is deliberately both — it is the one scrollback key every
+    /// terminal already has, so it scrolls while nothing is selected and
+    /// extends the selection once something is.
+    fn shell_scrollback_key(&mut self, k: KeyEvent) -> bool {
+        let shift = k.modifiers.contains(KeyModifiers::SHIFT);
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let page = self.shell_page();
+
+        // Esc puts the live screen back, but only when there is something to
+        // come back from: inside a hosted `vim` it has to reach the child, and
+        // a key that sometimes arrives and sometimes does not is unusable.
+        if k.code == KeyCode::Esc
+            && !ctrl
+            && (self.shell_selection.is_some() || self.shell_back() > 0)
+        {
+            self.shell_to_live();
+            return true;
+        }
+        if !shift {
+            return false;
+        }
+        let selecting = self.shell_selection.is_some();
+
+        match k.code {
+            // --- Ctrl-Shift: move the view, and touch nothing else. ---
+            KeyCode::Up if ctrl => self.looked(1),
+            KeyCode::Down if ctrl => self.looked(-1),
+            KeyCode::PageUp if ctrl => self.looked(page),
+            KeyCode::PageDown if ctrl => self.looked(-page),
+            // The oldest line still held, and the live screen.
+            KeyCode::Home if ctrl => self.looked(i32::MAX),
+            KeyCode::End if ctrl => self.looked(i32::MIN),
+
+            // The scrollback keys every terminal has, while nothing is selected.
+            KeyCode::PageUp if !selecting => self.looked(page),
+            KeyCode::PageDown if !selecting => self.looked(-page),
+
+            // --- Shift: grow the selection, scrolling when it runs off an edge. ---
+            KeyCode::Up => self.extend_shell(Step::Rows(-1)),
+            KeyCode::Down => self.extend_shell(Step::Rows(1)),
+            KeyCode::PageUp => self.extend_shell(Step::Rows(-page)),
+            KeyCode::PageDown => self.extend_shell(Step::Rows(page)),
+            KeyCode::Left => self.extend_shell(Step::Left),
+            KeyCode::Right => self.extend_shell(Step::Right),
+            KeyCode::Home => self.extend_shell(Step::LineStart),
+            KeyCode::End => self.extend_shell(Step::LineEnd),
+
+            _ => false,
+        }
+    }
+
+    /// Scroll without disturbing the selection, and say the key was ours.
+    fn looked(&mut self, delta: i32) -> bool {
+        self.scroll_shell(delta);
+        true
+    }
+
+    /// Move the keyboard caret one step and drag the selection with it.
+    ///
+    /// Scrolls rather than stopping when the caret steps off an edge: selecting
+    /// more than one screenful is the reason any of this exists, and a
+    /// selection that quietly stopped growing while the key was still held down
+    /// would look exactly like one that had worked.
+    fn extend_shell(&mut self, step: Step) -> bool {
+        let Some((cols, _)) = self.ses().hosted().map(|sh| sh.size()) else {
+            return false;
+        };
+        let rows = i32::from(self.layout.shell.height.max(1));
+
+        // The first Shift keypress anchors on the child's cursor: that is where
+        // the eye already is, and it is the one position the user has not had
+        // to put anything at. Clamped into the view, because after reading back
+        // the cursor is a long way below it — and anchoring down there would
+        // drag the view back to the live screen, throwing away exactly what the
+        // user had scrolled to in order to select it.
+        let mut caret = match self.shell_caret {
+            Some(c) => c,
+            None => {
+                let at = self.shell_cursor_cell();
+                let at = (at.0.clamp(0, rows - 1), at.1);
+                self.shell_selection = Some(crate::ui::shell::Selection::new(at.0, at.1));
+                at
+            }
+        };
+
+        match step {
+            Step::Rows(d) => caret.0 += d,
+            // Wrapping at the margins, so holding Shift-Right walks the text
+            // the way reading does instead of stopping at the right edge.
+            Step::Left => {
+                if caret.1 > 0 {
+                    caret.1 -= 1;
+                } else {
+                    caret.1 = cols.saturating_sub(1);
+                    caret.0 -= 1;
+                }
+            }
+            Step::Right => {
+                if caret.1.saturating_add(1) < cols {
+                    caret.1 += 1;
+                } else {
+                    caret.1 = 0;
+                    caret.0 += 1;
+                }
+            }
+            Step::LineStart => caret.1 = 0,
+            Step::LineEnd => caret.1 = cols.saturating_sub(1),
+        }
+        self.shell_caret = Some(caret);
+
+        // Off an edge: move the view instead, which drags the caret and the
+        // anchor back into their old relationship with the text.
+        let off = if caret.0 < 0 {
+            -caret.0
+        } else if caret.0 >= rows {
+            rows - 1 - caret.0
+        } else {
+            0
+        };
+        if off != 0 {
+            self.scroll_shell(off);
+        }
+
+        // Whatever the buffer would not give, the caret gives up: past the
+        // oldest line held there is nothing further to select.
+        let settled = self.shell_caret.map(|c| (c.0.clamp(0, rows - 1), c.1));
+        self.shell_caret = settled;
+        if let (Some(sel), Some(c)) = (self.shell_selection.as_mut(), settled) {
+            sel.extend_to(c.0, c.1);
+        }
+        true
     }
 
     fn context_key(&mut self, k: KeyEvent, selected: usize, anchor: (u16, u16)) {
@@ -2393,14 +2754,16 @@ impl App {
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 // The rail is to the left of the panels, so it is checked first.
-                let rail = self.layout.rail;
-                if rail.width > 0 && m.column >= rail.x && m.column < rail.x + rail.width {
-                    if let Some(i) =
-                        crate::ui::rail::session_at_row(&self.sessions, rail, self.rail_open, m.row)
-                        && self.sessions.switch_to(i)
-                    {
-                        self.after_session_switch();
+                let outer = self.layout.rail_outer;
+                if outer.width > 0 && m.column >= outer.x && m.column < outer.x + outer.width {
+                    // The last column is the grip. Nothing happens until the
+                    // pointer moves, so letting go without moving still picks
+                    // the session under it and the column is not dead.
+                    if m.column + 1 == outer.x + outer.width {
+                        self.rail_grip = Some(false);
+                        return;
                     }
+                    self.pick_rail_session(m.row);
                     return;
                 }
                 match self.hit_test(m.column, m.row) {
@@ -2461,6 +2824,14 @@ impl App {
             }
 
             MouseEventKind::Drag(button) => {
+                // Dragging the grip is a resize, and nothing else: the pointer
+                // is over the rail's edge, not over any row.
+                if self.rail_grip.is_some() && button == MouseButton::Left {
+                    self.rail_grip = Some(true);
+                    let x = self.layout.rail_outer.x;
+                    self.set_rail_width(m.column.saturating_sub(x).saturating_add(1));
+                    return;
+                }
                 if button == MouseButton::Right {
                     self.right_dragged = true;
                 }
@@ -2472,7 +2843,13 @@ impl App {
                 }
             }
 
-            MouseEventKind::Up(_) => self.drag = None,
+            MouseEventKind::Up(_) => {
+                // A press on the grip that never moved was a click on a row.
+                if let Some(false) = self.rail_grip.take() {
+                    self.pick_rail_session(m.row);
+                }
+                self.drag = None;
+            }
 
             // Any-motion tracking: the pointer is drawn by inverting the cell
             // under it, so we need to know where it is on every move.
@@ -2498,7 +2875,7 @@ impl App {
                 let double = self
                     .last_shell_click
                     .is_some_and(|(t, r, c)| t.elapsed() < DOUBLE_CLICK && (r, c) == (row, col));
-                let mut sel = crate::ui::shell::Selection::new(row, col);
+                let mut sel = crate::ui::shell::Selection::new(i32::from(row), col);
                 if double && let Some(sh) = self.ses().hosted() {
                     sel.expand_to_word(sh);
                     self.shell_selection = Some(sel);
@@ -2509,12 +2886,15 @@ impl App {
                 }
                 self.last_shell_click = Some((std::time::Instant::now(), row, col));
                 self.shell_selection = Some(sel);
+                // The pointer takes over from the keyboard: two carets, one of
+                // them stale, is worse than none.
+                self.shell_caret = None;
                 self.selecting = true;
                 true
             }
             MouseEventKind::Drag(MouseButton::Left) if self.selecting => {
                 if let Some(sel) = self.shell_selection.as_mut() {
-                    sel.extend_to(row, col);
+                    sel.extend_to(i32::from(row), col);
                 }
                 true
             }
@@ -2530,6 +2910,19 @@ impl App {
                 }
                 true
             }
+
+            // Three lines per notch, the same as a panel: one is sluggish and a
+            // page is disorienting. This is the gesture people try first, so it
+            // is the one that has to work without being told about.
+            MouseEventKind::ScrollUp => {
+                self.scroll_shell(3);
+                true
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll_shell(-3);
+                true
+            }
+
             _ => false,
         }
     }
@@ -3079,6 +3472,7 @@ fn effect_key(k: KeyEvent) -> EffectKey {
 pub async fn run(mut start: Startup) -> anyhow::Result<()> {
     let cursor = start.cursor;
     let restored = start.restored.take();
+    let rail_override = start.rail;
     let mut guard = TerminalGuard::enter(cursor)?;
 
     let (update_tx, mut update_rx) = mpsc::unbounded_channel();
@@ -3103,6 +3497,14 @@ pub async fn run(mut start: Startup) -> anyhow::Result<()> {
     } else {
         app.reload(PanelId::Left);
         app.reload(PanelId::Right);
+    }
+    // After the restore, never before: a width given on the command line has to
+    // win over the saved one, and applying it first would have it overwritten.
+    if let Some(w) = rail_override.collapsed {
+        app.sessions.rail.collapsed = w;
+    }
+    if let Some(w) = rail_override.expanded {
+        app.sessions.rail.expanded = w.max(1);
     }
     // Where every session already is counts as somewhere we have been. Without
     // this the history is empty on the first press of Ctrl-H, which reads as a
@@ -3297,6 +3699,7 @@ impl App {
                 // Tests never touch the real session file.
                 store: None,
                 restored: None,
+                rail: RailOverride::default(),
             },
             tx,
         );
@@ -4157,6 +4560,87 @@ mod tests {
         assert!(!app.rail_open);
     }
 
+    /// The rail is resizable, and the two widths are separate settings: the
+    /// resting strip and the opened list answer different questions, and one
+    /// width would make one of them wrong.
+    #[test]
+    fn the_rail_is_resized_separately_at_rest_and_open() {
+        let mut app = fixture();
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let start = app.sessions.rail;
+
+        // Open it, widen it, and the resting strip must not have moved.
+        app.handle(Action::ToggleRail);
+        assert!(
+            matches!(app.mode, Mode::Rail { .. }),
+            "the rail has the keys"
+        );
+        for _ in 0..4 {
+            app.on_key(key(KeyCode::Right));
+        }
+        assert_eq!(app.sessions.rail.expanded, start.expanded + 4);
+        assert_eq!(app.sessions.rail.collapsed, start.collapsed);
+
+        // Closed, the same keys move the other one.
+        app.close_rail();
+        app.mode = Mode::Rail { selected: 0 };
+        for _ in 0..5 {
+            app.on_key(key(KeyCode::Char('+')));
+        }
+        assert_eq!(app.sessions.rail.collapsed, start.collapsed + 5);
+        assert_eq!(app.sessions.rail.expanded, start.expanded + 4);
+    }
+
+    /// A rail that could eat the panels is a rail that eventually will, and one
+    /// that could go negative would panic on the way. Neither is allowed.
+    #[test]
+    fn the_rail_cannot_be_dragged_past_a_third_of_the_screen_or_below_nothing() {
+        let mut app = fixture();
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+
+        app.set_rail_width(u16::MAX);
+        assert_eq!(app.sessions.rail.collapsed, 40, "a third of 120 columns");
+
+        for _ in 0..80 {
+            app.resize_rail(-1);
+        }
+        assert_eq!(app.sessions.rail.collapsed, 0, "at rest it may vanish");
+
+        // Opened it may not: a list you cannot see is a list you cannot leave.
+        app.rail_open = true;
+        for _ in 0..80 {
+            app.resize_rail(-1);
+        }
+        assert_eq!(app.sessions.rail.expanded, 1);
+    }
+
+    /// Widening the resting strip is how you ask to see the sessions all the
+    /// time. A strip that stayed a column of dots however wide it was made
+    /// would be answering a question nobody asked.
+    #[test]
+    fn a_widened_resting_rail_shows_the_session_names() {
+        let mut app = fixture();
+        app.sessions.rail.collapsed = 20;
+        assert!(!app.rail_open, "still at rest");
+
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(app.layout.rail_outer.width, 20);
+
+        let name = &app.sessions.current().name;
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<Vec<_>>()
+            .concat();
+        assert!(text.contains(name.as_str()), "the rail showed no names");
+    }
+
     /// A shortcut that does nothing must say why, or it is indistinguishable
     /// from a broken binding.
     #[test]
@@ -4568,6 +5052,180 @@ mod tests {
         );
     }
 
+    /// A shell view sized and filled, with more printed than fits on screen.
+    #[cfg(unix)]
+    fn shell_with_scrollback() -> (App, Terminal<TestBackend>) {
+        let mut app = fixture();
+        app.handle(Action::ToggleShell);
+        let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        // One frame first, so the pane has a size and the PTY is told about it.
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        app.sync_shell_size();
+
+        app.run_line("i=1; while [ $i -le 60 ]; do echo line-$i; i=$((i+1)); done")
+            .expect("run");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let seen = app
+                .ses()
+                .hosted()
+                .and_then(|sh| sh.with_screen(|s| s.contents()))
+                .unwrap_or_default();
+            if seen.contains("line-60") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        (app, term)
+    }
+
+    fn with(code: KeyCode, m: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, m)
+    }
+
+    /// What scrolled off the top has to be reachable from the keyboard.
+    /// Shift-PageUp is the key every terminal already has, so it is the one
+    /// that has to work without being told about.
+    #[cfg(unix)]
+    #[test]
+    fn shift_page_up_reads_back_through_the_shell() {
+        let (mut app, _term) = shell_with_scrollback();
+        assert_eq!(app.shell_back(), 0, "a fresh pane looks at the live screen");
+
+        app.on_key(with(KeyCode::PageUp, KeyModifiers::SHIFT));
+        let back = app.shell_back();
+        assert!(back > 0, "Shift-PageUp did not move the view");
+        assert!(
+            app.shell_selection.is_none(),
+            "looking back is not selecting"
+        );
+
+        // A line at a time, and all the way to either end.
+        app.on_key(with(
+            KeyCode::Up,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert_eq!(app.shell_back(), back + 1);
+        app.on_key(with(
+            KeyCode::Home,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert!(app.shell_back() > back + 1, "Ctrl-Shift-Home went nowhere");
+
+        app.on_key(with(
+            KeyCode::End,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert_eq!(app.shell_back(), 0, "Ctrl-Shift-End must reach the bottom");
+    }
+
+    /// Typing is how you say you have finished reading. A pane that stayed
+    /// where it was would hide the echo of what was just typed.
+    #[cfg(unix)]
+    #[test]
+    fn typing_snaps_the_shell_back_to_the_live_screen() {
+        let (mut app, _term) = shell_with_scrollback();
+        app.on_key(with(KeyCode::PageUp, KeyModifiers::SHIFT));
+        assert!(app.shell_back() > 0);
+
+        app.on_key(key(KeyCode::Char('x')));
+        assert_eq!(app.shell_back(), 0, "the view stayed behind");
+    }
+
+    /// Shift-selection over a hosted shell, growing past the top of the view.
+    /// Stopping at row 0 while the key is still held would look exactly like a
+    /// selection that had worked, which is the worst way for it to fail.
+    #[cfg(unix)]
+    #[test]
+    fn shift_selection_over_the_shell_runs_past_one_screenful() {
+        let (mut app, _term) = shell_with_scrollback();
+        let rows = app.layout.shell.height;
+        assert!(rows >= 4, "the pane is only {rows} rows tall");
+
+        // Up past the top of the pane: twice its height, plus a few.
+        for _ in 0..(rows * 2 + 3) {
+            app.on_key(with(KeyCode::Up, KeyModifiers::SHIFT));
+        }
+        assert!(
+            app.shell_back() > 0,
+            "the selection did not carry the view with it"
+        );
+        let sel = app.shell_selection.expect("nothing was selected");
+        assert!(!sel.is_empty());
+
+        let text = sel.text(app.ses().hosted().expect("a shell"));
+        let numbers: Vec<u32> = text
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("line-"))
+            .filter_map(|n| n.parse().ok())
+            .collect();
+        assert!(
+            numbers.len() > usize::from(rows),
+            "only {} lines selected in a {rows}-row pane: {text:?}",
+            numbers.len()
+        );
+        for pair in numbers.windows(2) {
+            assert_eq!(pair[1], pair[0] + 1, "out of order in {numbers:?}");
+        }
+
+        // Esc is the way out, and only while there is something to get out of.
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.shell_selection.is_none());
+        assert_eq!(app.shell_back(), 0);
+    }
+
+    /// The view moving must not move the highlight off its own characters.
+    #[cfg(unix)]
+    #[test]
+    fn looking_further_back_leaves_a_selection_on_its_own_text() {
+        let (mut app, _term) = shell_with_scrollback();
+        for _ in 0..3 {
+            app.on_key(with(KeyCode::Up, KeyModifiers::SHIFT));
+        }
+        let shell = app.ses().hosted().expect("a shell");
+        let before = app.shell_selection.expect("a selection").text(shell);
+        assert!(before.contains("line-"), "nothing selected: {before:?}");
+
+        app.on_key(with(
+            KeyCode::Up,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        let shell = app.ses().hosted().expect("a shell");
+        let after = app.shell_selection.expect("a selection").text(shell);
+        assert_eq!(after, before, "the highlight slid off its text");
+    }
+
+    /// Output arriving while the view is scrolled back must not take the
+    /// selection with it: `vt100` holds the visible rows still, so the
+    /// highlight is still on the characters it was put on.
+    #[cfg(unix)]
+    #[test]
+    fn a_selection_survives_output_while_the_view_is_held_back() {
+        let (mut app, _term) = shell_with_scrollback();
+        app.on_key(with(KeyCode::PageUp, KeyModifiers::SHIFT));
+        let back = app.shell_back();
+        assert!(back > 0, "nothing to hold back from");
+
+        for _ in 0..3 {
+            app.on_key(with(KeyCode::Up, KeyModifiers::SHIFT));
+        }
+        assert!(app.shell_selection.is_some());
+        assert_eq!(
+            app.shell_back(),
+            back,
+            "selecting after reading back must not throw the view away"
+        );
+
+        // Whatever the pane thinks it owes a repaint for, the selection stays.
+        app.before_frame();
+        assert!(
+            app.shell_selection.is_some(),
+            "scrolled back, nothing has moved under the highlight"
+        );
+    }
+
     /// A hosted CLI you cannot see the cursor of is a CLI you cannot tell is
     /// waiting for you. The style is re-asserted every frame that shows one, so
     /// Apple's Terminal sends Ctrl-Shift-H as byte `0x08` — exactly what Ctrl-H
@@ -4959,6 +5617,63 @@ mod tests {
     }
 
     /// A paste is text, not a decision to run three commands.
+    /// A utility run from the shell view has to put its answer where the user
+    /// is looking. The command line is not drawn there at all, so text sent to
+    /// it goes nowhere the user can see — which is exactly what happened: a
+    /// uuid generated while talking to an agent was found afterwards, sitting
+    /// on the commander's command line behind it.
+    #[cfg(unix)]
+    #[test]
+    fn a_utility_run_from_the_shell_types_into_the_child() {
+        let mut app = fixture();
+        app.handle(Action::ToggleShell);
+        let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        app.sync_shell_size();
+
+        app.handle(Action::UtilitiesMenu);
+        app.run_utility(crate::utilities::Utility::Uuid);
+
+        assert_eq!(
+            app.ses().command_line,
+            "",
+            "the answer must not be parked on a command line nobody can see"
+        );
+        assert!(
+            app.status.contains("shell"),
+            "the status has to say where it went: {}",
+            app.status
+        );
+
+        // And it really reached the child: the shell echoes what is typed at
+        // its prompt, so the uuid shows up on the screen the user is reading.
+        let uuid = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut seen = String::new();
+        while std::time::Instant::now() < uuid {
+            seen = app
+                .ses()
+                .hosted()
+                .and_then(|sh| sh.with_screen(|s| s.contents()))
+                .unwrap_or_default();
+            if seen.split_whitespace().any(is_uuid) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            seen.split_whitespace().any(is_uuid),
+            "no uuid was typed into the shell; it shows:\n{seen}"
+        );
+    }
+
+    fn is_uuid(w: &str) -> bool {
+        w.len() == 36
+            && w.chars().enumerate().all(|(i, c)| match i {
+                8 | 13 | 18 | 23 => c == '-',
+                _ => c.is_ascii_hexdigit(),
+            })
+    }
+
     #[test]
     fn a_multi_line_paste_arrives_as_one_line() {
         use ratatui::crossterm::event::Event;
