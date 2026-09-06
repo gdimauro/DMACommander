@@ -32,6 +32,7 @@ const ATTACHED: &[Attach] = &[Attach {
     ],
     new_flag: "--session-id",
     resume_flag: "--resume",
+    mcp_flag: Some("--mcp-config"),
 }];
 
 struct Attach {
@@ -39,6 +40,10 @@ struct Attach {
     explicit: &'static [&'static str],
     new_flag: &'static str,
     resume_flag: &'static str,
+    /// How this program is told about an extra MCP server, if it can be. The
+    /// commander describes itself to whatever it hosts: an agent that has to be
+    /// told in prose where the panels are is working from a blurred photograph.
+    mcp_flag: Option<&'static str>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -174,18 +179,51 @@ pub fn clear_orphans(_conversation: &str) -> usize {
 /// later and then fails to find it.
 pub fn prepare(root: &Path, session_id: &str, conversation: &str) -> Option<PathBuf> {
     let dir = root.join("shims").join(session_id);
+    // Written before the shims, because a shim names it.
+    let mcp = write_mcp_config(root, &dir, session_id);
     let mut wrote_any = false;
     for a in ATTACHED {
         let Some(real) = resolve(a.program, &dir) else {
             continue;
         };
         let marker = dir.join(format!("{}.started", a.program));
-        let script = shim_script(a, &real, conversation, &marker);
+        let script = shim_script(a, &real, conversation, &marker, mcp.as_deref());
         if write_executable(&dir.join(a.program), &script).is_ok() {
             wrote_any = true;
         }
     }
     wrote_any.then_some(dir)
+}
+
+/// Describe this commander as an MCP server the hosted agent can call.
+///
+/// Returns the path of the configuration file, or `None` when there is nothing
+/// to describe — no socket, or no binary to point at. Absent, everything else
+/// still works: the agent simply cannot see the panels.
+fn write_mcp_config(root: &Path, dir: &Path, session_id: &str) -> Option<PathBuf> {
+    let binary = std::env::current_exe().ok()?;
+    // A test binary is not a commander. Without this, a `cargo test` run would
+    // leave a configuration behind pointing a real agent at something in
+    // `target/debug/deps` that the next build deletes — and the agent would
+    // report a broken MCP server it was never meant to have.
+    if binary.file_stem().is_none_or(|n| n != "dmac") {
+        return None;
+    }
+    let socket = dmac_mcp::socket_path(root, std::process::id());
+    let config = dir.join("mcp.json");
+    let json = serde_json::json!({
+        "mcpServers": {
+            "dmac": {
+                "command": binary,
+                "args": ["--mcp", socket, "--mcp-session", session_id],
+            }
+        }
+    });
+    if let Some(parent) = config.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    std::fs::write(&config, serde_json::to_vec_pretty(&json).ok()?).ok()?;
+    Some(config)
 }
 
 /// The environment a hosted shell needs so the shim is found and the id is
@@ -199,11 +237,19 @@ pub fn environment(
         Ok(p) => format!("{}:{p}", shim_dir.display()),
         Err(_) => shim_dir.display().to_string(),
     };
-    vec![
+    let mut env = vec![
         ("PATH".to_string(), path),
         ("DMAC_SESSION".to_string(), session_name.to_string()),
         ("DMAC_CONVERSATION".to_string(), conversation.to_string()),
-    ]
+    ];
+    // Also in the environment, not only in the agent's configuration file: a
+    // script, or an agent this program has never heard of, can find the
+    // commander without anyone having taught it about shims.
+    if let Some(root) = crate::agent_root() {
+        let socket = dmac_mcp::socket_path(&root, std::process::id());
+        env.push(("DMAC_MCP_SOCKET".to_string(), socket.display().to_string()));
+    }
+    env
 }
 
 /// The first `program` on `PATH` that is not our own shim.
@@ -244,9 +290,21 @@ fn is_executable_file(p: &Path) -> bool {
 /// `exec` rather than a call, so the shim leaves no process of its own between
 /// the shell and the agent: signals, job control and `ps` all then read the way
 /// they would without it.
-fn shim_script(a: &Attach, real: &Path, conversation: &str, marker: &Path) -> String {
+fn shim_script(
+    a: &Attach,
+    real: &Path,
+    conversation: &str,
+    marker: &Path,
+    mcp_config: Option<&Path>,
+) -> String {
     let (real, marker) = (real.display(), marker.display());
     let (program, new_flag, resume_flag) = (a.program, a.new_flag, a.resume_flag);
+    // Empty when there is nothing to add, so the exec lines below read the same
+    // either way rather than needing two versions of each.
+    let mcp = match (a.mcp_flag, mcp_config) {
+        (Some(flag), Some(path)) => format!("{flag} '{}' ", path.display()),
+        _ => String::new(),
+    };
     let explicit = a
         .explicit
         .iter()
@@ -260,10 +318,13 @@ fn shim_script(a: &Attach, real: &Path, conversation: &str, marker: &Path) -> St
 # was. To start a fresh conversation instead:
 #   rm '{marker}'
 #
+# The commander also describes itself to {program} as an MCP server, so it can
+# see the panels, the history and the sessions it is running inside.
+#
 # An explicit choice on the command line always wins; this only fills in a gap.
 for arg in "$@"; do
   case "$arg" in
-    {explicit}) exec '{real}' "$@" ;;
+    {explicit}) exec '{real}' {mcp}"$@" ;;
   esac
 done
 # Ask {program}'s own store whether this conversation exists, and fall back to
@@ -273,10 +334,10 @@ done
 # written because the first run was killed before it got that far.
 existing=$(ls "$HOME"/.claude/projects/*/'{conversation}'.jsonl 2>/dev/null | head -1)
 if [ -n "$existing" ] || [ -e '{marker}' ]; then
-  exec '{real}' {resume_flag} '{conversation}' "$@"
+  exec '{real}' {mcp}{resume_flag} '{conversation}' "$@"
 fi
 : > '{marker}'
-exec '{real}' {new_flag} '{conversation}' "$@"
+exec '{real}' {mcp}{new_flag} '{conversation}' "$@"
 "#
     )
 }
@@ -309,6 +370,7 @@ mod tests {
             Path::new("/usr/local/bin/claude"),
             "11111111-2222-4333-8444-555555555555",
             Path::new("/tmp/shims/s1/claude.started"),
+            None,
         );
         assert!(
             s.contains("--session-id '11111111-2222-4333-8444-555555555555'"),
@@ -330,6 +392,7 @@ mod tests {
             Path::new("/usr/local/bin/claude"),
             "abc",
             Path::new("/tmp/m"),
+            None,
         );
         for flag in claude().explicit {
             assert!(s.contains(&format!("{flag}|{flag}=*")), "{flag} missing");
@@ -340,7 +403,7 @@ mod tests {
     /// agent — otherwise signals and job control read differently through it.
     #[test]
     fn the_shim_execs_rather_than_calling() {
-        let s = shim_script(claude(), Path::new("/bin/true"), "abc", Path::new("/tmp/m"));
+        let s = shim_script(claude(), Path::new("/bin/true"), "abc", Path::new("/tmp/m"), None);
         for line in s.lines() {
             let line = line.trim();
             if line.contains("/bin/true") {
@@ -358,6 +421,7 @@ mod tests {
             Path::new("/opt/my tools/claude"),
             "abc",
             Path::new("/tmp/my markers/m"),
+            None,
         );
         assert!(s.contains("'/opt/my tools/claude'"), "{s}");
         assert!(s.contains("'/tmp/my markers/m'"), "{s}");
@@ -374,11 +438,61 @@ mod tests {
             Path::new("/usr/local/bin/claude"),
             "abcd-1234",
             Path::new("/tmp/m"),
+            None,
         );
         assert!(s.contains(".claude/projects/"), "{s}");
         assert!(s.contains("'abcd-1234'.jsonl"), "{s}");
         // And the marker is still consulted, for a store that is not there.
         assert!(s.contains("[ -e '/tmp/m' ]"), "{s}");
+    }
+
+    /// `cargo test` must not leave a configuration behind that points a real
+    /// agent at a binary in `target/debug/deps`. This test asserts the guard by
+    /// being one: it *is* running from a test binary.
+    #[test]
+    fn a_test_binary_never_advertises_itself_as_the_commander() {
+        let root = tempfile::tempdir().expect("a temp dir");
+        let dir = root.path().join("shims").join("s1");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        assert!(
+            write_mcp_config(root.path(), &dir, "s1").is_none(),
+            "current_exe() here is a test binary"
+        );
+        assert!(!dir.join("mcp.json").exists(), "and nothing was written");
+    }
+
+    /// The commander describes itself to the agent it hosts. Without this the
+    /// agent is in the file manager and cannot see it.
+    #[test]
+    fn the_shim_hands_the_agent_our_own_mcp_configuration() {
+        let s = shim_script(
+            claude(),
+            Path::new("/usr/local/bin/claude"),
+            "abcd-1234",
+            Path::new("/tmp/m"),
+            Some(Path::new("/tmp/shims/s1/mcp.json")),
+        );
+        assert!(s.contains("--mcp-config '/tmp/shims/s1/mcp.json'"), "{s}");
+        // On every route out, including the one the user's own flags take:
+        // choosing a conversation is not choosing to be blind.
+        assert_eq!(
+            s.matches("--mcp-config").count(),
+            3,
+            "every exec should carry it: {s}"
+        );
+    }
+
+    /// ...and without one, the shim is exactly what it was.
+    #[test]
+    fn no_configuration_means_no_extra_flag() {
+        let s = shim_script(
+            claude(),
+            Path::new("/usr/local/bin/claude"),
+            "abcd-1234",
+            Path::new("/tmp/m"),
+            None,
+        );
+        assert!(!s.contains("--mcp-config"), "{s}");
     }
 
     #[test]

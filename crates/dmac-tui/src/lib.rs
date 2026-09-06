@@ -10,6 +10,7 @@
 pub mod action;
 pub mod app;
 pub mod keymap;
+pub mod mcp;
 pub mod terminal;
 pub mod theme;
 pub(crate) mod ui;

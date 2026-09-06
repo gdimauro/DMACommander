@@ -606,6 +606,7 @@ dependencies = [
  "dmac-core",
  "dmac-fx",
  "dmac-gpu",
+ "dmac-mcp",
  "dmac-session",
  "dmac-tui",
  "dmac-vfs",
@@ -653,6 +654,14 @@ name = "dmac-gpu"
 version = "0.1.0"
 
 [[package]]
+name = "dmac-mcp"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "dmac-plugin"
 version = "0.1.0"
 
@@ -679,6 +688,7 @@ version = "0.1.0"
 dependencies = [
  "directories",
  "dmac-core",
+ "dmac-mcp",
  "dmac-pty",
  "dmac-vfs",
  "libc",
@@ -696,12 +706,14 @@ dependencies = [
  "dmac-config",
  "dmac-core",
  "dmac-fx",
+ "dmac-mcp",
  "dmac-pty",
  "dmac-session",
  "dmac-vfs",
  "futures",
  "jiff",
  "ratatui",
+ "serde_json",
  "tokio",
  "unicode-segmentation",
  "unicode-width",

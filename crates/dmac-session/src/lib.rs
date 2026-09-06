@@ -362,6 +362,18 @@ impl SessionManager {
         }
     }
 
+    /// A session by position, without making it current.
+    ///
+    /// The read-only half of `at_mut`, which existed alone: everything that
+    /// only wants to *look* at another session had to take a mutable borrow to
+    /// do it, and a borrow that says "I will change this" when it will not is a
+    /// borrow that eventually blocks something legitimate.
+    pub fn at(&self, index: usize) -> &Session {
+        self.sessions
+            .get(index.min(self.sessions.len().saturating_sub(1)))
+            .unwrap_or_else(|| self.current())
+    }
+
     pub fn at_mut(&mut self, index: usize) -> &mut Session {
         let i = index.min(self.sessions.len() - 1);
         &mut self.sessions[i]
@@ -484,7 +496,7 @@ fn abbreviate_home(path: &str) -> String {
 ///
 /// Beside the session file, so a session and the shims that serve it are
 /// removed together and a backup of one carries the other.
-fn agent_root() -> Option<std::path::PathBuf> {
+pub fn agent_root() -> Option<std::path::PathBuf> {
     crate::store::SessionStore::platform_default()
         .ok()
         .and_then(|s| s.path().parent().map(std::path::Path::to_path_buf))

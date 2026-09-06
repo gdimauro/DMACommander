@@ -13,6 +13,7 @@ members = [
     "crates/dmac-tui",
     "crates/dmac-gpu",
     "crates/dmac-agent",
+    "crates/dmac-mcp",
     "crates/dmac-plugin",
     "crates/dmac-pty",
 ]

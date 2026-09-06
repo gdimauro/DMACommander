@@ -22,6 +22,7 @@ dmac-config = { version = "0.1.0", path = "../dmac-config" }
 dmac-core = { version = "0.1.0", path = "../dmac-core" }
 dmac-fx = { version = "0.1.0", path = "../dmac-fx" }
 dmac-gpu = { version = "0.1.0", path = "../dmac-gpu", optional = true }
+dmac-mcp = { version = "0.1.0", path = "../dmac-mcp" }
 dmac-session = { version = "0.1.0", path = "../dmac-session" }
 dmac-tui = { version = "0.1.0", path = "../dmac-tui" }
 dmac-vfs = { version = "0.1.0", path = "../dmac-vfs" }

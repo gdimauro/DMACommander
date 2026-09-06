@@ -119,6 +119,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     layout.fkeys = rows[2];
     layout.command = rows[1];
+    layout.screen = area;
 
     // The shell replaces the panels rather than sitting beside them: it is the
     // same session seen a different way, and splitting the screen would give

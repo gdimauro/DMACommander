@@ -66,10 +66,32 @@ struct Cli {
     /// bug report.
     #[arg(long)]
     build_info: bool,
+
+    /// Speak Model Context Protocol on stdin and stdout, relaying to the
+    /// DMACommander listening on this socket.
+    ///
+    /// Not a mode you run by hand: an MCP client starts its servers itself, as
+    /// child processes with pipes, and this is the few lines of pipe that puts
+    /// one of them in touch with the commander already on screen. DMACommander
+    /// writes the flag into the configuration it hands a hosted agent.
+    #[arg(long, value_name = "SOCKET")]
+    mcp: Option<PathBuf>,
+
+    /// Which session an `--mcp` bridge belongs to, so its tools answer about
+    /// that session's panels rather than whichever one is on screen.
+    #[arg(long, value_name = "ID", requires = "mcp")]
+    mcp_session: Option<String>,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Before anything else, and before the terminal is touched: this process is
+    // a pipe, not a file manager. Any stray byte on stdout would be read by the
+    // client as a malformed protocol message.
+    if let Some(socket) = &cli.mcp {
+        return dmac_mcp::bridge::run(socket, cli.mcp_session.as_deref()).map_err(Into::into);
+    }
 
     let Some(cursor) = dmac_tui::terminal::CursorStyle::parse(&cli.cursor) else {
         anyhow::bail!(

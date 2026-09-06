@@ -22,7 +22,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// A state change produced off the UI thread.
-enum Update {
+pub(crate) enum Update {
     /// A slice of a directory listing arrived.
     Entries {
         /// Which session asked for it.
@@ -57,6 +57,18 @@ enum Update {
     /// message exists only to break the event loop out of its wait, and the
     /// frame that follows reads the emulator directly.
     ShellOutput,
+    /// One line of MCP, from an agent talking to the commander it is running
+    /// inside. Parsed on the connection's task, answered here — so no
+    /// application state is ever behind a lock, and a slow client cannot stall
+    /// a frame.
+    Mcp {
+        /// Which session the calling agent belongs to, from the bridge's
+        /// handshake.
+        session: Option<SessionId>,
+        line: String,
+        /// `None` for a notification, which must not be answered at all.
+        reply: tokio::sync::oneshot::Sender<Option<String>>,
+    },
 }
 
 /// Everything the application needs to start.
@@ -182,6 +194,9 @@ pub(crate) struct LayoutCache {
     pub picker: Rect,
     /// Interior of the directory history's list, while it is open.
     pub history: Rect,
+    /// The whole frame. Needed to render a second, off-screen copy at the same
+    /// size when an agent asks what is on screen.
+    pub screen: Rect,
 }
 
 pub struct App {
@@ -204,6 +219,11 @@ pub struct App {
     pub(crate) fullscreen: bool,
     /// Agents from the last run, waiting for an answer to "resume?".
     pub(crate) pending: Vec<Pending>,
+    /// Which session the MCP call being handled belongs to — the session the
+    /// calling agent is hosted in. Set for the duration of one call, so a tool
+    /// answers about the agent's own panels rather than about whichever session
+    /// the user happens to be looking at.
+    pub(crate) mcp_session: Option<SessionId>,
     /// What has been typed into the directory history's filter.
     pub(crate) history_filter: String,
     /// The last row clicked in the history, and when — a second click on the
@@ -268,7 +288,7 @@ pub struct App {
     /// throttled to a sane frame rate instead of redrawing as fast as the
     /// reader thread can parse.
     last_shell_frame: std::time::Instant,
-    tx: mpsc::UnboundedSender<Update>,
+    pub(crate) tx: mpsc::UnboundedSender<Update>,
 }
 
 /// Executables on `PATH` whose name starts with `word`.
@@ -432,6 +452,7 @@ impl App {
             should_quit: false,
             fullscreen: false,
             pending: Vec::new(),
+            mcp_session: None,
             history_filter: String::new(),
             last_history_click: None,
             history_order: dmac_core::history::Order::default(),
@@ -443,6 +464,17 @@ impl App {
             selecting: false,
             last_shell_frame: std::time::Instant::now(),
             tx,
+        }
+    }
+
+    /// The size of the last frame. What the `screen` tool renders a second copy
+    /// at, so the text an agent reads is laid out exactly as the user's is.
+    pub(crate) fn screen_size(&self) -> (u16, u16) {
+        let a = self.layout.screen;
+        if a.width >= 2 && a.height >= 2 {
+            (a.width, a.height)
+        } else {
+            (80, 24)
         }
     }
 
@@ -556,7 +588,7 @@ impl App {
 
     /// Start a listing for any session, visible or not. Restoring a saved set
     /// needs this: every session is live, so every panel needs its contents.
-    fn reload_session(&mut self, index: usize, id: PanelId) {
+    pub(crate) fn reload_session(&mut self, index: usize, id: PanelId) {
         if index >= self.sessions.len() {
             return;
         }
@@ -651,6 +683,19 @@ impl App {
             // Nothing to apply: arriving here already cost the redraw that the
             // hosted program was asking for.
             Update::ShellOutput => {}
+            Update::Mcp {
+                session,
+                line,
+                reply,
+            } => {
+                // Every tool runs here, on the UI thread, with the whole
+                // application in hand. No locks, and no chance of answering
+                // about a panel that moved between the read and the reply.
+                self.mcp_session = session;
+                let answer = dmac_mcp::dispatch(&line, self);
+                self.mcp_session = None;
+                let _ = reply.send(answer);
+            }
             Update::Error {
                 session,
                 panel,
@@ -671,7 +716,7 @@ impl App {
         }
     }
 
-    fn handle(&mut self, action: Action) {
+    pub(crate) fn handle(&mut self, action: Action) {
         use Action::*;
         self.status.clear();
 
@@ -920,7 +965,7 @@ impl App {
     /// Note that the session set changed. The actual write is debounced by the
     /// event loop: renaming a session one keystroke at a time should not mean
     /// one file write per keystroke.
-    fn touch_sessions(&mut self) {
+    pub(crate) fn touch_sessions(&mut self) {
         if self.store.is_some() {
             self.dirty_at = Some(std::time::Instant::now());
         }
@@ -1087,7 +1132,7 @@ impl App {
 
     /// The area the shell is drawn in, in cells. Recorded by the renderer, so
     /// the PTY is always exactly the size of what the user can see.
-    fn shell_size(&self) -> (u16, u16) {
+    pub(crate) fn shell_size(&self) -> (u16, u16) {
         let a = self.layout.shell;
         if a.width >= 2 && a.height >= 2 {
             (a.width, a.height)
@@ -1610,20 +1655,28 @@ impl App {
         if line.is_empty() {
             return;
         }
+        if let Err(e) = self.run_line(&line) {
+            self.status = format!("shell: {e}");
+        }
+    }
 
+    /// Run a line in the current session's shell, and show it.
+    ///
+    /// Split out so the same path serves the command line and a tool call —
+    /// two ways of running a command that could drift apart is two ways of
+    /// running a command that eventually behave differently.
+    pub(crate) fn run_line(&mut self, line: &str) -> Result<(), String> {
         let (cols, rows) = self.shell_size();
         let waker = self.waker();
-        match self.ses_mut().shell(cols, rows, waker) {
-            Ok(shell) => match shell.run(&line) {
-                Ok(()) => {
-                    self.ses_mut().command_line.clear();
-                    self.ses_mut().view = View::Shell;
-                    self.status.clear();
-                }
-                Err(e) => self.status = format!("shell: {e}"),
-            },
-            Err(e) => self.status = format!("shell: {e}"),
-        }
+        let shell = self
+            .ses_mut()
+            .shell(cols, rows, waker)
+            .map_err(|e| e.to_string())?;
+        shell.run(line).map_err(|e| e.to_string())?;
+        self.ses_mut().command_line.clear();
+        self.ses_mut().view = View::Shell;
+        self.status.clear();
+        Ok(())
     }
 
     /// A movement that is not a Shift-selection: it ends any running gesture.
@@ -1649,7 +1702,7 @@ impl App {
     /// Nothing is reloaded: every session keeps its listings, which is the whole
     /// point of holding them all live. Only the transient, per-view state that
     /// belonged to the session we just left is cleared.
-    fn after_session_switch(&mut self) {
+    pub(crate) fn after_session_switch(&mut self) {
         self.touch_sessions();
         self.quick_search.clear();
         // Close an overlay that belonged to the session we left — but not the
@@ -2500,22 +2553,27 @@ impl App {
     /// Every navigation goes through here. One door means the history cannot
     /// quietly miss a route into a directory, which is exactly how a history
     /// ends up with holes nobody can explain.
-    fn go_to(&mut self, path: VfsPath) {
-        let i = Self::idx(self.ses().active);
-        self.ses_mut().cwd[i] = path;
-        self.reload(self.ses().active);
-        self.touch_sessions();
-        self.remember_here();
+    pub(crate) fn go_to(&mut self, path: VfsPath) {
+        let index = self.sessions.current_index();
+        let panel = self.ses().active;
+        self.go_to_panel(index, panel, path);
     }
 
-    /// Record where the active panel is now.
-    fn remember_here(&mut self) {
-        let i = Self::idx(self.ses().active);
-        let path = self.ses().cwd[i].display();
-        let session = self.ses().id.0;
+    /// The general form: any panel, of any session. What the panel-aware
+    /// callers use — an agent may move the panel it is not looking at.
+    pub(crate) fn go_to_panel(&mut self, index: usize, panel: PanelId, path: VfsPath) {
+        if index >= self.sessions.len() {
+            return;
+        }
+        let i = Self::idx(panel);
+        let session = self.sessions.at_mut(index);
+        session.cwd[i] = path;
+        let (id, display) = (session.id.0, session.cwd[i].display());
+        self.reload_session(index, panel);
+        self.touch_sessions();
         self.sessions
             .history
-            .record(&path, session, dmac_core::history::now());
+            .record(&display, id, dmac_core::history::now());
     }
 
     /// Record where every session already is. Called once, at startup.
@@ -2744,6 +2802,16 @@ pub async fn run(mut start: Startup) -> anyhow::Result<()> {
     // feature that does not work rather than one with nothing to say yet.
     app.seed_history();
 
+    // An agent hosted in one of these sessions can drive the commander it is
+    // running inside. The socket is named by pid and advertised to hosted
+    // shells through the environment, so a `claude` started here finds it
+    // without anyone configuring anything.
+    let mcp_socket = dmac_session::agent_root()
+        .map(|root| dmac_mcp::socket_path(&root, std::process::id()));
+    if let Some(socket) = mcp_socket.clone() {
+        crate::mcp::listen(socket, app.tx.clone());
+    }
+
     // Input lives on its own thread doing a blocking read. Cheaper and more
     // portable than an async event stream, and it keeps the loop below free of
     // polling timeouts — we redraw when something happens, not on a timer.
@@ -2860,6 +2928,11 @@ pub async fn run(mut start: Startup) -> anyhow::Result<()> {
     }
 
     app.save_on_exit();
+    // The socket is this process's; leaving it behind would have the next run
+    // find a file that answers nobody.
+    if let Some(socket) = mcp_socket {
+        let _ = std::fs::remove_file(socket);
+    }
     Ok(())
 }
 
@@ -2883,18 +2956,14 @@ async fn wait_for_signal(_set: &mut [()]) -> Option<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-
-    /// A plain key press, the way the terminal delivers one.
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
-    }
-
-    /// Build an App without a terminal, with a listing already in place.
-    fn fixture() -> App {
+impl App {
+    /// An App with no terminal and a listing already in place.
+    ///
+    /// Lives outside `mod tests` so the sibling modules that also need one —
+    /// the MCP tools, for instance — are testing the same application the UI
+    /// tests are, rather than a second fixture that will drift from it.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> App {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = App::new(
             Startup {
@@ -2933,6 +3002,22 @@ mod tests {
             mk("👨‍👩‍👧‍👦-family.png", File),
         ]);
         app
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    /// A plain key press, the way the terminal delivers one.
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn fixture() -> App {
+        App::for_test()
     }
 
     /// Render into a fixed-size buffer and assert nothing panicked and the

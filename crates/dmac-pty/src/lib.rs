@@ -18,6 +18,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Serialises [`Hosted::spawn`]'s call into the pty layer. See the comment at
+/// the call site for why this exists at all.
+fn open_lock() -> &'static Mutex<()> {
+    static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PtyError {
     #[error("could not open a pseudo-terminal: {0}")]
@@ -132,14 +139,28 @@ impl Hosted {
         } = spec;
         let (cols, rows) = (cols.max(2), rows.max(2));
 
-        let pty = native_pty_system()
-            .openpty(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| PtyError::Open(e.to_string()))?;
+        // One at a time. Opening a pseudo-terminal is three syscalls that have
+        // to agree with each other — claim a master, change the slave's
+        // ownership, unlock it — and on macOS two threads doing that at once
+        // intermittently lose the race, with `openpty` failing outright rather
+        // than retrying. It shows up as an occasional "Unknown error: -6" when
+        // several sessions are restored together, and as a flaky test suite.
+        //
+        // The lock costs nothing: this happens once per shell, not once per
+        // keystroke, and the critical section is microseconds long.
+        let pty = {
+            let _one_at_a_time = open_lock()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            native_pty_system()
+                .openpty(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .map_err(|e| PtyError::Open(e.to_string()))?
+        };
 
         let mut cmd = CommandBuilder::new(program);
         for a in args {

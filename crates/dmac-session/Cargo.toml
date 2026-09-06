@@ -14,6 +14,7 @@ workspace = true
 [dependencies]
 directories = "6.0.0"
 dmac-core = { version = "0.1.0", path = "../dmac-core" }
+dmac-mcp = { version = "0.1.0", path = "../dmac-mcp" }
 dmac-pty = { version = "0.1.0", path = "../dmac-pty" }
 dmac-vfs = { version = "0.1.0", path = "../dmac-vfs" }
 serde = { version = "1.0.229", features = ["derive"] }
