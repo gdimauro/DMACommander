@@ -223,20 +223,92 @@ pub fn environment(
 /// is absent — it is a server that is malformed, and it fails on startup.
 const MCP_CONFIG_VAR: &str = "DMAC_MCP_CONFIG";
 
+/// The variable carrying this session's conversation id. Set by [`environment`]
+/// and spent by [`start_command`], for the same reason as [`MCP_CONFIG_VAR`].
+const CONVERSATION_VAR: &str = "DMAC_CONVERSATION";
+
 /// What to type at a hosted shell to start the agent in it.
 ///
 /// The program by its bare name, so the user's own shell resolves it — their
-/// aliases, their functions, their `PATH`. Then the commander's description, by
-/// the *variable* rather than its value: that value is JSON full of braces
-/// wrapped around a path with a space in it, and a command line carrying it is
-/// one nobody can read, which defeats the point of typing it where it can be
-/// seen and corrected before Enter.
-pub fn start_command(session_id: &str) -> String {
-    let program = attached_program();
-    match mcp_config(session_id) {
-        Some(_) => format!("{program} --mcp-config \"${MCP_CONFIG_VAR}\""),
-        None => program.to_string(),
+/// aliases, their functions, their `PATH`. Then what the commander knows and
+/// the user should not have to retype: its own description, and which
+/// conversation this session is.
+///
+/// Both by the *variable* rather than the value. The description is JSON full
+/// of braces wrapped around a path with a space in it, and a command line
+/// carrying it is one nobody can read — which defeats the point of typing it
+/// where it can be seen and corrected before Enter.
+///
+/// `theirs` is whatever the user chose themselves — a model, a permission mode,
+/// a directory — kept and put last, so it is the part that reads like theirs.
+pub fn start_command(session_id: &str, conversation: &str, theirs: &str) -> String {
+    let mut line = attached_program().to_string();
+    if mcp_config(session_id).is_some() {
+        line.push_str(&format!(" --mcp-config \"${MCP_CONFIG_VAR}\""));
     }
+    if !conversation.is_empty() {
+        line.push_str(&format!(
+            " {} \"${CONVERSATION_VAR}\"",
+            conversation_flag(conversation)
+        ));
+    }
+    let theirs = theirs.trim();
+    if !theirs.is_empty() {
+        line.push(' ');
+        line.push_str(theirs);
+    }
+    line
+}
+
+/// The same, for an agent the last run was hosting: the saved line stripped of
+/// what belonged to that run, with this run's own put back.
+pub fn resume_command(session_id: &str, conversation: &str, saved: &str) -> String {
+    let stripped = as_resume(saved);
+    let theirs = stripped.split_once(' ').map_or("", |(_, rest)| rest);
+    start_command(session_id, conversation, theirs)
+}
+
+/// `--session-id` for a conversation that does not exist yet, `--resume` for one
+/// that does.
+///
+/// There is no flag that means "either". `--session-id` is refused for a
+/// conversation that already exists — *"Session ID … is already in use"* — and
+/// `--resume` for one that does not, so the choice has to be made by looking,
+/// and the only thing that really knows is the agent's own store.
+///
+/// A marker file of ours was the alternative, and it was wrong exactly when it
+/// mattered: cleaned up, moved, or never written because the first run was
+/// killed before it got that far. The conversation outlives our bookkeeping,
+/// and asking the store is the answer that cannot drift from the truth.
+fn conversation_flag(conversation: &str) -> &'static str {
+    match agent_store().is_some_and(|s| conversation_in(&s, conversation)) {
+        true => "--resume",
+        false => "--session-id",
+    }
+}
+
+/// Where Claude Code keeps its conversations.
+fn agent_store() -> Option<std::path::PathBuf> {
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+        return Some(std::path::PathBuf::from(dir));
+    }
+    std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".claude"))
+}
+
+/// Whether `store` already holds this conversation.
+///
+/// Split from the lookup so it can be tested against a directory laid out by
+/// hand: the alternative is writing `HOME` or `CLAUDE_CONFIG_DIR`, which is
+/// process-wide and races every other test in the binary.
+///
+/// One file per conversation, under a directory per project — and which project
+/// is not ours to guess, so every one of them is looked in.
+fn conversation_in(store: &std::path::Path, conversation: &str) -> bool {
+    let Ok(projects) = std::fs::read_dir(store.join("projects")) else {
+        return false;
+    };
+    let name = format!("{conversation}.jsonl");
+    projects.flatten().any(|p| p.path().join(&name).is_file())
 }
 
 /// This commander described as an MCP server, in the JSON `--mcp-config` takes.
@@ -329,7 +401,7 @@ mod tests {
     /// fails at startup for a reason that names neither of them.
     #[test]
     fn the_typed_line_spends_only_what_the_environment_sets() {
-        let line = start_command("3");
+        let line = start_command("3", "11111111-2222-3333-4444-555555555555", "");
         if let Some(rest) = line.strip_prefix(attached_program()) {
             if rest.contains("--mcp-config") {
                 let named = format!("${MCP_CONFIG_VAR}");
@@ -343,6 +415,13 @@ mod tests {
         } else {
             panic!("the line must start with the program: {line}");
         }
+        // The same coupling for the conversation, which is always spent.
+        let env = environment("3", "work", "11111111-2222-3333-4444-555555555555");
+        assert!(line.contains(&format!("${CONVERSATION_VAR}")), "{line}");
+        assert!(
+            env.iter().any(|(k, _)| k == CONVERSATION_VAR),
+            "the line spends {CONVERSATION_VAR}, which nothing sets"
+        );
     }
 
     /// The description is JSON: braces, quotes, and a socket path that on macOS
@@ -350,10 +429,69 @@ mod tests {
     /// survive being quoted through a shell to get there, and it does not.
     #[test]
     fn the_description_never_reaches_the_command_line() {
-        let line = start_command("3");
+        let line = start_command("3", "11111111-2222-3333-4444-555555555555", "");
         for c in ['{', '}', '\''] {
             assert!(!line.contains(c), "{c:?} in the typed line: {line}");
         }
+    }
+
+    /// There is no flag that means "either". `--session-id` is refused for a
+    /// conversation that already exists and `--resume` for one that does not,
+    /// so this has to be decided by looking — and the agent's own store is the
+    /// only thing that knows.
+    #[test]
+    fn the_store_decides_which_flag() {
+        let store = std::env::temp_dir().join(format!("dmac-store-{}", std::process::id()));
+        let project = store.join("projects").join("-Users-someone-code");
+        std::fs::create_dir_all(&project).expect("scratch");
+        let known = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        std::fs::write(project.join(format!("{known}.jsonl")), "{}\n").expect("write");
+
+        assert!(
+            conversation_in(&store, known),
+            "a conversation the store holds has to be found in whichever project it is under"
+        );
+        assert!(
+            !conversation_in(&store, "ffffffff-0000-4000-8000-000000000000"),
+            "and one it does not hold must not be"
+        );
+        // A store that is not there at all is not an error, it is a first run.
+        assert!(!conversation_in(&store.join("nope"), known));
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    /// A conversation nothing has ever heard of is a first start, and a first
+    /// start is `--session-id`. Never a bare `--resume`: that does not fail,
+    /// it silently opens whichever conversation was most recent.
+    #[test]
+    fn an_unknown_conversation_is_started_and_not_resumed() {
+        let line = start_command("3", "ffffffff-0000-4000-8000-000000000000", "");
+        assert!(line.contains("--session-id"), "{line}");
+        assert!(!line.contains("--resume"), "{line}");
+    }
+
+    /// What the user chose is theirs and comes back untouched; what belonged to
+    /// the run that ended does not — its socket died with it, and its
+    /// `--session-id` names a conversation that now exists.
+    #[test]
+    fn a_resumed_line_keeps_their_arguments_and_replaces_ours() {
+        let saved = "/opt/homebrew/bin/claude --mcp-config {\"mcpServers\":{\"dmac\":{}}} \
+                     --session-id aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee --model opus \
+                     --permission-mode plan";
+        let line = resume_command("3", "ffffffff-0000-4000-8000-000000000000", saved);
+
+        assert!(line.starts_with(attached_program()), "{line}");
+        assert!(line.contains("--model opus"), "{line}");
+        assert!(line.contains("--permission-mode plan"), "{line}");
+        assert!(
+            !line.contains("mcpServers"),
+            "the dead run's description came back: {line}"
+        );
+        assert!(
+            !line.contains("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"),
+            "the old conversation id is on the line: {line}"
+        );
+        assert_eq!(line.matches("--session-id").count(), 1, "{line}");
     }
 
     /// Nothing this sets may change what a command resolves to. That was the

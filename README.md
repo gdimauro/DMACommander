@@ -41,10 +41,12 @@ running inside. `F9` then `c` starts `claude` already connected to it — by
 typing the line at the shell, where you can read it before it runs:
 
 ```sh
-claude --mcp-config "$DMAC_MCP_CONFIG"
+claude --mcp-config "$DMAC_MCP_CONFIG" --session-id "$DMAC_CONVERSATION"
 ```
 
-Every hosted shell is given that variable, so the same line works by hand.
+It rejoins the same conversation every time rather than starting a fresh one —
+`--resume` once that conversation exists. Every hosted shell is given both
+variables, so the same line works by hand.
 See [docs/MCP.md](docs/MCP.md).
 
 Nothing is put on your `PATH` and no rc file of yours is written. An earlier

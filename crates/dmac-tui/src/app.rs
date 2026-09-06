@@ -1435,10 +1435,14 @@ impl App {
             let Some(saved) = self.sessions.at_mut(i).reattach.take() else {
                 continue;
             };
-            // Replayed as a resume: the saved line names the conversation it
-            // *created*, and running it verbatim asks for one that already
-            // exists. Every other argument the user chose is kept.
-            let command = dmac_session::agent::as_resume(&saved);
+            // Never verbatim: the saved line names the conversation it
+            // *created*, and asking for that one again is refused. Ours is
+            // stripped and put back as this run's — the conversation resumed,
+            // this commander's socket, and every argument the user chose kept.
+            let session = self.sessions.at_mut(i);
+            let id = session.id.0.to_string();
+            let conversation = session.conversation_id().to_string();
+            let command = dmac_session::agent::resume_command(&id, &conversation, &saved);
             let program = command
                 .split_whitespace()
                 .next()
@@ -3447,7 +3451,9 @@ impl App {
         let waker = self.waker();
         let (cols, rows) = self.shell_size();
         let session = self.sessions.current_mut();
-        let line = dmac_session::agent::start_command(&session.id.0.to_string());
+        let id = session.id.0.to_string();
+        let conversation = session.conversation_id().to_string();
+        let line = dmac_session::agent::start_command(&id, &conversation, "");
         let shell = match session.shell(cols, rows, waker) {
             Ok(shell) => shell,
             Err(e) => {
@@ -4334,8 +4340,9 @@ mod tests {
 
     /// The saved line is an `argv` seen through `ps`, quoting and all already
     /// gone — replaying it verbatim asks for a conversation that already exists
-    /// *and* hands the shell a JSON object to glob. The offer is the command;
-    /// the conversation travels beside it, for the shim to name.
+    /// *and* hands the shell a JSON object to glob. What is offered is the
+    /// command: their arguments kept, ours named through the variables the
+    /// hosted shell already has, so nothing has to survive being quoted twice.
     #[tokio::test]
     async fn the_offer_is_the_command_and_not_the_old_expansion() {
         let mut app = fixture();
@@ -4345,10 +4352,18 @@ mod tests {
         app.reattach_agents();
 
         let p = &app.pending[0];
-        // The shim names the conversation, from the session, quoted properly.
-        // Carrying the old id here means carrying it through a shell, and a
-        // saved line has already lost the quoting that made it one argument.
-        assert_eq!(p.command, "claude --verbose");
+        assert!(p.command.starts_with("claude "), "{}", p.command);
+        assert!(p.command.contains("--verbose"), "{}", p.command);
+        assert!(
+            p.command.contains("\"$DMAC_CONVERSATION\""),
+            "the conversation has to travel as the variable: {}",
+            p.command
+        );
+        assert!(
+            !p.command.contains(&id),
+            "carrying the id itself means carrying it through a shell: {}",
+            p.command
+        );
         assert_eq!(
             p.conversation, id,
             "the conversation must still be the one being offered"

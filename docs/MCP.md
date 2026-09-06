@@ -34,11 +34,20 @@ Nothing on `PATH` is touched, so this is something you ask for — one line, in 
 shell DMACommander is hosting:
 
 ```sh
-claude --mcp-config "$DMAC_MCP_CONFIG"
+claude --mcp-config "$DMAC_MCP_CONFIG" --session-id "$DMAC_CONVERSATION"
 ```
 
-That is exactly what the utilities menu types for you (`F9`, then `c`). It is
-the *variable* and not its value on purpose: the value is JSON full of braces
+That is exactly what the utilities menu types for you (`F9`, then `c`) — with
+`--resume` in place of `--session-id` once that conversation exists, so closing
+the commander and coming back reopens the conversation instead of starting a
+fresh one. There is no flag meaning "either": `--session-id` is refused for a
+conversation that already exists and `--resume` for one that does not, so the
+choice is made by looking in the agent's own store
+(`$CLAUDE_CONFIG_DIR`, or `~/.claude`). A marker file of ours was the
+alternative, and it was wrong exactly when it mattered — the conversation
+outlives our bookkeeping.
+
+Both are the *variable* and not its value on purpose: the value is JSON full of braces
 wrapped around a socket path with a space in it, and a command line carrying
 that is one nobody can read — and one that `zsh` would try to glob before
 `claude` ever saw it. Through the environment it arrives as a single argument,
