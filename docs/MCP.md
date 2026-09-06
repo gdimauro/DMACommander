@@ -11,91 +11,45 @@ screen.
   claude ──stdio──> dmac --mcp <socket> ──unix socket──> the running commander
 ```
 
-DMACommander listens on `<config>/mcp/<pid>.sock` for as long as it runs. When
-it starts a shell for a session it writes a shim in
-`<config>/shims/run-<pid>/<session>/` carrying the MCP description inline —
-`--mcp-config` takes JSON as readily as a filename — so:
+DMACommander listens on `<config>/mcp/<pid>.sock` for as long as it runs, and
+tells every shell it hosts where that is. `dmac --mcp <socket>` is a few dozen
+lines of pipe: MCP clients start their servers themselves, as child processes
+with pipes, and this is what puts one of them in touch with the commander
+already on screen rather than a fresh one.
 
-```sh
-claude              # becomes: claude --mcp-config '{"mcpServers":{...}}' --resume <uuid>
-```
-
-Nothing to install and nothing to configure. `dmac --mcp <socket>` is a few
-dozen lines of pipe: MCP clients start their servers themselves, as child
-processes with pipes, and this is what puts one of them in touch with the
-commander already on screen rather than a fresh one.
-
-Nothing describing the server is written to a file. A file has to live
-somewhere, and wherever that somewhere is a second commander wants it too:
-session ids are indices, so two commanders each have a session `0`. When they
-shared one, the second to start rewrote the first one's configuration to name
-*its* socket, and every agent the first commander hosted was left pointed at a
-socket that died with the other commander — configured, and answering nothing.
-The description belongs to the run, so it travels inside the run's own shim.
-
-The shim directory carries the pid for the same reason, and directories
-belonging to runs that have ended are swept at startup.
-
-The one thing that does *not* move with the run is the marker recording that a
-conversation has been started once: it lives in `<config>/agents/`, because it
-describes the conversation rather than the run and has to outlive both.
-
-The environment carries the same facts for anything that is not `claude`:
+Named by pid, so two commanders on one machine never fight over it. Sockets
+left by runs that have ended are swept at startup.
 
 | Variable            | What it is                          |
 | ------------------- | ----------------------------------- |
 | `DMAC_MCP_SOCKET`   | The socket to connect to            |
-| `DMAC_SHIM_DIR`     | Where this session's shims live     |
 | `DMAC_SESSION`      | The session's name                  |
+| `DMAC_SESSION_ID`   | The session, as `--mcp-session` takes it |
 | `DMAC_CONVERSATION` | The agent conversation it owns      |
 
-## When the shim is not reached
+## Connecting an agent to it
 
-The shim only works while it is the first `claude` on `PATH`, and `PATH` is not
-DMACommander's to keep. The environment above is handed to the shell *before* it
-reads its rc files, and the ordinary
-
-```sh
-export PATH="$HOME/.local/bin:$PATH"
-```
-
-in a `.zshrc` runs afterwards and puts that directory in front of ours. The
-agent then starts from your own `PATH`, perfectly well, knowing nothing about
-which conversation it belongs to and unable to see the panels it is running
-inside — and nothing anywhere says so. The symptom is an absence, which is the
-hardest kind of thing to go looking for.
-
-One case is immune: when **DMACommander itself** launches the agent — resuming a
-conversation at startup — there is no interactive shell in between, no rc file
-runs, and the shim wins. It is only what *you* type in a hosted shell that your
-own configuration gets to reorder.
-
-So startup asks. Not by reading `PATH` here — the answer depends on what the rc
-files do after we hand over, and the only thing that knows that is the shell.
-It is started the way a session starts it, interactive and with the same
-environment, and asked where `claude` resolves. When the answer is not the shim,
-you are told what runs instead and offered the fix:
+Nothing on `PATH` is touched, so this is something you ask for. For Claude Code,
+in a shell DMACommander is hosting — `--mcp-config` takes JSON as readily as a
+filename:
 
 ```sh
-# Added by DMACommander …
-if [ -n "$DMAC_SHIM_DIR" ] && [ "${PATH%%:*}" != "$DMAC_SHIM_DIR" ]; then
-  PATH="$DMAC_SHIM_DIR:$PATH"
-  export PATH
-fi
+claude --mcp-config "{\"mcpServers\":{\"dmac\":{\"command\":\"dmac\",\"args\":[\"--mcp\",\"$DMAC_MCP_SOCKET\",\"--mcp-session\",\"$DMAC_SESSION_ID\"]}}}"
 ```
 
-Appended to your rc file, never inserted: it has to run after whatever else that
-file does to `PATH`, and that is the entire point. Written in terms of the
-variable and not the directory, because the directory is named after this run's
-pid and will not exist tomorrow — so the line stays correct for every future
-run, and does nothing at all in a shell DMACommander did not start.
+Worth an alias in your own rc file, where you can see it. `--mcp-session` is
+what makes a tool answer about the session the agent is hosted in rather than
+whichever one happens to be on screen; leave it out and the tools still work,
+they just follow the user around.
 
-Nothing is written without a yes. Saying no leaves the file alone and says, in
-the status line, what the agent in that session will be running instead.
-
-Shells whose configuration we do not know how to write are told rather than
-asked: the same diagnosis, and `$DMAC_SHIM_DIR` to put in front of `PATH`
-wherever that shell's last word on it lives.
+There was once a shim for this — a `claude` script planted early on the hosted
+shell's `PATH` that added all of the above by itself. It is gone. `PATH` is not
+ours to keep: the shell reads its rc files after we hand over, and the ordinary
+`export PATH="$HOME/.local/bin:$PATH"` puts that directory in front of ours. So
+the shim worked or did not depending on someone else's dotfiles, and when it did
+not, it failed silently — the agent started perfectly well, knowing nothing. A
+line you wrote yourself is worth more than a mechanism that is right most of the
+time and gives no sign when it is not.
 
 ## The tools
 

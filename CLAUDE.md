@@ -98,5 +98,5 @@ agent — that is deliberate, not an oversight.
 
 Current phase: **M1**, starting with `dmac-config` — still the open gap: this
 program hosts agents and remembers everything you had open, and cannot yet move
-a byte. Most of **M2** landed ahead of it (live sessions, hosting in a PTY, the
-agent shim, the MCP server); `docs/PLAN.md` says what that leaves owing.
+a byte. Most of **M2** landed ahead of it (live sessions, hosting in a PTY,
+agent reattachment, the MCP server); `docs/PLAN.md` says what that leaves owing.

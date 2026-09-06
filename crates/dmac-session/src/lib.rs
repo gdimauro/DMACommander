@@ -225,27 +225,13 @@ impl Session {
             .get_or_insert_with(dmac_core::tools::uuid_v4)
     }
 
-    /// Where this session's shims live, written if they are not there yet.
-    ///
-    /// `None` when there is no agent to attach to, which is also when there is
-    /// nothing to check: a shim that was never written cannot be shadowed.
-    pub fn shim_dir(&mut self) -> Option<std::path::PathBuf> {
-        let root = agent_root()?;
-        let id = self.id.0.to_string();
-        let conversation = self.conversation_id().to_string();
-        agent::prepare(&root, &id, &conversation)
-    }
-
-    /// Environment for a shell started in this session: the shim directory on
-    /// `PATH`, and the ids in plain sight.
+    /// Environment for a shell started in this session: the ids, in plain
+    /// sight. Nothing on `PATH` — what a command resolves to in the user's
+    /// shell stays the user's business.
     fn agent_environment(&mut self) -> Vec<(String, String)> {
-        let name = self.name.clone();
+        let (id, name) = (self.id.0.to_string(), self.name.clone());
         let conversation = self.conversation_id().to_string();
-        match self.shim_dir() {
-            Some(dir) => agent::environment(&dir, &name, &conversation),
-            // No agent installed: no shim, and no PATH surgery for nothing.
-            None => Vec::new(),
-        }
+        agent::environment(&id, &name, &conversation)
     }
 
     /// The attached agent running in this session's shell right now, if any.
@@ -541,8 +527,8 @@ pub fn abbreviate_home(path: &str) -> String {
 
 /// Where per-session scratch belonging to DMACommander lives.
 ///
-/// Beside the session file, so a session and the shims that serve it are
-/// removed together and a backup of one carries the other.
+/// Beside the session file, so a session and what serves it are removed
+/// together and a backup of one carries the other.
 pub fn agent_root() -> Option<std::path::PathBuf> {
     crate::store::SessionStore::platform_default()
         .ok()

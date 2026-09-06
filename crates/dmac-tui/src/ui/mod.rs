@@ -12,7 +12,6 @@ pub(crate) mod rail;
 pub(crate) mod reattach;
 mod screen;
 pub(crate) mod shell;
-mod shim;
 mod splash;
 
 pub use screen::draw_canvas;
@@ -283,11 +282,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
         crate::app::Mode::Reattach { selected } => {
             reattach::draw(frame, area, &app.pending, selected, theme);
-        }
-        crate::app::Mode::ShimPath => {
-            if let Some(shim) = &app.shim {
-                shim::draw(frame, area, shim, theme);
-            }
         }
         crate::app::Mode::Rail { .. } | crate::app::Mode::Normal => {
             app.layout.picker = ratatui::layout::Rect::default();

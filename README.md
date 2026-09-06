@@ -35,18 +35,16 @@ In a hosted shell, `Shift-PgUp/PgDn` reads back through what it has printed and
 the session rail, whose two widths you can drag or resize with `Left`/`Right`.
 See [docs/TERMINAL-KEYS.md](docs/TERMINAL-KEYS.md).
 
-Run `claude` in a hosted shell and it comes up already knowing where it is:
-DMACommander describes itself to it as an MCP server, so the agent can see both
-panels, the history and the sessions it is running inside, and it rejoins the
-same conversation every time rather than starting a fresh one. Nothing to
-install — a shim early on `PATH` does it.
+DMACommander is an MCP server for as long as it runs, so an agent hosted in a
+shell here can see both panels, the history, the sessions and the screen it is
+running inside. Every hosted shell is told where to find it in
+`$DMAC_MCP_SOCKET`; connecting an agent to it is one line you write yourself.
+See [docs/MCP.md](docs/MCP.md).
 
-That shim is also the one thing your own shell can quietly defeat: a `.zshrc`
-that does `PATH="$HOME/.local/bin:$PATH"` runs *after* DMACommander has had its
-say and puts its own directory first, and then `claude` starts from your `PATH`
-knowing none of the above. Startup asks your shell where `claude` actually
-resolves and offers to add a line to your rc file if the answer is wrong —
-nothing is written unless you say yes. See [docs/MCP.md](docs/MCP.md).
+Nothing is put on your `PATH` and no rc file of yours is written. An earlier
+version planted a `claude` shim to do all of this by itself, which worked
+exactly as long as no dotfile put its own directory first — and gave no sign
+when one did.
 
 Keys bound to subsystems that do not exist yet say so in the status line rather
 than doing nothing.

@@ -77,12 +77,12 @@ What is running:
 - **Startup resolution**, three of the five steps: `--session`, then
   `$DMAC_SESSION`, then a `.dmac-session` file walked up from the working
   directory. Auto-resume and the picker are still to come.
-- **Agents are attached, not merely launched.** A shim early on `PATH` gives
-  every `claude` started in a session that session's conversation id, so closing
-  the commander and coming back reopens the conversation rather than a fresh
-  one — and the restart *asks* before resuming anything. Startup also checks
-  that the shim is actually being reached, because an rc file that reorders
-  `PATH` silently defeats it.
+- **Agents come back with the session.** What a session was running is read
+  from `ps`, saved verbatim, and offered back on the next start as a resume —
+  the restart *asks* before reopening anything, and clears whatever is still
+  holding that conversation first. Nothing is planted on `PATH` to arrange it:
+  a shim there is defeated silently by any rc file that reorders `PATH`, which
+  is why the one that used to be here is gone.
 - **The commander is itself an MCP server**, so a hosted agent can see the
   panels, the history, the sessions and the screen. Ten tools, one socket per
   run, described to the agent inline so two commanders never share a file.

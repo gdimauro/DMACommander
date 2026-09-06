@@ -63,13 +63,6 @@ pub(crate) enum Update {
     /// message exists only to break the event loop out of its wait, and the
     /// frame that follows reads the emulator directly.
     ShellOutput,
-    /// A hosted shell would not reach the agent shim: something else on
-    /// `PATH` answers to `claude` first. Only sent when that is the case —
-    /// there is nothing to say when it works.
-    ShimShadowed {
-        by: std::path::PathBuf,
-        rc: Option<std::path::PathBuf>,
-    },
     /// One line of MCP, from an agent talking to the commander it is running
     /// inside. Parsed on the connection's task, answered here — so no
     /// application state is ever behind a lock, and a slow client cannot stall
@@ -149,9 +142,6 @@ pub(crate) enum Mode {
     Reattach {
         selected: usize,
     },
-    /// "The agent shim is being shadowed — fix it?". What was found and which
-    /// file would change live on `App`.
-    ShimPath,
 }
 
 /// An agent the last run was hosting, waiting to be resumed.
@@ -167,30 +157,13 @@ pub(crate) struct Pending {
     pub session_name: String,
     /// `claude`, `codex`, whatever it was.
     pub program: String,
-    /// What will actually be run: the command, not the expansion of it. The
-    /// shim on `PATH` puts the conversation and the commander's description
-    /// back, correctly quoted — see [`dmac_session::agent::as_resume`].
+    /// What will actually be run: the command, not the expansion of it —
+    /// see [`dmac_session::agent::as_resume`].
     pub command: String,
     pub conversation: String,
     /// Unticked rows are left alone: their conversation id is kept, so running
     /// the agent by hand later still comes back to it.
     pub chosen: bool,
-}
-
-/// A shim a hosted shell would not reach, and what could be done about it.
-///
-/// Worth interrupting for, because nothing else will ever mention it: the
-/// agent starts, works, and is simply blind — no conversation of its own, no
-/// panels, no sessions. The symptom is an absence, which is the hardest kind
-/// of thing to go looking for.
-#[derive(Debug, Clone)]
-pub(crate) struct ShimShadowed {
-    /// What the shell runs instead.
-    pub by: std::path::PathBuf,
-    /// The rc file that would have to change. `None` for a shell whose
-    /// configuration we do not know how to write — then this is a warning and
-    /// not an offer, and there is nothing to say yes to.
-    pub rc: Option<std::path::PathBuf>,
 }
 
 /// What a prompt is collecting. The value itself lives on `App`, because a
@@ -290,9 +263,6 @@ pub struct App {
     pub(crate) fullscreen: bool,
     /// Agents from the last run, waiting for an answer to "resume?".
     pub(crate) pending: Vec<Pending>,
-    /// A shim a hosted shell would not reach, waiting for an answer to "fix
-    /// it?". Cleared once asked, either way: it is a question, not a nag.
-    pub(crate) shim: Option<ShimShadowed>,
     /// Which session the MCP call being handled belongs to — the session the
     /// calling agent is hosted in. Set for the duration of one call, so a tool
     /// answers about the agent's own panels rather than about whichever session
@@ -535,7 +505,6 @@ impl App {
             should_quit: false,
             fullscreen: false,
             pending: Vec::new(),
-            shim: None,
             mcp_session: None,
             history_filter: String::new(),
             last_history_click: None,
@@ -766,10 +735,6 @@ impl App {
                 items,
             } => self.apply_completion(session, generation, start, items),
             Update::Editor(Ok(message) | Err(message)) => self.status = message,
-            Update::ShimShadowed { by, rc } => {
-                self.shim = Some(ShimShadowed { by, rc });
-                self.raise_shim_question();
-            }
             Update::Rebuilt(Ok(())) => self.restart_in_place(),
             // A failed build changes nothing: the point of building first is
             // that a broken tree costs you a message, not your session.
@@ -1464,27 +1429,6 @@ impl App {
         self.reload_session(index, PanelId::Right);
     }
 
-    /// Find out, in the background, whether a shell started here would reach
-    /// the shim at all — and say so if it would not.
-    ///
-    /// In the background because the only honest way to ask is to start the
-    /// user's shell and let it read its rc files, which is as slow as their rc
-    /// files are. Nothing is sent unless there is a problem, so the common
-    /// case costs a thread and no interruption.
-    pub(crate) fn check_shim(&mut self) {
-        let Some(dir) = self.ses_mut().shim_dir() else {
-            return;
-        };
-        let tx = self.tx.clone();
-        tokio::task::spawn_blocking(move || {
-            if let dmac_session::agent::ShimCheck::Shadowed { by, rc } =
-                dmac_session::agent::check(&dir)
-            {
-                let _ = tx.send(Update::ShimShadowed { by, rc });
-            }
-        });
-    }
-
     pub(crate) fn reattach_agents(&mut self) {
         self.pending.clear();
         for i in 0..self.sessions.len() {
@@ -1555,9 +1499,6 @@ impl App {
                 n => format!("resumed {started} — cleared {n} left over"),
             };
         }
-        // Especially now: what was just resumed went through the same `PATH`,
-        // and if the shim is not on it those agents are the blind ones.
-        self.raise_shim_question();
     }
 
     /// Say no. The conversation ids are kept either way: running the agent by
@@ -1569,7 +1510,6 @@ impl App {
         if n > 0 {
             self.status = format!("left {n} conversation(s) alone — run the agent to pick one up");
         }
-        self.raise_shim_question();
     }
 
     /// Bring this session's editor window forward, if it has one.
@@ -1607,47 +1547,6 @@ impl App {
                 name: s.name.clone(),
             })
             .collect()
-    }
-
-    /// Ask about the shim, if there is anything to ask and nothing else is
-    /// asking. Called from the event loop, so it waits for whatever else is
-    /// open — "resume?" comes first, and a second dialog appearing over it
-    /// would take an answer meant for the first.
-    pub(crate) fn raise_shim_question(&mut self) {
-        if self.shim.is_some() && self.mode == Mode::Normal {
-            self.mode = Mode::ShimPath;
-        }
-    }
-
-    /// Driving the "fix it?" question.
-    fn shim_key(&mut self, k: KeyEvent) {
-        let shim = self.shim.take();
-        self.mode = Mode::Normal;
-        let Some(shim) = shim else {
-            return;
-        };
-        let yes = matches!(
-            k.code,
-            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y')
-        );
-        let Some(rc) = shim.rc.filter(|_| yes) else {
-            // Either they said no, or there was nothing to offer. Both leave
-            // the file alone, and both are worth a line: the agent in this
-            // session is blind either way, and that should not be a surprise
-            // later.
-            self.status = format!(
-                "left alone \u{2014} the agent here runs {} and joins no conversation",
-                shim.by.display()
-            );
-            return;
-        };
-        self.status = match dmac_session::agent::repair(&rc) {
-            Ok(()) => format!(
-                "{} now puts the shim first \u{2014} open a new shell for it to take",
-                rc.display()
-            ),
-            Err(e) => format!("could not write {}: {e}", rc.display()),
-        };
     }
 
     /// Driving the "resume?" question.
@@ -2296,7 +2195,6 @@ impl App {
             Mode::Utilities { selected } => return self.utilities_key(k, selected),
             Mode::History { selected } => return self.history_key(k, selected),
             Mode::Reattach { selected } => return self.reattach_key(k, selected),
-            Mode::ShimPath => return self.shim_key(k),
             Mode::Normal => {}
         }
 
@@ -3540,11 +3438,10 @@ impl App {
 
     /// Start this session's agent in its shell, and show the shell.
     ///
-    /// Typed at the shell rather than spawned beside it: the shim on `PATH` is
-    /// what gives the agent this session's conversation and the commander's own
-    /// MCP description, and it only gets to do that for something the shell
-    /// runs. Starting the binary directly would produce an agent that knows
-    /// none of it.
+    /// Typed at the shell rather than spawned beside it, so it is the user's
+    /// own shell that runs it — with their aliases, their functions and their
+    /// `PATH` — and so the line is visible, editable, and in the history like
+    /// anything else they typed.
     fn start_agent_here(&mut self) {
         let agent = dmac_session::agent::attached_program();
         let waker = self.waker();
@@ -3779,9 +3676,10 @@ pub async fn run(mut start: Startup) -> anyhow::Result<()> {
         // get nothing from.
         if let Some(root) = dmac_session::agent_root() {
             dmac_mcp::clear_stale_sockets(&root);
-            // The same sweep for the shim directories, which are named by pid
-            // for the same reason and would otherwise accumulate one per run.
-            dmac_session::agent::clear_stale_shims(&root);
+            // And the shim directories earlier versions planted: nothing
+            // writes them any more, so this is a sweep that runs once and
+            // finds nothing ever after.
+            dmac_session::agent::clear_shims(&root);
         }
         crate::mcp::listen(socket, app.tx.clone());
     }
@@ -3821,11 +3719,6 @@ pub async fn run(mut start: Startup) -> anyhow::Result<()> {
     let mut first_frame = true;
 
     loop {
-        // Cheap, and here rather than only where the answer arrives: the check
-        // lands a second or two into the run, by which time the user may have
-        // opened something. Asked from the loop, the question waits for them to
-        // be back at the panels instead of being lost to whatever was open.
-        app.raise_shim_question();
         app.before_frame();
         guard.terminal().draw(|f| ui::draw(f, &mut app))?;
         app.sync_shell_size();
@@ -3834,7 +3727,6 @@ pub async fn run(mut start: Startup) -> anyhow::Result<()> {
             // After the frame, so a cold start still shows something inside its
             // budget and the spawning happens where the user can watch it.
             app.reattach_agents();
-            app.check_shim();
         }
         // After the frame, never during it: stdout is shared with ratatui and
         // interleaving with a half-written frame corrupts both.
@@ -4544,49 +4436,6 @@ mod tests {
         app.ses_mut().cwd[0] = remote;
         app.ses_mut().active = PanelId::Left;
         assert!(app.editor_here_target().is_err());
-    }
-
-    /// The check comes back a second or two into the run, by which time the
-    /// user may have opened something. A question that arrived while another
-    /// was on screen used to be kept and never shown again.
-    #[test]
-    fn the_shim_question_waits_for_whatever_is_open() {
-        let mut app = App::for_test();
-        app.mode = Mode::History { selected: 0 };
-        app.apply(Update::ShimShadowed {
-            by: std::path::PathBuf::from("/usr/local/bin/claude"),
-            rc: Some(std::path::PathBuf::from("/tmp/rc")),
-        });
-        assert_eq!(app.mode, Mode::History { selected: 0 }, "must not barge in");
-
-        app.mode = Mode::Normal;
-        app.raise_shim_question();
-        assert_eq!(app.mode, Mode::ShimPath, "and must not be forgotten either");
-    }
-
-    /// Once answered it is done: a warning that comes back every time the
-    /// panels are on screen is a warning nobody reads.
-    #[test]
-    fn the_shim_question_is_asked_once() {
-        let mut app = App::for_test();
-        app.apply(Update::ShimShadowed {
-            by: std::path::PathBuf::from("/usr/local/bin/claude"),
-            rc: None,
-        });
-        assert_eq!(app.mode, Mode::ShimPath);
-
-        app.on_key(KeyEvent::from(KeyCode::Char('n')));
-        assert_eq!(app.mode, Mode::Normal);
-        assert!(app.shim.is_none());
-        app.raise_shim_question();
-        assert_eq!(app.mode, Mode::Normal);
-        // Saying no is not silence: the agent in this session is blind, and the
-        // status line is where that gets said.
-        assert!(
-            app.status.contains("/usr/local/bin/claude"),
-            "{}",
-            app.status
-        );
     }
 
     /// Space unticks one row without answering for the others: on a restart

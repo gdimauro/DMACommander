@@ -1,64 +1,32 @@
-//! Keeping a hosted agent — Claude Code, in practice — attached to the session
-//! it belongs to, across restarts.
+//! Recognising a hosted agent — Claude Code, in practice — and bringing it back
+//! with the session it belongs to.
 //!
-//! The mechanism is a shim: a small `claude` script early on the hosted shell's
-//! `PATH`, which adds the session's own conversation id to every invocation.
-//! A shim rather than rewriting what the user types, because they mostly do not
-//! type it here at all — they type it *inside* the hosted shell, where
-//! DMACommander never sees the keystrokes. It also means `ps` shows the id and
-//! the directory, so which conversation a process belongs to is visible from
-//! outside.
+//! There used to be a shim here: a `claude` script planted early on the hosted
+//! shell's `PATH`, which added the session's conversation id to every
+//! invocation. It is gone. `PATH` is not ours to keep — the shell reads its rc
+//! files after we set it, and an rc file that puts its own directory in front
+//! puts it in front of ours — so the shim worked or did not depending on
+//! someone else's dotfiles, and when it did not it failed in silence.
+//!
+//! What is left works on what can actually be observed: the command line of
+//! whatever is running in the shell, read through `ps`. If the user starts an
+//! agent with a conversation id, that id is in its arguments, and this module
+//! saves the line, hands it back as a resume on the next run, and clears
+//! anything still holding the conversation. Nothing is written to the user's
+//! machine, and nothing depends on being found first on a search path.
 
-use std::path::{Path, PathBuf};
-
-/// Programs worth attaching to a session.
+/// Programs worth recognising as an agent, by the name people run them under.
 ///
 /// One entry today. It is a list because the next one — any agent CLI with
 /// resumable conversations — needs exactly the same treatment, and a list makes
 /// that obvious to whoever adds it.
-const ATTACHED: &[Attach] = &[Attach {
-    program: "claude",
-    // Flags that mean "I have decided which conversation this is". The shim
-    // must not add a second opinion.
-    explicit: &[
-        "--session-id",
-        "--resume",
-        "-r",
-        "-c",
-        "--continue",
-        "--fork-session",
-        "--from-pr",
-        "--cloud",
-    ],
-    new_flag: "--session-id",
-    resume_flag: "--resume",
-    mcp_flag: Some("--mcp-config"),
-}];
-
-struct Attach {
-    program: &'static str,
-    explicit: &'static [&'static str],
-    new_flag: &'static str,
-    resume_flag: &'static str,
-    /// How this program is told about an extra MCP server, if it can be. The
-    /// commander describes itself to whatever it hosts: an agent that has to be
-    /// told in prose where the panels are is working from a blurred photograph.
-    mcp_flag: Option<&'static str>,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum AgentError {
-    #[error("could not write the agent shim: {0}")]
-    Io(#[from] std::io::Error),
-}
+const ATTACHED: &[&str] = &["claude"];
 
 /// The agent a session hosts, named once. The menu that offers to start it and
-/// the shim that intercepts it have to agree, and the way to guarantee that is
-/// for there to be one name. The first of [`ATTACHED`] because that is the one
-/// that exists; a second agent needs a second menu entry, and whoever adds it
-/// will find this.
+/// the code that recognises it running have to agree, and the way to guarantee
+/// that is for there to be one name.
 pub fn attached_program() -> &'static str {
-    ATTACHED[0].program
+    ATTACHED[0]
 }
 
 /// Which attached program, if any, is among these running commands.
@@ -88,7 +56,7 @@ fn is_attached(line: &str) -> bool {
     let Some(first) = words.first().map(|w| base(w)) else {
         return false;
     };
-    if ATTACHED.iter().any(|a| a.program == first) {
+    if ATTACHED.contains(&first.as_str()) {
         return true;
     }
     if INTERPRETERS.contains(&first.as_str())
@@ -97,7 +65,7 @@ fn is_attached(line: &str) -> bool {
         // `node /path/claude.js` and `sh /path/claude` both count; the
         // extension is not part of the name people know it by.
         let stem = second.split('.').next().unwrap_or(&second);
-        return ATTACHED.iter().any(|a| a.program == stem);
+        return ATTACHED.contains(&stem);
     }
     false
 }
@@ -107,19 +75,18 @@ fn is_attached(line: &str) -> bool {
 ///
 /// The input is not a command line. It is an `argv` observed through `ps` and
 /// rejoined with spaces, so every quote its author wrote is already gone —
-/// which matters enormously, because the shim's `--mcp-config` argument is a
-/// JSON object full of braces and containing a path with a space in it. Handed
+/// which matters enormously, because a `--mcp-config` argument is a JSON
+/// object full of braces and containing a path with a space in it. Handed
 /// back to a shell it is not one argument any more: `zsh` word-splits it,
 /// tries to glob `{"mcpServers":{...}}`, and refuses the whole line with "bad
 /// pattern". That is not a thing to fix by quoting it again — the quoting that
 /// was lost cannot be recovered — so what comes back here is the *command*, not
 /// the expansion of it:
 ///
-/// - the program by its bare name, so the shim on `PATH` is what runs, rather
-///   than the absolute path the shim itself resolved to last time;
-/// - nothing of what the shim added — the socket in an old `--mcp-config` died
-///   with the run that printed it, and the conversation is the shim's to name,
-///   from the session, correctly quoted;
+/// - the program by its bare name, so what runs is whatever the user's shell
+///   resolves today, not the absolute path `ps` happened to show last time;
+/// - nothing that belonged to the run that is over — a socket named in an old
+///   `--mcp-config` died with the commander that printed it;
 /// - everything the *user* chose, untouched: a model, a permission mode, a
 ///   directory. That is what they set up, and it is not ours to drop.
 ///
@@ -217,176 +184,27 @@ pub fn clear_orphans(conversation: &str) -> usize {
 pub fn clear_orphans(_conversation: &str) -> usize {
     0
 }
-
-/// Where one commander keeps a session's shims.
+/// The environment a hosted shell is given: the ids, in plain sight.
 ///
-/// Under this process's own pid, because the session ids are indices: two
-/// commanders both have a session `0`, and a shared directory means the second
-/// one to start rewrites the first one's `mcp.json` to name *its* socket. The
-/// first commander is still running and still listening, but every agent it
-/// hosts is now pointed at a socket that dies with the other commander — the
-/// server is configured, and answers nothing. The socket is already named by
-/// pid for exactly this reason; the shims have to be too.
-/// Marks a shim directory as belonging to one run. Spelled out rather than
-/// left as a bare number because the old layout named these directories by
-/// session id — `0`, `1`, `2` — which read as perfectly good pids. Worse, pid
-/// `0` is not a process at all: `kill(0, 0)` asks about the caller's whole
-/// process group and says yes, so `shims/0` looked permanently alive and was
-/// never swept.
-const RUN_PREFIX: &str = "run-";
-
-fn shim_dir(root: &Path, session_id: &str) -> PathBuf {
-    root.join("shims")
-        .join(format!("{RUN_PREFIX}{}", std::process::id()))
-        .join(session_id)
-}
-
-/// Where the "this conversation has been started once" marker lives.
-///
-/// Keyed by conversation and kept out of the per-commander directory, because
-/// it describes the conversation and not the run: it has to outlive both. A
-/// marker that vanished on restart would send the next `claude` in with
-/// `--session-id` for a conversation that already exists, which is refused.
-fn marker_path(root: &Path, conversation: &str, program: &str) -> PathBuf {
-    root.join("agents")
-        .join(format!("{conversation}.{program}.started"))
-}
-
-/// Remove the shim directories of commanders that are no longer running.
-///
-/// One directory per run accumulates otherwise. Returns how many were removed.
-#[cfg(unix)]
-pub fn clear_stale_shims(root: &Path) -> usize {
-    let Ok(entries) = std::fs::read_dir(root.join("shims")) else {
-        return 0;
-    };
-    let me = std::process::id() as i32;
-    let mut removed = 0;
-    for e in entries.flatten() {
-        let path = e.path();
-        let Some(pid) = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .and_then(|s| s.strip_prefix(RUN_PREFIX))
-            .and_then(|s| s.parse::<i32>().ok())
-        else {
-            // Anything else is the older layout, where the directory was named
-            // by session id. Nothing reads those any more.
-            if path.is_dir() {
-                let _ = std::fs::remove_dir_all(&path);
-            }
-            continue;
-        };
-        // SAFETY: two integers in, one out; signal 0 delivers nothing.
-        #[allow(unsafe_code)]
-        let alive = unsafe { libc::kill(pid, 0) == 0 };
-        if pid == me || alive {
-            continue;
-        }
-        if std::fs::remove_dir_all(&path).is_ok() {
-            removed += 1;
-        }
-    }
-    removed
-}
-
-#[cfg(not(unix))]
-pub fn clear_stale_shims(_root: &Path) -> usize {
-    0
-}
-
-/// The shim directory for one session, created if needed.
-///
-/// Returns `None` when there is nothing to attach — no `claude` on `PATH` means
-/// no shim, rather than a script that shadows a program the user might install
-/// later and then fails to find it.
-pub fn prepare(root: &Path, session_id: &str, conversation: &str) -> Option<PathBuf> {
-    let dir = shim_dir(root, session_id);
-    // The shim writes its marker here with `: >`, which does not create
-    // directories; without this the marker silently never appears and every
-    // run looks like the first one.
-    let _ = std::fs::create_dir_all(root.join("agents"));
-    let mcp = mcp_config(root, session_id);
-    let mut wrote_any = false;
-    for a in ATTACHED {
-        let Some(real) = resolve(a.program, &dir) else {
-            continue;
-        };
-        let marker = marker_path(root, conversation, a.program);
-        let script = shim_script(a, &real, conversation, &marker, mcp.as_deref());
-        if write_executable(&dir.join(a.program), &script).is_ok() {
-            wrote_any = true;
-        }
-    }
-    wrote_any.then_some(dir)
-}
-
-/// Describe this commander as an MCP server the hosted agent can call.
-///
-/// Returned as the JSON `--mcp-config` takes directly — it accepts strings as
-/// well as files. Nothing is written to disk: a file would have to live
-/// somewhere, and wherever that somewhere is, a second commander wants it too.
-/// The description belongs to the run, so it travels inside the run's own shim
-/// rather than in a file both runs can see.
-///
-/// `None` when there is nothing to describe — no socket, or no binary to point
-/// at. Absent, everything else still works: the agent simply cannot see the
-/// panels.
-fn mcp_config(root: &Path, session_id: &str) -> Option<String> {
-    let binary = std::env::current_exe().ok()?;
-    // A test binary is not a commander. Without this, a `cargo test` run would
-    // hand a real agent something in `target/debug/deps` that the next build
-    // deletes — and the agent would report a broken MCP server it was never
-    // meant to have.
-    if binary.file_stem().is_none_or(|n| n != "dmac") {
-        return None;
-    }
-    let socket = dmac_mcp::socket_path(root, std::process::id());
-    // Only advertise a server that is actually there. Binding can fail — a path
-    // too long for a socket address, a read-only directory — and it fails
-    // silently, so describing it anyway hands the agent a path nothing answers
-    // on. An MCP server that is absent is better than one that is present and
-    // dead: the second wastes the user's time working out why the tools do not
-    // respond.
-    if !socket.exists() {
-        return None;
-    }
-    serde_json::to_string(&serde_json::json!({
-        "mcpServers": {
-            "dmac": {
-                "command": binary,
-                "args": ["--mcp", socket, "--mcp-session", session_id],
-            }
-        }
-    }))
-    .ok()
-}
-
-/// The environment a hosted shell needs so the shim is found and the id is
-/// visible to anything that wants it.
+/// No `PATH` surgery. Nothing here changes what a command resolves to — these
+/// are facts a script or an agent can read if it wants them, and ignore if it
+/// does not. `DMAC_MCP_SOCKET` is the one that earns its place: it is how
+/// anything running in this shell can find the commander hosting it without
+/// having been configured to.
 pub fn environment(
-    shim_dir: &Path,
+    session_id: &str,
     session_name: &str,
     conversation: &str,
 ) -> Vec<(String, String)> {
-    let path = match std::env::var("PATH") {
-        Ok(p) => format!("{}:{p}", shim_dir.display()),
-        Err(_) => shim_dir.display().to_string(),
-    };
     let mut env = vec![
-        ("PATH".to_string(), path),
-        // Named as well as prepended, because prepending is not the last word:
-        // the shell reads its rc files after this, and an rc file that puts its
-        // own directory in front of `PATH` puts it in front of ours too. A
-        // shell that can name the directory can put it back — which is what
-        // `repair` writes, and what `check` looks for the absence of.
-        (SHIM_DIR_VAR.to_string(), shim_dir.display().to_string()),
         ("DMAC_SESSION".to_string(), session_name.to_string()),
+        // The id as well as the name, because it is what the bridge takes:
+        // `--mcp-session` is how a tool call is answered about the session the
+        // agent is hosted in rather than whichever one is on screen. Without
+        // it the documented one-liner is subtly worse than what it replaces.
+        ("DMAC_SESSION_ID".to_string(), session_id.to_string()),
         ("DMAC_CONVERSATION".to_string(), conversation.to_string()),
     ];
-    // Also in the environment, not only in the agent's configuration file: a
-    // script, or an agent this program has never heard of, can find the
-    // commander without anyone having taught it about shims.
     if let Some(root) = crate::agent_root() {
         let socket = dmac_mcp::socket_path(&root, std::process::id());
         env.push(("DMAC_MCP_SOCKET".to_string(), socket.display().to_string()));
@@ -394,707 +212,65 @@ pub fn environment(
     env
 }
 
-/// The variable naming the shim directory to a hosted shell.
+/// Remove the shim directories earlier versions wrote.
 ///
-/// Also the marker that says the rc file has already been repaired: a file
-/// that mentions it at all is left alone, so running the repair twice writes
-/// nothing the second time.
-const SHIM_DIR_VAR: &str = "DMAC_SHIM_DIR";
-
-/// Marks off the one line of a shell's output that is an answer to us.
-const FENCE: &str = "--dmac--";
-
-/// Whether a hosted shell would actually reach the shim.
+/// Nothing creates them any more, so this is a one-way sweep rather than the
+/// per-run housekeeping it replaces. Worth doing rather than leaving behind:
+/// each of those directories holds an executable called `claude` that resolves
+/// to a path from a run that is long gone, and a stray `claude` on disk is the
+/// kind of thing that is eventually found by something.
 ///
-/// It is worth asking because the failure is silent. The shim is only reached
-/// while it is the first `claude` on `PATH`, and `PATH` is not ours to keep:
-/// what we hand the shell is read before its rc files, and the usual
-/// `PATH="$HOME/.local/bin:$PATH"` in a `.zshrc` puts that directory in front
-/// of ours. The agent then starts perfectly well, knowing nothing about which
-/// conversation it belongs to and unable to see the panels it is running
-/// inside — and nothing anywhere says why.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ShimCheck {
-    /// The shim wins. Nothing to do.
-    Reached,
-    /// Something else wins. Names it, and the file that would have to change
-    /// for it not to — `None` when the shell is one whose configuration we do
-    /// not know how to write, where offering to edit it would be worse than
-    /// saying nothing.
-    Shadowed { by: PathBuf, rc: Option<PathBuf> },
-    /// No answer worth acting on: no shell, or one that would not say.
-    Unknown,
-}
-
-/// Ask the user's shell, the way the user's shell will be asked.
-///
-/// Not by reading `PATH` here: the answer depends on what the rc files do
-/// after we hand the environment over, and the only thing that knows that is
-/// the shell itself. So it is started the way a session starts it —
-/// interactive, same environment — and asked where the agent resolves.
-///
-/// Costs a whole shell startup, rc files and all, so it belongs on a thread
-/// that is not drawing anything.
-#[cfg(unix)]
-pub fn check(shim_dir: &Path) -> ShimCheck {
-    let Some(program) = ATTACHED.first().map(|a| a.program) else {
-        return ShimCheck::Unknown;
+/// Returns how many were removed.
+pub fn clear_shims(root: &std::path::Path) -> usize {
+    let shims = root.join("shims");
+    let Ok(entries) = std::fs::read_dir(&shims) else {
+        return 0;
     };
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    let path = match std::env::var("PATH") {
-        Ok(p) => format!("{}:{p}", shim_dir.display()),
-        Err(_) => shim_dir.display().to_string(),
-    };
-    let out = std::process::Command::new(&shell)
-        .arg("-i")
-        .arg("-c")
-        // Fenced, because an interactive shell is not a quiet one: rc files
-        // greet, print tips, and restore sessions, and the first line of that
-        // is not the answer to anything. `echo` and `;` are the two pieces of
-        // syntax every shell worth asking agrees on, fish included.
-        .arg(format!("echo {FENCE}; command -v {program}; echo {FENCE}"))
-        .env("PATH", path)
-        .env("DMAC", "1")
-        .env(SHIM_DIR_VAR, shim_dir)
-        // An rc file that reads from its input gets end of file rather than
-        // the user's keyboard: this runs behind their back and must not be
-        // able to sit there waiting for them. Complaints about job control go
-        // the same way — a shell that is interactive without a terminal says
-        // so, and it is not an answer to anything.
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output();
-    let Ok(out) = out else {
-        return ShimCheck::Unknown;
-    };
-    let answer = String::from_utf8_lossy(&out.stdout);
-    let Some(found) = answer
-        .lines()
-        .skip_while(|l| l.trim() != FENCE)
-        .skip(1)
-        .take_while(|l| l.trim() != FENCE)
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-    else {
-        // Nothing between the fences, or no fences at all: nothing found, or a
-        // shell that would not answer. Neither is a shadowed shim — there is
-        // no agent here to shadow, and `prepare` would not have written one.
-        return ShimCheck::Unknown;
-    };
-    let found = PathBuf::from(found);
-    if found.parent() == Some(shim_dir) {
-        return ShimCheck::Reached;
-    }
-    ShimCheck::Shadowed {
-        by: found,
-        rc: rc_file(&shell),
-    }
-}
-
-#[cfg(not(unix))]
-pub fn check(_shim_dir: &Path) -> ShimCheck {
-    ShimCheck::Unknown
-}
-
-/// The file that gets the last word on `PATH`, for the shells whose answer we
-/// know how to write.
-fn rc_file(shell: &str) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    match Path::new(shell).file_name()?.to_str()? {
-        // Not `$HOME` blindly: a `ZDOTDIR` is where that user's zsh actually
-        // reads from, and writing to the other file would change nothing while
-        // looking like it had.
-        "zsh" => Some(
-            std::env::var_os("ZDOTDIR")
-                .map(PathBuf::from)
-                .unwrap_or(home)
-                .join(".zshrc"),
-        ),
-        "bash" => Some(home.join(".bashrc")),
-        "fish" => Some(home.join(".config/fish/config.fish")),
-        _ => None,
-    }
-}
-
-/// Put the shim directory back in front, from inside the user's own rc file.
-///
-/// Appended, never inserted: it has to run after whatever else the file does
-/// to `PATH`, and that is the whole point of it. Written in terms of the
-/// variable rather than the directory, because the directory is named after
-/// this run's pid and will not exist tomorrow — so the line is correct for
-/// every future run, and does nothing at all in a shell DMACommander did not
-/// start.
-///
-/// Idempotent: a file that already mentions the variable is left alone.
-pub fn repair(rc: &Path) -> Result<(), AgentError> {
-    let existing = std::fs::read_to_string(rc).unwrap_or_default();
-    if existing.contains(SHIM_DIR_VAR) {
-        return Ok(());
-    }
-    let fish = rc.extension().is_some_and(|e| e == "fish");
-    let mut out = existing;
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out.push_str(if fish { FISH_REPAIR } else { POSIX_REPAIR });
-    if let Some(parent) = rc.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(rc, out)?;
-    Ok(())
-}
-
-/// Why the line is there, in the file the user will find it in one day.
-const POSIX_REPAIR: &str = r#"
-# Added by DMACommander. It puts its own directory in front of PATH before this
-# file runs, and this file then puts yours in front of that — so without these
-# lines the `claude` started here is the one from your PATH, which knows nothing
-# about which conversation this session is or that there are panels to look at.
-# Outside DMACommander it does nothing: nothing else sets DMAC_SHIM_DIR.
-if [ -n "$DMAC_SHIM_DIR" ] && [ "${PATH%%:*}" != "$DMAC_SHIM_DIR" ]; then
-  PATH="$DMAC_SHIM_DIR:$PATH"
-  export PATH
-fi
-"#;
-
-const FISH_REPAIR: &str = r#"
-# Added by DMACommander. It puts its own directory in front of PATH before this
-# file runs, and this file then puts yours in front of that — so without these
-# lines the `claude` started here is the one from your PATH, which knows nothing
-# about which conversation this session is or that there are panels to look at.
-# Outside DMACommander it does nothing: nothing else sets DMAC_SHIM_DIR.
-if set -q DMAC_SHIM_DIR
-    fish_add_path --path --prepend --move $DMAC_SHIM_DIR
-end
-"#;
-
-/// The first `program` on `PATH` that is not our own shim.
-///
-/// Skipping the shim directory matters: without it a shim written into a
-/// directory already on `PATH` would find itself and recurse until the process
-/// runs out of file descriptors.
-fn resolve(program: &str, shim_dir: &Path) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        if dir == shim_dir {
-            continue;
-        }
-        let candidate = dir.join(program);
-        if is_executable_file(&candidate) {
-            return Some(candidate);
+    let mut removed = 0;
+    for e in entries.flatten() {
+        if std::fs::remove_dir_all(e.path()).is_ok() {
+            removed += 1;
         }
     }
-    None
-}
-
-fn is_executable_file(p: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(p)
-            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        p.is_file()
-    }
-}
-
-/// The shim itself.
-///
-/// `exec` rather than a call, so the shim leaves no process of its own between
-/// the shell and the agent: signals, job control and `ps` all then read the way
-/// they would without it.
-fn shim_script(
-    a: &Attach,
-    real: &Path,
-    conversation: &str,
-    marker: &Path,
-    mcp_config: Option<&str>,
-) -> String {
-    let (real, marker) = (real.display(), marker.display());
-    let (program, new_flag, resume_flag) = (a.program, a.new_flag, a.resume_flag);
-    // Empty when there is nothing to add, so the exec lines below read the same
-    // either way rather than needing two versions of each. Quoted properly and
-    // not just wrapped in apostrophes: this is JSON carrying filesystem paths,
-    // and a home directory can be called `O'Brien`.
-    let mcp = match (a.mcp_flag, mcp_config) {
-        (Some(flag), Some(json)) => {
-            format!("{flag} {} ", dmac_core::tools::shell_quote(json))
-        }
-        _ => String::new(),
-    };
-    let explicit = a
-        .explicit
-        .iter()
-        .map(|f| format!("{f}|{f}=*"))
-        .collect::<Vec<_>>()
-        .join("|");
-    format!(
-        r#"#!/bin/sh
-# Written by DMACommander. Every `{program}` started from this session joins the
-# same conversation, so closing DMACommander and coming back reopens it where it
-# was. To start a fresh conversation instead:
-#   rm '{marker}'
-#
-# The commander also describes itself to {program} as an MCP server, so it can
-# see the panels, the history and the sessions it is running inside. The
-# description is passed inline rather than through a file, so several
-# commanders can be open at once without sharing anything writable.
-#
-# An explicit choice on the command line always wins; this only fills in a gap.
-for arg in "$@"; do
-  case "$arg" in
-    {explicit}) exec '{real}' {mcp}"$@" ;;
-  esac
-done
-# Ask {program}'s own store whether this conversation exists. That store is the
-# truth: the conversation outlives our marker whenever the marker is cleaned up
-# or never written, and the marker outlives the conversation whenever one was
-# reserved and never used. Resuming on the marker alone gets both wrong, in
-# opposite directions.
-existing=$(ls "$HOME"/.claude/projects/*/'{conversation}'.jsonl 2>/dev/null | head -1)
-if [ -n "$existing" ]; then
-  exec '{real}' {mcp}{resume_flag} '{conversation}' "$@"
-fi
-# Only when the store cannot be consulted at all does the marker get a say.
-# It used to have one whenever it existed, and that is a resume of a
-# conversation that is not there — which does not start empty, it refuses to
-# start. The marker is written the moment a conversation is *reserved*, and a
-# reserved conversation nobody ever typed into leaves no transcript behind.
-if [ ! -d "$HOME/.claude/projects" ] && [ -e '{marker}' ]; then
-  exec '{real}' {mcp}{resume_flag} '{conversation}' "$@"
-fi
-: > '{marker}'
-exec '{real}' {mcp}{new_flag} '{conversation}' "$@"
-"#
-    )
-}
-
-fn write_executable(path: &Path, contents: &str) -> Result<(), AgentError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, contents)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
-    }
-    Ok(())
+    let _ = std::fs::remove_dir(&shims);
+    removed
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn claude() -> &'static Attach {
-        &ATTACHED[0]
-    }
-
-    /// The description is JSON carrying filesystem paths, and a home directory
-    /// can be called `O'Brien`. Wrapped in bare apostrophes that would end the
-    /// quoting early and hand the rest of the JSON to the shell as code.
+    /// The shim directories are the one thing an older version left on the
+    /// user's disk, and each holds an executable called `claude`. Upgrading
+    /// has to take them away.
     #[test]
-    fn an_apostrophe_in_the_description_cannot_escape_its_quotes() {
-        let json = r#"{"command":"/Users/O'Brien/dmac"}"#;
-        let s = shim_script(
-            claude(),
-            Path::new("/usr/local/bin/claude"),
-            "abc",
-            Path::new("/tmp/m"),
-            Some(json),
-        );
+    fn the_sweep_takes_away_what_older_versions_left_behind() {
+        let root = std::env::temp_dir().join(format!("dmac-sweep-{}", std::process::id()));
+        let dir = root.join("shims").join("run-1234").join("0");
+        std::fs::create_dir_all(&dir).expect("scratch");
+        std::fs::write(dir.join("claude"), "#!/bin/sh\nexit 0\n").expect("write");
+
+        assert_eq!(clear_shims(&root), 1);
         assert!(
-            s.contains(r#"'{"command":"/Users/O'\''Brien/dmac"}'"#),
-            "the apostrophe was not closed and reopened: {s}"
+            !root.join("shims").exists(),
+            "the directory itself has to go too, not only its contents"
         );
-        // And what a shell would actually read back is the JSON we started with.
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!("printf %s {}", dmac_core::tools::shell_quote(json)))
-            .output()
-            .expect("sh");
-        assert_eq!(String::from_utf8_lossy(&out.stdout), json);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Two commanders both have a session `0`. When they shared a directory the
-    /// second one to start rewrote the first one's `mcp.json` to name its own
-    /// socket, and the first commander — still running, still listening — had
-    /// every agent it hosted pointed at a socket that died with the other one.
-    /// The server was configured and answered nothing.
+    /// Nothing this sets may change what a command resolves to. That was the
+    /// shim's whole trouble, and the environment is what is left of it.
     #[test]
-    fn one_commander_never_writes_over_another_commanders_shims() {
-        let root = tempfile::tempdir().expect("a temp dir");
-        // Where the shared layout put it, and where a second commander would
-        // therefore land.
-        let theirs = root.path().join("shims").join("0");
-        std::fs::create_dir_all(&theirs).expect("their directory");
-        std::fs::write(theirs.join("claude"), b"theirs").expect("their shim");
-
-        let _ = prepare(root.path(), "0", "11111111-2222-4333-8444-555555555555");
-
-        assert_eq!(
-            std::fs::read(theirs.join("claude")).expect("still there"),
-            b"theirs",
-            "another commander's shim was overwritten"
-        );
+    fn the_environment_never_touches_the_path() {
+        let env = environment("3", "work", "11111111-2222-3333-4444-555555555555");
         assert!(
-            shim_dir(root.path(), "0")
-                .to_string_lossy()
-                .contains(&format!("{RUN_PREFIX}{}", std::process::id())),
-            "the directory must be named by the run that owns it"
+            !env.iter().any(|(k, _)| k == "PATH"),
+            "the hosted shell's PATH is the user's, not ours"
         );
-    }
-
-    /// The old layout named these directories by session id, and `0`, `1`, `2`
-    /// parse as pids. Pid `0` is the caller's own process group, which is
-    /// always alive, so `shims/0` was kept for ever.
-    #[test]
-    fn the_sweep_removes_the_old_layout_and_keeps_this_run() {
-        let root = tempfile::tempdir().expect("a temp dir");
-        for old in ["0", "1", "2"] {
-            std::fs::create_dir_all(root.path().join("shims").join(old)).expect("old layout");
-        }
-        let mine = shim_dir(root.path(), "0");
-        std::fs::create_dir_all(&mine).expect("ours");
-        clear_stale_shims(root.path());
-
-        for old in ["0", "1", "2"] {
-            assert!(
-                !root.path().join("shims").join(old).exists(),
-                "the old layout survived the sweep"
-            );
-        }
-        assert!(mine.exists(), "this run's own directory was swept away");
-    }
-
-    /// The marker says a conversation has been started once, so it has to
-    /// outlive the run that started it: kept inside a per-commander directory
-    /// it would vanish on restart, and the next `claude` would go in with
-    /// `--session-id` for a conversation that already exists — which is refused
-    /// with "Session ID ... is already in use".
-    #[test]
-    fn the_marker_outlives_the_commander_that_wrote_it() {
-        let root = tempfile::tempdir().expect("a temp dir");
-        let marker = marker_path(root.path(), "abc", "claude");
-        assert!(
-            !marker.starts_with(shim_dir(root.path(), "0")),
-            "the marker must not live in a directory swept away on restart"
-        );
-        prepare(root.path(), "0", "abc");
-        assert!(
-            marker.parent().is_some_and(std::path::Path::is_dir),
-            "the shim writes the marker with `: >`, which creates no directories"
-        );
-    }
-
-    #[test]
-    fn the_shim_adds_the_conversation_on_a_first_run_and_resumes_after() {
-        let s = shim_script(
-            claude(),
-            Path::new("/usr/local/bin/claude"),
-            "11111111-2222-4333-8444-555555555555",
-            Path::new("/tmp/shims/s1/claude.started"),
-            None,
-        );
-        assert!(
-            s.contains("--session-id '11111111-2222-4333-8444-555555555555'"),
-            "{s}"
-        );
-        assert!(
-            s.contains("--resume '11111111-2222-4333-8444-555555555555'"),
-            "{s}"
-        );
-        assert!(s.starts_with("#!/bin/sh\n"), "{s}");
-    }
-
-    /// A user who says which conversation they want must get that one. The shim
-    /// fills in a gap; it does not hold an opinion.
-    #[test]
-    fn an_explicit_choice_on_the_command_line_wins() {
-        let s = shim_script(
-            claude(),
-            Path::new("/usr/local/bin/claude"),
-            "abc",
-            Path::new("/tmp/m"),
-            None,
-        );
-        for flag in claude().explicit {
-            assert!(s.contains(&format!("{flag}|{flag}=*")), "{flag} missing");
-        }
-    }
-
-    /// `exec`, so the shim leaves nothing of its own between the shell and the
-    /// agent — otherwise signals and job control read differently through it.
-    #[test]
-    fn the_shim_execs_rather_than_calling() {
-        let s = shim_script(
-            claude(),
-            Path::new("/bin/true"),
-            "abc",
-            Path::new("/tmp/m"),
-            None,
-        );
-        for line in s.lines() {
-            let line = line.trim();
-            if line.contains("/bin/true") {
-                assert!(line.contains("exec "), "not an exec: {line}");
-            }
-        }
-    }
-
-    /// The real program is quoted, because it is a path from the environment and
-    /// a directory on PATH can contain a space.
-    #[test]
-    fn paths_in_the_shim_are_quoted() {
-        let s = shim_script(
-            claude(),
-            Path::new("/opt/my tools/claude"),
-            "abc",
-            Path::new("/tmp/my markers/m"),
-            None,
-        );
-        assert!(s.contains("'/opt/my tools/claude'"), "{s}");
-        assert!(s.contains("'/tmp/my markers/m'"), "{s}");
-    }
-
-    /// The conversation outlives our marker — it is cleaned up, moved, or never
-    /// written because a first run was killed early — and asking for it with
-    /// --session-id then fails with "already in use". The agent's own store is
-    /// the thing that actually knows.
-    #[test]
-    fn the_shim_asks_the_agent_store_not_just_its_own_marker() {
-        let s = shim_script(
-            claude(),
-            Path::new("/usr/local/bin/claude"),
-            "abcd-1234",
-            Path::new("/tmp/m"),
-            None,
-        );
-        assert!(s.contains(".claude/projects/"), "{s}");
-        assert!(s.contains("'abcd-1234'.jsonl"), "{s}");
-        // And the marker is still consulted, for a store that is not there.
-        assert!(s.contains("[ -e '/tmp/m' ]"), "{s}");
-    }
-
-    /// `cargo test` must not leave a configuration behind that points a real
-    /// agent at a binary in `target/debug/deps`. This test asserts the guard by
-    /// being one: it *is* running from a test binary.
-    #[test]
-    fn a_test_binary_never_advertises_itself_as_the_commander() {
-        let root = tempfile::tempdir().expect("a temp dir");
-        assert!(
-            mcp_config(root.path(), "s1").is_none(),
-            "current_exe() here is a test binary"
-        );
-    }
-
-    /// The commander describes itself to the agent it hosts. Without this the
-    /// agent is in the file manager and cannot see it.
-    #[test]
-    fn the_shim_hands_the_agent_our_own_mcp_configuration() {
-        let s = shim_script(
-            claude(),
-            Path::new("/usr/local/bin/claude"),
-            "abcd-1234",
-            Path::new("/tmp/m"),
-            Some(r#"{"mcpServers":{"dmac":{"command":"/usr/bin/dmac"}}}"#),
-        );
-        assert!(
-            s.contains(r#"--mcp-config '{"mcpServers":{"dmac":{"command":"/usr/bin/dmac"}}}'"#),
-            "the description travels inline, not as a path: {s}"
-        );
-        // On every route out, including the one the user's own flags take:
-        // choosing a conversation is not choosing to be blind. Counted against
-        // the `exec`s themselves, so adding a route cannot quietly add a blind
-        // one.
-        assert_eq!(
-            s.matches("--mcp-config").count(),
-            s.matches("exec '/usr/local/bin/claude'").count(),
-            "every exec should carry it: {s}"
-        );
-        assert!(s.matches("--mcp-config").count() >= 4, "{s}");
-    }
-
-    /// ...and without one, the shim is exactly what it was.
-    #[test]
-    fn no_configuration_means_no_extra_flag() {
-        let s = shim_script(
-            claude(),
-            Path::new("/usr/local/bin/claude"),
-            "abcd-1234",
-            Path::new("/tmp/m"),
-            None,
-        );
-        assert!(!s.contains("--mcp-config"), "{s}");
-    }
-
-    /// A directory named by pid, so two runs of the suite cannot collide.
-    fn scratch(what: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("dmac-{what}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        dir
-    }
-
-    /// The shim's one decision, exercised by running it. All of resuming lives
-    /// in a few lines of `sh`, and asserting on the text of them proves nothing
-    /// about what `sh` does with it.
-    #[cfg(unix)]
-    #[test]
-    fn the_shim_resumes_only_a_conversation_that_is_really_there() {
-        const CONV: &str = "d0754a32-dd64-4d19-891b-d5bcf3de3d4b";
-        let dir = scratch("decide");
-        let home = dir.join("home");
-        let argv = dir.join("argv");
-        let marker = dir.join("marker");
-
-        // Stands in for the agent: writes down what it was handed, and stops.
-        let real = dir.join("agent");
-        write_executable(
-            &real,
-            &format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n", argv.display()),
-        )
-        .expect("agent");
-
-        let shim = dir.join("claude");
-        write_executable(&shim, &shim_script(claude(), &real, CONV, &marker, None)).expect("shim");
-
-        let transcript = home
-            .join(".claude/projects/somewhere")
-            .join(format!("{CONV}.jsonl"));
-        let run = || {
-            let _ = std::fs::remove_file(&argv);
-            let ok = std::process::Command::new(&shim)
-                .env("HOME", &home)
-                .status()
-                .expect("the shim runs")
-                .success();
-            assert!(ok, "the shim exited badly");
-            std::fs::read_to_string(&argv).expect("the agent recorded nothing")
-        };
-
-        // A conversation with a transcript is resumed.
-        std::fs::create_dir_all(transcript.parent().expect("parent")).expect("projects");
-        std::fs::write(&transcript, "{}").expect("transcript");
-        assert!(
-            run().contains("--resume"),
-            "a real conversation was not resumed"
-        );
-
-        // One that was reserved and never typed into leaves a marker and no
-        // transcript. Resuming that does not start empty — it refuses to start.
-        std::fs::remove_file(&transcript).expect("remove");
-        std::fs::write(&marker, "").expect("marker");
-        let args = run();
-        assert!(args.contains("--session-id"), "a ghost was resumed: {args}");
-
-        // Unless the store cannot be looked at at all, which is the one case
-        // the marker was ever for.
-        std::fs::remove_dir_all(home.join(".claude")).expect("remove store");
-        assert!(
-            run().contains("--resume"),
-            "with no store to consult, the marker has the say"
-        );
-    }
-
-    /// Running it twice must not write it twice: the offer is made once per
-    /// run, and a user who says yes on three mornings should not find three
-    /// copies of the same block in their `.zshrc`.
-    #[test]
-    fn the_repair_is_written_once() {
-        let rc = scratch("rc").join(".zshrc");
-        std::fs::write(&rc, "export PATH=\"$HOME/.local/bin:$PATH\"").expect("write");
-        repair(&rc).expect("first");
-        repair(&rc).expect("second");
-        let text = std::fs::read_to_string(&rc).expect("read");
-        assert_eq!(
-            text.matches(SHIM_DIR_VAR).count(),
-            POSIX_REPAIR.matches(SHIM_DIR_VAR).count(),
-            "{text}"
-        );
-        // And what was there before is still there, untouched and still first:
-        // the whole point is to run after it.
-        assert!(
-            text.starts_with("export PATH=\"$HOME/.local/bin:$PATH\"\n"),
-            "{text}"
-        );
-    }
-
-    /// fish is not a POSIX shell and `${PATH%%:*}` is a syntax error in it.
-    #[test]
-    fn a_fish_rc_is_written_in_fish() {
-        let rc = scratch("fish").join("config.fish");
-        repair(&rc).expect("write");
-        let text = std::fs::read_to_string(&rc).expect("read");
-        assert!(text.contains("fish_add_path"), "{text}");
-        assert!(!text.contains("${PATH%%:*}"), "{text}");
-    }
-
-    /// The shell is told the directory as well as given it, because being
-    /// given it is not enough — the rc files run afterwards.
-    #[test]
-    fn the_shell_is_told_where_the_shim_is() {
-        let env = environment(Path::new("/tmp/shims/s1"), "work", "abc");
-        assert!(
-            env.iter()
-                .any(|(k, v)| k == SHIM_DIR_VAR && v == "/tmp/shims/s1"),
-            "{env:?}"
-        );
-    }
-
-    /// What this machine's shell would really do, which no assertion can know.
-    /// Ignored because it starts a whole interactive shell:
-    ///
-    ///     cargo test -p dmac-session -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    fn what_this_shell_would_run() {
-        let dir = scratch("check");
-        write_executable(&dir.join("claude"), "#!/bin/sh\nexit 0\n").expect("write");
-        println!("{:?}", check(&dir));
-    }
-
-    #[test]
-    fn the_shim_directory_goes_in_front_of_the_path() {
-        let env = environment(Path::new("/tmp/shims/s1"), "work", "abc");
-        let path = env
-            .iter()
-            .find(|(k, _)| k == "PATH")
-            .map(|(_, v)| v.clone())
-            .expect("a PATH");
-        assert!(path.starts_with("/tmp/shims/s1"), "{path}");
-        assert!(
-            env.iter()
-                .any(|(k, v)| k == "DMAC_CONVERSATION" && v == "abc"),
-            "the id should be visible to the shell too"
-        );
-    }
-
-    /// Without this the shim finds itself and recurses until the process runs
-    /// out of file descriptors.
-    // SAFETY: `set_var` is unsound only when another thread is reading the
-    // environment at the same time. This test is the only thing touching PATH
-    // and the suite gives it no concurrent reader of its own.
-    #[allow(unsafe_code)]
-    #[test]
-    fn resolving_skips_our_own_shim_directory() {
-        let dir = std::env::temp_dir().join(format!("dmac-shim-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        write_executable(&dir.join("claude"), "#!/bin/sh\nexit 0\n").expect("write");
-
-        let old = std::env::var_os("PATH");
-        // SAFETY-adjacent: this test is single-threaded with respect to PATH.
-        unsafe { std::env::set_var("PATH", &dir) };
-        let found = resolve("claude", &dir);
-        if let Some(old) = old {
-            unsafe { std::env::set_var("PATH", old) };
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-
-        assert!(found.is_none(), "resolved to our own shim: {found:?}");
+        let names: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(names.contains(&"DMAC_SESSION"), "{names:?}");
+        assert!(names.contains(&"DMAC_CONVERSATION"), "{names:?}");
+        assert!(names.contains(&"DMAC_SESSION_ID"), "{names:?}");
     }
 
     #[test]

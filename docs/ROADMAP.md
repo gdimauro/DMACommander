@@ -25,10 +25,9 @@ For the order it happens in, the acceptance criteria and the risks, see
       hosted agent sees the panels, the history, the sessions and the screen.
       Described to the agent inline, never through a file two runs could share —
       `ai-integration-engineer`
-- [x] **Agents stay attached**: a shim early on `PATH` hands every `claude`
-      started in a session that session's conversation id, and startup checks the
-      shim is actually being reached — an rc file that reorders `PATH` defeats it
-      silently otherwise — `session-engineer`
+- [x] **Agents come back**: what a session had running is read from `ps`,
+      saved with the session, and offered back as a resume on the next start.
+      Anything still holding that conversation is cleared first — `session-engineer`
 - [x] **Directory history** (`Ctrl-H`): everywhere the panels have been, four
       ways to read it, fuzzy filter, `F5` opens a row in the editor beside the
       commander — `tui-engineer`
