@@ -250,8 +250,6 @@ function run(argv) {
   var termName = argv[0], editorName = argv[1];
   var share = parseInt(argv[2], 10), of = parseInt(argv[3], 10);
   var se = Application('System Events');
-  var std = Application.currentApplication();
-  std.includeStandardAdditions = true;
 
   function frontWindow(name) {
     try {
@@ -265,7 +263,11 @@ function run(argv) {
   var ed = null;
   for (var i = 0; i < 60 && ed === null; i++) {
     ed = frontWindow(editorName);
-    if (ed === null) std.delay(0.1);
+    // Foundation, not the scripting additions: `delay` belongs to Standard
+    // Additions, which `osascript -l JavaScript -e` does not always have — and
+    // when it does not, the call fails with "Message not understood" (-1708)
+    // and takes the whole placement with it. Sleeping through ObjC always works.
+    if (ed === null) $.NSThread.sleepForTimeInterval(0.1);
   }
   if (ed === null) return 'the editor never showed a window';
   var term = frontWindow(termName);
@@ -375,6 +377,31 @@ mod tests {
             .expect_err("not ok")
             .to_string();
         assert!(e.contains("never showed a window"), "{e}");
+    }
+
+    /// `delay` belongs to Standard Additions, and `osascript -l JavaScript -e`
+    /// does not always have them: on this machine `Application.currentApplication()`
+    /// answers "Message not understood" (-1708) and the exception takes the
+    /// whole placement with it — so the windows never moved, and the only time
+    /// it bit was the one that matters, when the editor was still starting and
+    /// the script had to wait for its window.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_script_waits_without_the_scripting_additions() {
+        assert!(
+            TILE_SCRIPT.contains("NSThread.sleepForTimeInterval"),
+            "the wait has to be one that always exists"
+        );
+        for forbidden in [
+            "std.delay",
+            "includeStandardAdditions",
+            "currentApplication",
+        ] {
+            assert!(
+                !TILE_SCRIPT.contains(forbidden),
+                "`{forbidden}` is not available under `osascript -e`"
+            );
+        }
     }
 
     /// The names of the applications come out of `ps`. Interpolating them into
