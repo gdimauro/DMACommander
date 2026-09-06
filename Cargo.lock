@@ -706,6 +706,7 @@ dependencies = [
  "anyhow",
  "dmac-config",
  "dmac-core",
+ "dmac-desktop",
  "dmac-fx",
  "dmac-mcp",
  "dmac-pty",

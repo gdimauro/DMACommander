@@ -24,6 +24,7 @@ jiff = "0.2.35"
 ratatui = "0.30.2"
 futures = "0.3.31"
 serde_json = "1.0.145"
+dmac-desktop = { path = "../dmac-desktop" }
 tokio = { version = "1.53.1", features = ["rt", "sync", "macros", "time", "signal", "net", "io-util", "fs"] }
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.2"

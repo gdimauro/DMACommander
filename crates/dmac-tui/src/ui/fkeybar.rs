@@ -27,13 +27,13 @@ pub const NORMAL: [(&str, &str); 10] = [
     ("10", "Quit"),
 ];
 
-/// The bar for the directory history: the three orders, and the way out.
+/// The bar for the directory history: the orders, the editor, and the way out.
 pub const HISTORY: [(&str, &str); 10] = [
     ("1", "Recent"),
     ("2", "MostUsed"),
     ("3", "Session"),
     ("4", "Sessions"),
-    ("5", ""),
+    ("5", "Editor"),
     ("6", ""),
     ("7", ""),
     ("8", ""),

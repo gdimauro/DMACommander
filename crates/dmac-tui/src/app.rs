@@ -25,6 +25,10 @@ use tokio::sync::mpsc;
 pub(crate) enum Update {
     /// A rebuild asked for by `recycle` finished. `Ok` means restart now.
     Rebuilt(Result<(), String>),
+    /// The editor was asked to open a directory. Carries what to tell the user
+    /// either way: launching and placing windows are separate things that fail
+    /// separately, and "it opened but could not be placed" is not a failure.
+    Editor(Result<String, String>),
     /// A slice of a directory listing arrived.
     Entries {
         /// Which session asked for it.
@@ -691,6 +695,7 @@ impl App {
                 start,
                 items,
             } => self.apply_completion(session, generation, start, items),
+            Update::Editor(Ok(message) | Err(message)) => self.status = message,
             Update::Rebuilt(Ok(())) => self.restart_in_place(),
             // A failed build changes nothing: the point of building first is
             // that a broken tree costs you a message, not your session.
@@ -2856,6 +2861,10 @@ impl App {
             KeyCode::F(2) => self.set_history_order(Order::Frequent),
             KeyCode::F(3) => self.set_history_order(Order::Session),
             KeyCode::F(4) => self.set_history_order(Order::Sessions),
+            // The directory under the cursor, in the editor. The history is
+            // where a project you were in an hour ago is easiest to find, so it
+            // is the natural place to ask for it to be opened.
+            KeyCode::F(5) => self.open_in_editor(selected),
             // ...and one key that reaches all three, for anyone whose terminal
             // eats function keys.
             KeyCode::Tab => self.set_history_order(self.history_order.next()),
@@ -2923,6 +2932,71 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Open the highlighted directory in the editor, and put the two windows
+    /// side by side on the screen this terminal is on.
+    ///
+    /// Four fifths to the editor and one to the commander: the editor is what
+    /// you are about to read, and the commander only has to stay legible next
+    /// to it. Launching and placing are separate things that fail separately —
+    /// an editor that opened but could not be placed has still done the thing
+    /// that was asked, and says so rather than reporting a failure.
+    fn open_in_editor(&mut self, selected: usize) {
+        let dir = match self.editor_target(selected) {
+            Ok(dir) => dir,
+            Err(why) => {
+                self.status = why;
+                return;
+            }
+        };
+
+        self.close_history();
+        self.status = format!("opening {} \u{2026}", dir.display());
+        let tx = self.tx.clone();
+        // On a task, never here: launching waits on the editor's window
+        // appearing, which takes as long as starting an editor takes.
+        tokio::task::spawn_blocking(move || {
+            let shown = dir.display().to_string();
+            let update = match dmac_desktop::open_editor(&dir) {
+                Err(e) => Update::Editor(Err(format!("{e}"))),
+                Ok(()) => match dmac_desktop::tile(4, 5) {
+                    Ok(()) => Update::Editor(Ok(format!("opened {shown}"))),
+                    // It opened. That is the thing that was asked for, and the
+                    // windows not moving is worth a line but is not a failure.
+                    Err(e) => Update::Editor(Ok(format!("opened {shown} \u{2014} {e}"))),
+                },
+            };
+            let _ = tx.send(update);
+        });
+    }
+
+    /// Which directory a history row means to an editor.
+    ///
+    /// Split out from the opening so it can be tested without launching
+    /// anything: a test that starts the user's editor is a test nobody runs
+    /// twice.
+    pub(crate) fn editor_target(&mut self, selected: usize) -> Result<std::path::PathBuf, String> {
+        let rows = self.history_rows();
+        let shown = rows.get(selected).ok_or("nothing there to open")?;
+        // A session row names a session, and what to open is where that session
+        // is; a directory row is already the answer.
+        let path = match shown.row.session {
+            Some(id) => self
+                .sessions
+                .all()
+                .iter()
+                .find(|s| s.id.0 == id)
+                .map(|s| s.cwd[dmac_session::Session::index_of(s.active)].clone())
+                .ok_or("that session is gone")?,
+            None => VfsPath::local(&shown.row.path),
+        };
+        // An editor opens directories on this machine. One inside an archive or
+        // on a remote host has no name it could be given.
+        if !path.is_local() {
+            return Err("the editor can only open local directories".into());
+        }
+        Ok(path.as_path().to_path_buf())
     }
 
     fn close_history(&mut self) {
@@ -4346,6 +4420,74 @@ mod tests {
             top.width > 45,
             "a stacked panel got only {} of 60 columns",
             top.width
+        );
+    }
+
+    /// The history mixes directories with sessions, and F5 has to mean the same
+    /// thing on both: open where that row is. A session row names a session,
+    /// not a path, so it has to be resolved to the directory that session is in.
+    #[test]
+    fn f5_resolves_both_kinds_of_history_row_to_a_directory() {
+        let mut app = fixture();
+        app.seed_history();
+        app.handle(Action::DirectoryHistory);
+        assert!(matches!(app.mode, Mode::History { .. }), "history is open");
+
+        // Both kinds have to be on screen, or this proves only one of them.
+        app.set_history_order(dmac_core::history::Order::Sessions);
+        let sessions = app.history_rows();
+        assert!(
+            sessions.iter().any(|r| r.row.session.is_some()),
+            "no session rows to test against"
+        );
+        app.set_history_order(dmac_core::history::Order::Recent);
+        let directories = app.history_rows();
+        assert!(
+            directories.iter().any(|r| r.row.session.is_none()),
+            "no directory rows to test against"
+        );
+
+        for order in [
+            dmac_core::history::Order::Sessions,
+            dmac_core::history::Order::Recent,
+        ] {
+            app.set_history_order(order);
+            let rows = app.history_rows();
+            assert!(!rows.is_empty(), "nothing seeded to select");
+
+            for (i, shown) in rows.iter().enumerate() {
+                let is_session = shown.row.session.is_some();
+                let target = app.editor_target(i);
+                assert!(
+                    target.is_ok(),
+                    "row {i} ({}) resolved to nothing: {target:?}",
+                    if is_session { "session" } else { "directory" }
+                );
+                let dir = target.unwrap_or_default();
+                assert!(
+                    dir.is_absolute(),
+                    "an editor needs a real path, got {dir:?}"
+                );
+                if is_session {
+                    assert!(
+                        !dir.to_string_lossy().contains(" \u{2014} "),
+                        "a session row's label leaked into the path: {dir:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A row past the end is a row nobody selected. It must say so rather than
+    /// opening whatever happens to be first.
+    #[test]
+    fn f5_on_a_row_that_is_not_there_opens_nothing() {
+        let mut app = fixture();
+        app.seed_history();
+        app.handle(Action::DirectoryHistory);
+        assert!(
+            app.editor_target(9999).is_err(),
+            "a selection past the end must not resolve to a directory"
         );
     }
 
