@@ -13,7 +13,8 @@ screen.
 
 DMACommander listens on `<config>/mcp/<pid>.sock` for as long as it runs. When
 it starts a shell for a session it writes an MCP configuration next to that
-session's shims and points the agent at it, so:
+session's shims, in `<config>/shims/run-<pid>/<session>/`, and points the agent
+at it, so:
 
 ```sh
 claude              # becomes: claude --mcp-config .../shims/<id>/mcp.json --resume <uuid>
@@ -23,6 +24,17 @@ Nothing to install and nothing to configure. `dmac --mcp <socket>` is a few
 dozen lines of pipe: MCP clients start their servers themselves, as child
 processes with pipes, and this is what puts one of them in touch with the
 commander already on screen rather than a fresh one.
+
+Both paths carry the pid, and for the same reason. Session ids are indices, so
+two commanders each have a session `0`; when they shared a shim directory the
+second one to start rewrote the first one's configuration to name *its* socket,
+and every agent the first commander hosted was left pointed at a socket that
+died with the other commander. Configured, and answering nothing. Directories
+belonging to runs that have ended are swept at startup.
+
+The one thing that does *not* move with the run is the marker recording that a
+conversation has been started once: it lives in `<config>/agents/`, because it
+describes the conversation rather than the run and has to outlive both.
 
 The environment carries the same facts for anything that is not `claude`:
 

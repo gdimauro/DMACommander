@@ -2982,6 +2982,9 @@ pub async fn run(mut start: Startup) -> anyhow::Result<()> {
         // get nothing from.
         if let Some(root) = dmac_session::agent_root() {
             dmac_mcp::clear_stale_sockets(&root);
+            // The same sweep for the shim directories, which are named by pid
+            // for the same reason and would otherwise accumulate one per run.
+            dmac_session::agent::clear_stale_shims(&root);
         }
         crate::mcp::listen(socket, app.tx.clone());
     }

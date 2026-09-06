@@ -172,13 +172,94 @@ pub fn clear_orphans(_conversation: &str) -> usize {
     0
 }
 
+/// Where one commander keeps a session's shims.
+///
+/// Under this process's own pid, because the session ids are indices: two
+/// commanders both have a session `0`, and a shared directory means the second
+/// one to start rewrites the first one's `mcp.json` to name *its* socket. The
+/// first commander is still running and still listening, but every agent it
+/// hosts is now pointed at a socket that dies with the other commander — the
+/// server is configured, and answers nothing. The socket is already named by
+/// pid for exactly this reason; the shims have to be too.
+/// Marks a shim directory as belonging to one run. Spelled out rather than
+/// left as a bare number because the old layout named these directories by
+/// session id — `0`, `1`, `2` — which read as perfectly good pids. Worse, pid
+/// `0` is not a process at all: `kill(0, 0)` asks about the caller's whole
+/// process group and says yes, so `shims/0` looked permanently alive and was
+/// never swept.
+const RUN_PREFIX: &str = "run-";
+
+fn shim_dir(root: &Path, session_id: &str) -> PathBuf {
+    root.join("shims")
+        .join(format!("{RUN_PREFIX}{}", std::process::id()))
+        .join(session_id)
+}
+
+/// Where the "this conversation has been started once" marker lives.
+///
+/// Keyed by conversation and kept out of the per-commander directory, because
+/// it describes the conversation and not the run: it has to outlive both. A
+/// marker that vanished on restart would send the next `claude` in with
+/// `--session-id` for a conversation that already exists, which is refused.
+fn marker_path(root: &Path, conversation: &str, program: &str) -> PathBuf {
+    root.join("agents")
+        .join(format!("{conversation}.{program}.started"))
+}
+
+/// Remove the shim directories of commanders that are no longer running.
+///
+/// One directory per run accumulates otherwise. Returns how many were removed.
+#[cfg(unix)]
+pub fn clear_stale_shims(root: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(root.join("shims")) else {
+        return 0;
+    };
+    let me = std::process::id() as i32;
+    let mut removed = 0;
+    for e in entries.flatten() {
+        let path = e.path();
+        let Some(pid) = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.strip_prefix(RUN_PREFIX))
+            .and_then(|s| s.parse::<i32>().ok())
+        else {
+            // Anything else is the older layout, where the directory was named
+            // by session id. Nothing reads those any more.
+            if path.is_dir() {
+                let _ = std::fs::remove_dir_all(&path);
+            }
+            continue;
+        };
+        // SAFETY: two integers in, one out; signal 0 delivers nothing.
+        #[allow(unsafe_code)]
+        let alive = unsafe { libc::kill(pid, 0) == 0 };
+        if pid == me || alive {
+            continue;
+        }
+        if std::fs::remove_dir_all(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+#[cfg(not(unix))]
+pub fn clear_stale_shims(_root: &Path) -> usize {
+    0
+}
+
 /// The shim directory for one session, created if needed.
 ///
 /// Returns `None` when there is nothing to attach — no `claude` on `PATH` means
 /// no shim, rather than a script that shadows a program the user might install
 /// later and then fails to find it.
 pub fn prepare(root: &Path, session_id: &str, conversation: &str) -> Option<PathBuf> {
-    let dir = root.join("shims").join(session_id);
+    let dir = shim_dir(root, session_id);
+    // The shim writes its marker here with `: >`, which does not create
+    // directories; without this the marker silently never appears and every
+    // run looks like the first one.
+    let _ = std::fs::create_dir_all(root.join("agents"));
     // Written before the shims, because a shim names it.
     let mcp = write_mcp_config(root, &dir, session_id);
     let mut wrote_any = false;
@@ -186,7 +267,7 @@ pub fn prepare(root: &Path, session_id: &str, conversation: &str) -> Option<Path
         let Some(real) = resolve(a.program, &dir) else {
             continue;
         };
-        let marker = dir.join(format!("{}.started", a.program));
+        let marker = marker_path(root, conversation, a.program);
         let script = shim_script(a, &real, conversation, &marker, mcp.as_deref());
         if write_executable(&dir.join(a.program), &script).is_ok() {
             wrote_any = true;
@@ -370,6 +451,77 @@ mod tests {
 
     fn claude() -> &'static Attach {
         &ATTACHED[0]
+    }
+
+    /// Two commanders both have a session `0`. When they shared a directory the
+    /// second one to start rewrote the first one's `mcp.json` to name its own
+    /// socket, and the first commander — still running, still listening — had
+    /// every agent it hosted pointed at a socket that died with the other one.
+    /// The server was configured and answered nothing.
+    #[test]
+    fn one_commander_never_writes_over_another_commanders_shims() {
+        let root = tempfile::tempdir().expect("a temp dir");
+        // Where the shared layout put it, and where a second commander would
+        // therefore land.
+        let theirs = root.path().join("shims").join("0");
+        std::fs::create_dir_all(&theirs).expect("their directory");
+        std::fs::write(theirs.join("mcp.json"), b"theirs").expect("their config");
+
+        let _ = prepare(root.path(), "0", "11111111-2222-4333-8444-555555555555");
+
+        assert_eq!(
+            std::fs::read(theirs.join("mcp.json")).expect("still there"),
+            b"theirs",
+            "another commander's configuration was overwritten"
+        );
+        assert!(
+            shim_dir(root.path(), "0")
+                .to_string_lossy()
+                .contains(&std::process::id().to_string()),
+            "the directory must be named by the pid that owns it"
+        );
+    }
+
+    /// The old layout named these directories by session id, and `0`, `1`, `2`
+    /// parse as pids. Pid `0` is the caller's own process group, which is
+    /// always alive, so `shims/0` was kept for ever.
+    #[test]
+    fn the_sweep_removes_the_old_layout_and_keeps_this_run() {
+        let root = tempfile::tempdir().expect("a temp dir");
+        for old in ["0", "1", "2"] {
+            std::fs::create_dir_all(root.path().join("shims").join(old)).expect("old layout");
+        }
+        let mine = shim_dir(root.path(), "0");
+        std::fs::create_dir_all(&mine).expect("ours");
+        clear_stale_shims(root.path());
+
+        for old in ["0", "1", "2"] {
+            assert!(
+                !root.path().join("shims").join(old).exists(),
+                "the old layout survived the sweep"
+            );
+        }
+        assert!(mine.exists(), "this run's own directory was swept away");
+    }
+
+    /// The marker says a conversation has been started once, so it has to
+    /// outlive the run that started it: kept inside a per-commander directory
+    /// it would vanish on restart, and the next `claude` would go in with
+    /// `--session-id` for a conversation that already exists — which is refused
+    /// with "Session ID ... is already in use".
+    #[test]
+    fn the_marker_outlives_the_commander_that_wrote_it() {
+        let root = tempfile::tempdir().expect("a temp dir");
+        let marker = marker_path(root.path(), "abc", "claude");
+        assert!(
+            !marker.starts_with(shim_dir(root.path(), "0")),
+            "the marker must not live in a directory swept away on restart"
+        );
+        prepare(root.path(), "0", "abc");
+        assert!(
+            marker.parent().is_some_and(std::path::Path::is_dir),
+            "the shim writes the marker with `: >`, which creates no directories"
+        );
     }
 
     #[test]

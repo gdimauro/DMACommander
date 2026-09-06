@@ -530,6 +530,32 @@ fn normalise(path: &str) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn the_socket_is_bound_before_listen_returns() {
+        // The configuration a hosted agent is handed is written only when the
+        // socket is already there, and the first shell can be started in the
+        // same breath as this call — nothing is awaited in between. Binding on
+        // the spawned task made that a race the agent lost in silence: the
+        // commander was running, the agent had no tools, and nothing anywhere
+        // said why.
+        let dir = std::env::temp_dir().join(format!("dmac-listen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let socket = dir.join("mcp").join("t.sock");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let _guard = runtime.enter();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        listen(socket.clone(), tx);
+        assert!(
+            socket.exists(),
+            "the socket must exist the moment listen returns, with no poll in between"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn dots_are_resolved_without_touching_the_disk() {
         assert_eq!(normalise("/a/b/../c"), "/a/c");
@@ -572,14 +598,19 @@ pub(crate) fn listen(
     socket: std::path::PathBuf,
     tx: tokio::sync::mpsc::UnboundedSender<crate::app::Update>,
 ) {
+    // Bound here, not on the spawned task. The configuration handed to a hosted
+    // agent is only written when the socket is already there, and the first
+    // shell can start in the same breath as this call — so binding later makes
+    // that a race the agent loses in silence: no server, no error, and nothing
+    // to tell the user why the tools are simply absent.
+    if let Some(dir) = socket.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::remove_file(&socket);
+    let Ok(listener) = tokio::net::UnixListener::bind(&socket) else {
+        return;
+    };
     tokio::spawn(async move {
-        if let Some(dir) = socket.parent() {
-            let _ = tokio::fs::create_dir_all(dir).await;
-        }
-        let _ = tokio::fs::remove_file(&socket).await;
-        let Ok(listener) = tokio::net::UnixListener::bind(&socket) else {
-            return;
-        };
         while let Ok((stream, _)) = listener.accept().await {
             let tx = tx.clone();
             tokio::spawn(async move { serve(stream, tx).await });
