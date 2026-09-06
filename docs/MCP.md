@@ -22,6 +22,7 @@ left by runs that have ended are swept at startup.
 
 | Variable            | What it is                          |
 | ------------------- | ----------------------------------- |
+| `DMAC_MCP_CONFIG`   | This commander, as `--mcp-config` takes it |
 | `DMAC_MCP_SOCKET`   | The socket to connect to            |
 | `DMAC_SESSION`      | The session's name                  |
 | `DMAC_SESSION_ID`   | The session, as `--mcp-session` takes it |
@@ -29,18 +30,23 @@ left by runs that have ended are swept at startup.
 
 ## Connecting an agent to it
 
-Nothing on `PATH` is touched, so this is something you ask for. For Claude Code,
-in a shell DMACommander is hosting — `--mcp-config` takes JSON as readily as a
-filename:
+Nothing on `PATH` is touched, so this is something you ask for — one line, in a
+shell DMACommander is hosting:
 
 ```sh
-claude --mcp-config "{\"mcpServers\":{\"dmac\":{\"command\":\"dmac\",\"args\":[\"--mcp\",\"$DMAC_MCP_SOCKET\",\"--mcp-session\",\"$DMAC_SESSION_ID\"]}}}"
+claude --mcp-config "$DMAC_MCP_CONFIG"
 ```
 
-Worth an alias in your own rc file, where you can see it. `--mcp-session` is
-what makes a tool answer about the session the agent is hosted in rather than
-whichever one happens to be on screen; leave it out and the tools still work,
-they just follow the user around.
+That is exactly what the utilities menu types for you (`F9`, then `c`). It is
+the *variable* and not its value on purpose: the value is JSON full of braces
+wrapped around a socket path with a space in it, and a command line carrying
+that is one nobody can read — and one that `zsh` would try to glob before
+`claude` ever saw it. Through the environment it arrives as a single argument,
+already correct.
+
+Worth an alias in your own rc file if you start agents by hand. The description
+names this session, so a tool call is answered about the panels the agent is
+running inside rather than whichever session happens to be on screen.
 
 There was once a shim for this — a `claude` script planted early on the hosted
 shell's `PATH` that added all of the above by itself. It is gone. `PATH` is not

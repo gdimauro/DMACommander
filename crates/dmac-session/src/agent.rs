@@ -209,7 +209,72 @@ pub fn environment(
         let socket = dmac_mcp::socket_path(&root, std::process::id());
         env.push(("DMAC_MCP_SOCKET".to_string(), socket.display().to_string()));
     }
+    if let Some(config) = mcp_config(session_id) {
+        env.push((MCP_CONFIG_VAR.to_string(), config));
+    }
     env
+}
+
+/// The variable carrying the commander's own MCP description to a hosted shell.
+///
+/// Named once because two things have to agree about it: [`environment`], which
+/// sets it, and [`start_command`], which spends it. A line that expands to
+/// nothing would hand the agent `--mcp-config ""`, which is not a server that
+/// is absent — it is a server that is malformed, and it fails on startup.
+const MCP_CONFIG_VAR: &str = "DMAC_MCP_CONFIG";
+
+/// What to type at a hosted shell to start the agent in it.
+///
+/// The program by its bare name, so the user's own shell resolves it — their
+/// aliases, their functions, their `PATH`. Then the commander's description, by
+/// the *variable* rather than its value: that value is JSON full of braces
+/// wrapped around a path with a space in it, and a command line carrying it is
+/// one nobody can read, which defeats the point of typing it where it can be
+/// seen and corrected before Enter.
+pub fn start_command(session_id: &str) -> String {
+    let program = attached_program();
+    match mcp_config(session_id) {
+        Some(_) => format!("{program} --mcp-config \"${MCP_CONFIG_VAR}\""),
+        None => program.to_string(),
+    }
+}
+
+/// This commander described as an MCP server, in the JSON `--mcp-config` takes.
+///
+/// Put in the environment rather than on a command line, which is what makes
+/// the command line worth looking at: `claude --mcp-config "$DMAC_MCP_CONFIG"`
+/// is a line you can read, and the JSON — braces, a socket path with a space
+/// in it — never has to survive being quoted through a shell to get there.
+///
+/// `None` when there is nothing to describe: no socket bound, or no commander
+/// to point at. Absent, an agent starts perfectly well and simply cannot see
+/// the panels; a server that is described but dead is worse, because it wastes
+/// the user's time working out why the tools never answer.
+pub fn mcp_config(session_id: &str) -> Option<String> {
+    let binary = std::env::current_exe().ok()?;
+    // A test binary is not a commander. Without this a `cargo test` run would
+    // describe something in `target/debug/deps` that the next build deletes.
+    if binary.file_stem().is_none_or(|n| n != "dmac") {
+        return None;
+    }
+    let root = crate::agent_root()?;
+    let socket = dmac_mcp::socket_path(&root, std::process::id());
+    // Only advertise a server that is actually there. Binding can fail — a path
+    // too long for a socket address, a read-only directory — and it fails
+    // quietly, so describing it anyway hands the agent a path nothing answers
+    // on.
+    if !socket.exists() {
+        return None;
+    }
+    serde_json::to_string(&serde_json::json!({
+        "mcpServers": {
+            "dmac": {
+                "command": binary,
+                "args": ["--mcp", socket, "--mcp-session", session_id],
+            }
+        }
+    }))
+    .ok()
 }
 
 /// Remove the shim directories earlier versions wrote.
@@ -256,6 +321,39 @@ mod tests {
             "the directory itself has to go too, not only its contents"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The line and the environment have to agree about the variable. If they
+    /// drift apart the line expands to nothing and the agent is handed
+    /// `--mcp-config ""` — not a missing server but a malformed one, which
+    /// fails at startup for a reason that names neither of them.
+    #[test]
+    fn the_typed_line_spends_only_what_the_environment_sets() {
+        let line = start_command("3");
+        if let Some(rest) = line.strip_prefix(attached_program()) {
+            if rest.contains("--mcp-config") {
+                let named = format!("${MCP_CONFIG_VAR}");
+                assert!(rest.contains(&named), "{line} does not use {named}");
+                let env = environment("3", "work", "11111111-2222-3333-4444-555555555555");
+                assert!(
+                    env.iter().any(|(k, _)| k == MCP_CONFIG_VAR),
+                    "the line spends {MCP_CONFIG_VAR}, which nothing sets"
+                );
+            }
+        } else {
+            panic!("the line must start with the program: {line}");
+        }
+    }
+
+    /// The description is JSON: braces, quotes, and a socket path that on macOS
+    /// contains a space. None of it may reach a command line — it would have to
+    /// survive being quoted through a shell to get there, and it does not.
+    #[test]
+    fn the_description_never_reaches_the_command_line() {
+        let line = start_command("3");
+        for c in ['{', '}', '\''] {
+            assert!(!line.contains(c), "{c:?} in the typed line: {line}");
+        }
     }
 
     /// Nothing this sets may change what a command resolves to. That was the

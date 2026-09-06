@@ -37,8 +37,14 @@ See [docs/TERMINAL-KEYS.md](docs/TERMINAL-KEYS.md).
 
 DMACommander is an MCP server for as long as it runs, so an agent hosted in a
 shell here can see both panels, the history, the sessions and the screen it is
-running inside. Every hosted shell is told where to find it in
-`$DMAC_MCP_SOCKET`; connecting an agent to it is one line you write yourself.
+running inside. `F9` then `c` starts `claude` already connected to it — by
+typing the line at the shell, where you can read it before it runs:
+
+```sh
+claude --mcp-config "$DMAC_MCP_CONFIG"
+```
+
+Every hosted shell is given that variable, so the same line works by hand.
 See [docs/MCP.md](docs/MCP.md).
 
 Nothing is put on your `PATH` and no rc file of yours is written. An earlier

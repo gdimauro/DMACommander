@@ -3447,6 +3447,7 @@ impl App {
         let waker = self.waker();
         let (cols, rows) = self.shell_size();
         let session = self.sessions.current_mut();
+        let line = dmac_session::agent::start_command(&session.id.0.to_string());
         let shell = match session.shell(cols, rows, waker) {
             Ok(shell) => shell,
             Err(e) => {
@@ -3461,12 +3462,16 @@ impl App {
             self.status = format!("the shell here is busy \u{2014} {agent} not started");
             return;
         }
-        if let Err(e) = shell.run(agent) {
+        if let Err(e) = shell.run(&line) {
             self.status = format!("could not start {agent}: {e}");
             return;
         }
         session.view = View::Shell;
-        self.status = format!("started {agent}");
+        self.status = if line == agent {
+            format!("started {agent}")
+        } else {
+            format!("started {agent} \u{2014} it can see this commander")
+        };
     }
 
     /// The same, for the directory the active panel is showing — the utilities
