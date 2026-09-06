@@ -14,37 +14,58 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use ratatui::widgets::{Block, BorderType, Borders};
 
-/// Draw the hosted screen into `area`, returning the interior rect so the caller
-/// can keep the PTY the same size as what is visible.
-/// A text selection over the hosted screen, in its own cell coordinates.
+/// A position over the hosted pane: a column, and a row counted from the top of
+/// what is currently *visible*.
 ///
-/// Held in screen coordinates rather than in the scrollback, which is why it is
-/// dropped as soon as the screen changes underneath it: a highlight that stayed
-/// put while the text scrolled out from under it would be pointing at whatever
-/// happened to land there, and copying it would hand you something you never
-/// selected. Wrong-looking is recoverable; wrong-and-confident is not.
+/// The row is signed because a selection is allowed to run off the top of the
+/// view and keep going — scrolling is how a selection grows past one screenful,
+/// and an end that had to be clamped to row 0 would silently stop selecting
+/// while the user was still holding the key down.
+pub type Cell = (i32, u16);
+
+/// A text selection over the hosted screen.
+///
+/// Held in *visible* coordinates, which is what makes it survive scrolling
+/// without ever pointing at the wrong text. Two things move underneath it, and
+/// they are handled differently on purpose:
+///
+/// - The user scrolls. The text moves by a known number of lines and
+///   [`Selection::shift`] moves the selection by exactly the same amount, so
+///   the highlight stays glued to the characters it was put on.
+/// - The child prints. While the view is scrolled back `vt100` keeps the
+///   visible rows where they are, so there is nothing to do; at the live bottom
+///   the text scrolls out from under the selection, and the caller drops it.
+///   A highlight left behind there would be pointing at whatever happened to
+///   land in those cells, and copying it would hand you something you never
+///   selected. Wrong-looking is recoverable; wrong-and-confident is not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Selection {
-    anchor: (u16, u16),
-    head: (u16, u16),
+    anchor: Cell,
+    head: Cell,
 }
 
 impl Selection {
-    pub fn new(row: u16, col: u16) -> Self {
+    pub fn new(row: i32, col: u16) -> Self {
         Self {
             anchor: (row, col),
             head: (row, col),
         }
     }
 
-    pub fn extend_to(&mut self, row: u16, col: u16) {
+    pub fn extend_to(&mut self, row: i32, col: u16) {
         self.head = (row, col);
+    }
+
+    /// Follow the text by `rows` after the view has scrolled that far.
+    pub fn shift(&mut self, rows: i32) {
+        self.anchor.0 += rows;
+        self.head.0 += rows;
     }
 
     /// Start and end in reading order. Tuples compare lexicographically, which
     /// for `(row, col)` *is* reading order — so nothing downstream has to know
     /// which way the drag went.
-    fn ordered(&self) -> ((u16, u16), (u16, u16)) {
+    fn ordered(&self) -> (Cell, Cell) {
         if self.anchor <= self.head {
             (self.anchor, self.head)
         } else {
@@ -54,7 +75,8 @@ impl Selection {
 
     pub fn contains(&self, row: u16, col: u16) -> bool {
         let (a, b) = self.ordered();
-        (row, col) >= a && (row, col) <= b
+        let at = (i32::from(row), col);
+        at >= a && at <= b
     }
 
     /// A single click selects nothing. Without this, every click would put an
@@ -66,27 +88,34 @@ impl Selection {
     /// Grow to the whole word under the anchor, for a double-click.
     pub fn expand_to_word(&mut self, shell: &Hosted) {
         let (row, col) = self.anchor;
+        // A double-click always lands on a visible row; anything else is not a
+        // word this can find.
+        let Ok(row) = u16::try_from(row) else {
+            return;
+        };
         let Some((lo, hi)) = shell
             .with_screen(|screen| word_at(screen, row, col))
             .flatten()
         else {
             return;
         };
-        self.anchor = (row, lo);
-        self.head = (row, hi);
+        self.anchor = (i32::from(row), lo);
+        self.head = (i32::from(row), hi);
     }
 
-    /// The selected text, as the user would read it.
+    /// The selected text, as the user would read it — including the parts that
+    /// have been scrolled out of view.
     pub fn text(&self, shell: &Hosted) -> String {
         let (a, b) = self.ordered();
+        let (cols, _) = shell.size();
+        // Visible row 0 is this line of the buffer, so the selection can be
+        // asked for in coordinates that do not depend on where the view is.
+        let base = shell.scrollback_len() as i64 - shell.scroll_offset() as i64;
+        // The far end stops *before* its column, and the cell under the pointer
+        // when the button came up is part of what was selected.
+        let end = b.1.saturating_add(1).min(cols);
         shell
-            .with_screen(|screen| {
-                let (_, cols) = screen.size();
-                // `contents_between` stops *before* end_col; the cell under the
-                // pointer when the button came up is part of what was selected.
-                let end = b.1.saturating_add(1).min(cols);
-                screen.contents_between(a.0, a.1, b.0, end)
-            })
+            .contents_between_buffer((base + i64::from(a.0), a.1), (base + i64::from(b.0), end))
             .unwrap_or_default()
     }
 }
@@ -120,7 +149,7 @@ fn word_at(screen: &vt100::Screen, row: u16, col: u16) -> Option<(u16, u16)> {
 /// How the pane is presented this frame. A struct rather than six positional
 /// arguments, which is how `bordered` and `focused` end up swapped.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct Chrome {
+pub struct Chrome<'a> {
     /// Whether the shell has the keyboard, which decides the cursor.
     pub focused: bool,
     /// A border and titles, or bare contents for full screen.
@@ -129,20 +158,56 @@ pub struct Chrome {
     /// cannot be trusted to blink one, and `None` for the real one.
     pub software_cursor: Option<bool>,
     pub selection: Option<Selection>,
+    /// Where the shell actually is, and where the panels have gone without it.
+    /// The only thing this view says about location: the F-key bar is not here,
+    /// and a shell whose directory you cannot see is one you have to `pwd` at.
+    /// `pending` is `Some` only when the two differ — which happens while
+    /// something is running, because a `cd` cannot be typed at it.
+    pub cwd: Option<&'a str>,
+    pub pending: Option<&'a str>,
+    /// Where the keyboard is selecting from, while a Shift-selection is being
+    /// made. Drawn so it is obvious which end of the highlight moves next.
+    pub caret: Option<Cell>,
 }
 
-pub fn draw(frame: &mut Frame, area: Rect, shell: &Hosted, c: &Chrome, theme: &Theme) -> Rect {
+/// What the top border says: the program, and where it is.
+///
+/// Both, because either alone leaves a question. The program without the
+/// directory is the state this view was in for months — the one place you type
+/// commands and the only one that would not tell you where they would land.
+/// The directory without the program would not say what has the keyboard.
+///
+/// An arrow appears when the panels have gone somewhere the shell could not
+/// follow, which is exactly when something is running in it: the answer to
+/// "did it come with me?" belongs on the screen, not in the user's head.
+fn title_for(shell: &Hosted, cwd: Option<&str>, pending: Option<&str>) -> String {
+    let mut title = format!(" {}", shell.program());
+    if shell.finished() {
+        title.push_str(" (exited)");
+    }
+    if let Some(cwd) = cwd {
+        title.push_str(&format!(" \u{b7} {cwd}"));
+    }
+    if let Some(pending) = pending {
+        title.push_str(&format!(" \u{2192} {pending}"));
+    }
+    title.push(' ');
+    title
+}
+
+/// Draw the hosted screen into `area`, returning the interior rect so the caller
+/// can keep the PTY the same size as what is visible.
+pub fn draw(frame: &mut Frame, area: Rect, shell: &Hosted, c: &Chrome<'_>, theme: &Theme) -> Rect {
     let Chrome {
         focused,
         bordered,
         software_cursor,
         selection,
+        caret,
+        cwd,
+        pending,
     } = *c;
-    let title = if shell.finished() {
-        format!(" {} (exited) ", shell.program())
-    } else {
-        format!(" {} ", shell.program())
-    };
+    let title = title_for(shell, cwd, pending);
 
     let block = Block::default()
         .borders(if bordered {
@@ -153,6 +218,11 @@ pub fn draw(frame: &mut Frame, area: Rect, shell: &Hosted, c: &Chrome, theme: &T
         .border_type(BorderType::Plain)
         .border_style(theme.border(focused))
         .style(Style::default().bg(Color::Black));
+    // How far back the view is. Said out loud rather than left to be inferred:
+    // a pane that has quietly stopped following its shell looks exactly like a
+    // pane whose shell has stopped saying anything.
+    let back = shell.scroll_offset();
+
     let block = if bordered {
         block
             .title(Span::styled(title, theme.border(focused)))
@@ -160,8 +230,19 @@ pub fn draw(frame: &mut Frame, area: Rect, shell: &Hosted, c: &Chrome, theme: &T
             // documentation of the keys that still reach the commander from
             // inside a hosted program. It has to name all of them.
             .title_bottom(Span::styled(
-                " Ctrl-O DMAC commander · F9 utilities · F12 history ",
-                theme.border(false),
+                match (selection.is_some(), back) {
+                    (true, 0) => {
+                        " selecting \u{b7} Ctrl-Shift-C copy \u{b7} Esc clear ".to_string()
+                    }
+                    (true, n) => {
+                        format!(" \u{2191} {n} back \u{b7} Ctrl-Shift-C copy \u{b7} Esc clear ")
+                    }
+                    (false, 0) => {
+                        " Ctrl-O DMAC commander \u{b7} F9 utilities \u{b7} F12 history ".to_string()
+                    }
+                    (false, n) => format!(" \u{2191} {n} lines back \u{b7} Esc back to live "),
+                },
+                theme.border(back > 0 || selection.is_some()),
             ))
     } else {
         block
@@ -196,18 +277,36 @@ pub fn draw(frame: &mut Frame, area: Rect, shell: &Hosted, c: &Chrome, theme: &T
         }
     });
 
+    // The end of the selection the keyboard moves next. Drawn under the child's
+    // cursor on purpose: while a selection is being made the caret is what the
+    // keys act on, and the child's cursor is a bystander.
+    if let Some((row, col)) = caret
+        && let Ok(row) = u16::try_from(row)
+        && row < inner.height
+        && col < inner.width
+    {
+        frame.buffer_mut()[(inner.x + col, inner.y + row)]
+            .set_style(theme.cursor().add_modifier(Modifier::BOLD));
+    }
+
     // The child's cursor, only when the shell has the keyboard. Two visible
     // cursors is worse than none.
     //
     // A hosted CLI without a visible cursor is a CLI you cannot tell is
     // waiting for you, so this matters more here than on the command line.
     // `hide_cursor` is the child's own decision and is always honoured.
-    if focused && !shell.finished() {
+    if focused && caret.is_none() && !shell.finished() {
         shell.with_screen(|screen| {
             if screen.hide_cursor() {
                 return;
             }
             let (row, col) = screen.cursor_position();
+            // `cursor_position` is where the child put it on the *live* screen,
+            // which is `back` rows further down once the view has been scrolled
+            // away from it.
+            let Some(row) = u16::try_from(back).ok().and_then(|b| row.checked_add(b)) else {
+                return;
+            };
             if row >= inner.height || col >= inner.width {
                 return;
             }
@@ -456,6 +555,93 @@ mod tests {
         let mut s = Selection::new(4, 9);
         s.extend_to(4, 10);
         assert!(!s.is_empty());
+    }
+
+    /// A shell that has printed `n` numbered lines onto a 6-row screen, so most
+    /// of what it said is above the top of the view.
+    #[cfg(unix)]
+    fn shell_that_counted_to(n: u32) -> Hosted {
+        let script = format!("i=1; while [ $i -le {n} ]; do echo line-$i; i=$((i+1)); done");
+        let args = ["-c".to_string(), script];
+        let h = Hosted::spawn(dmac_pty::Spawn {
+            scrollback: 200,
+            ..dmac_pty::Spawn::new("/bin/sh", &args, 40, 6)
+        })
+        .expect("spawn");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let seen = h.with_screen(|s| s.contents()).unwrap_or_default();
+            if seen.contains(&format!("line-{n}")) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        h
+    }
+
+    /// Selecting more than one screenful is the reason the rows are signed.
+    /// A selection whose top end is above the view has to copy the text that
+    /// is up there, not the top line of what happens to be showing.
+    #[cfg(unix)]
+    #[test]
+    fn a_selection_reaching_above_the_view_still_copies_what_is_up_there() {
+        let h = shell_that_counted_to(30);
+        // Rows -8 .. 0: eight lines that scrolled off, and the top visible one.
+        let mut sel = Selection::new(-8, 0);
+        sel.extend_to(0, 39);
+        let text = sel.text(&h);
+        let numbers: Vec<u32> = text
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("line-"))
+            .filter_map(|n| n.parse().ok())
+            .collect();
+        assert!(
+            numbers.len() >= 8,
+            "only {numbers:?} came back from {text:?}"
+        );
+        for pair in numbers.windows(2) {
+            assert_eq!(pair[1], pair[0] + 1, "out of order in {numbers:?}");
+        }
+    }
+
+    /// The view moving must not move the selection off its own characters:
+    /// after scrolling back by n, the same text is n rows further down.
+    #[cfg(unix)]
+    #[test]
+    fn a_selection_stays_on_its_text_when_the_view_scrolls() {
+        let h = shell_that_counted_to(30);
+        let mut sel = Selection::new(0, 0);
+        sel.extend_to(0, 39);
+        let before = sel.text(&h);
+        assert!(before.contains("line-"), "nothing selected: {before:?}");
+
+        let moved = h.scroll_by(4);
+        assert_eq!(moved, 4);
+        sel.shift(moved);
+        assert_eq!(sel.text(&h), before, "the highlight slid off its own text");
+
+        // And back again, from the other end of the buffer.
+        let moved = h.scroll_by(-4);
+        sel.shift(moved);
+        assert_eq!(sel.text(&h), before);
+    }
+
+    /// Shifting is the only thing that may move it. A selection nobody touched
+    /// must read the same twice, or copying it twice would give two answers.
+    #[test]
+    fn shifting_moves_both_ends_by_the_same_amount() {
+        let mut sel = Selection::new(2, 3);
+        sel.extend_to(5, 7);
+        let ordered = sel.ordered();
+        sel.shift(4);
+        let after = sel.ordered();
+        assert_eq!(after.0.0 - ordered.0.0, 4);
+        assert_eq!(after.1.0 - ordered.1.0, 4);
+        assert_eq!((after.0.1, after.1.1), (ordered.0.1, ordered.1.1));
+
+        sel.shift(-9);
+        assert!(sel.ordered().0.0 < 0, "an end is allowed above the view");
     }
 
     #[cfg(unix)]

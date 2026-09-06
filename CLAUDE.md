@@ -33,10 +33,15 @@ that exist because that subsystem has a specific way to go wrong.
 ```
 dmac (bin)
   -> dmac-tui, dmac-gpu, dmac-agent, dmac-plugin
-    -> dmac-vfs, dmac-search, dmac-view, dmac-fx
-      -> dmac-core
-        -> dmac-config
+    -> dmac-session
+      -> dmac-pty
+        -> dmac-vfs, dmac-search, dmac-view, dmac-fx
+          -> dmac-core
+            -> dmac-config
 ```
+
+`dmac-desktop` and `dmac-mcp` sit outside that spine on purpose: they depend on
+nothing of ours, so anything may use them. `dmac-tui` reaches both directly.
 
 `dmac-core` must never depend on `dmac-tui`. If a lower layer needs something
 from a higher one, invert it with a trait defined in the lower layer.
@@ -73,7 +78,7 @@ Breaking one is a regression, not a tradeoff.
 ## Working in this repo
 
 ```sh
-cargo test --workspace          # 39 tests, all must pass
+cargo test --workspace          # every one of them must pass
 cargo clippy --workspace --all-targets   # must be warning-free
 cargo fmt --all
 cargo run -- . ~                # left panel = cwd, right = home
@@ -91,4 +96,7 @@ explains the shape and the dependency choices.
 Crates with only a `lib.rs` doc comment are scaffolding waiting for their owning
 agent — that is deliberate, not an oversight.
 
-Current phase: **M1**, starting with `dmac-config`.
+Current phase: **M1**, starting with `dmac-config` — still the open gap: this
+program hosts agents and remembers everything you had open, and cannot yet move
+a byte. Most of **M2** landed ahead of it (live sessions, hosting in a PTY, the
+agent shim, the MCP server); `docs/PLAN.md` says what that leaves owing.

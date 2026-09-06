@@ -62,6 +62,18 @@ struct Cli {
     #[arg(long, value_name = "STYLE", default_value = "blinking-block")]
     cursor: String,
 
+    /// Columns the session rail takes while it is open. It is remembered
+    /// between runs, so this is only needed to set it from a script or to undo
+    /// a drag that went too far.
+    #[arg(long, value_name = "COLS")]
+    rail_width: Option<u16>,
+
+    /// Columns the session rail takes at rest. Widen it past 8 and it shows
+    /// session names all the time instead of a strip of dots; `0` hides it
+    /// entirely, and Ctrl-T still opens it.
+    #[arg(long, value_name = "COLS")]
+    rail_collapsed_width: Option<u16>,
+
     /// Print the full build identity and exit. The first thing to paste into a
     /// bug report.
     #[arg(long)]
@@ -142,19 +154,36 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
+    let cwd = std::env::current_dir()?;
+
     // Resolution order is a contract (see `.claude/agents/session-engineer.md`):
     // --session, then $DMAC_SESSION, then a `.dmac-session` file walking up
-    // from the cwd, then auto-resume, then the picker. Only the first two steps
-    // exist today; the rest is the session-engineer's work.
+    // from the cwd, then auto-resume, then the picker. The first three steps
+    // exist; auto-resume and the picker are the session-engineer's work.
     let session = if cli.no_session {
         None
     } else {
         cli.session
             .clone()
-            .or_else(|| std::env::var("DMAC_SESSION").ok())
+            // An empty variable is not a name. It would otherwise open a
+            // session called nothing at all, which the rail then has to draw.
+            .or_else(|| std::env::var("DMAC_SESSION").ok().filter(|s| !s.is_empty()))
+            .or_else(|| match dmac_session::session_from_tree(&cwd) {
+                dmac_session::Marker::Named(name) => Some(name),
+                dmac_session::Marker::None => None,
+                // Loudly, and once, before the screen is taken over: a session
+                // silently called `main` when the tree asked for something else
+                // is someone looking at the wrong workspace and not knowing it.
+                dmac_session::Marker::Unusable(path) => {
+                    eprintln!(
+                        "dmac: ignoring {} — a session name is one line, at most 64 characters, \
+                         without slashes or control characters",
+                        path.display()
+                    );
+                    None
+                }
+            })
     };
-
-    let cwd = std::env::current_dir()?;
     let left = start_dir(cli.left, &cwd, cwd.clone());
     let right = start_dir(cli.right, &cwd, home_dir().unwrap_or_else(|| cwd.clone()));
 
@@ -195,6 +224,11 @@ fn main() -> Result<()> {
         }
     };
 
+    let rail = dmac_tui::app::RailOverride {
+        collapsed: cli.rail_collapsed_width,
+        expanded: cli.rail_width,
+    };
+
     runtime.block_on(async move {
         dmac_tui::run(dmac_tui::app::Startup {
             session_name,
@@ -205,6 +239,7 @@ fn main() -> Result<()> {
             cursor,
             store,
             restored,
+            rail,
         })
         .await
     })

@@ -370,6 +370,108 @@ impl Hosted {
         self.parser.lock().ok().map(|p| f(p.screen()))
     }
 
+    /// How far the view has been pushed back from the live screen, in lines.
+    /// `0` means the live screen is what you are looking at.
+    pub fn scroll_offset(&self) -> usize {
+        self.parser
+            .lock()
+            .ok()
+            .map_or(0, |p| p.screen().scrollback())
+    }
+
+    /// How many lines are held above the live screen right now.
+    ///
+    /// `vt100` does not publish the length, so this asks for an impossible
+    /// offset and reads back what it was clamped to — which *is* the length,
+    /// by definition. Done under the lock and put straight back, so nothing
+    /// ever sees the intermediate value.
+    pub fn scrollback_len(&self) -> usize {
+        self.parser.lock().ok().map_or(0, |mut p| {
+            let saved = p.screen().scrollback();
+            p.screen_mut().set_scrollback(usize::MAX);
+            let len = p.screen().scrollback();
+            p.screen_mut().set_scrollback(saved);
+            len
+        })
+    }
+
+    /// Move the view `delta` lines away from the live screen — positive goes
+    /// back into history — and report how far it actually went.
+    ///
+    /// The *actual* distance, not the requested one, because a caller with a
+    /// selection on screen has to move it by exactly as much as the text moved
+    /// under it. Returning the request would drift the highlight off its text
+    /// at the top and bottom of the buffer.
+    pub fn scroll_by(&self, delta: i32) -> i32 {
+        let Ok(mut p) = self.parser.lock() else {
+            return 0;
+        };
+        let before = p.screen().scrollback();
+        let want = (before as i64 + delta as i64).max(0) as usize;
+        p.screen_mut().set_scrollback(want);
+        let after = p.screen().scrollback();
+        // Both fit in a `u16`-sized buffer many times over; the cast cannot
+        // lose anything a 2000-line scrollback could produce.
+        after as i32 - before as i32
+    }
+
+    /// Put the live screen back in view.
+    pub fn scroll_to_bottom(&self) {
+        if let Ok(mut p) = self.parser.lock() {
+            p.screen_mut().set_scrollback(0);
+        }
+    }
+
+    /// Text between two positions in the *buffer*: line 0 is the oldest line
+    /// still held in the scrollback, and lines from `scrollback_len()` onwards
+    /// are the live screen. `to.1` is exclusive, as a selection's far end is.
+    ///
+    /// Buffer coordinates rather than screen ones because a selection made by
+    /// scrolling can be taller than the screen, and reading only the part that
+    /// happens to be in view would hand back less than was selected without
+    /// saying so. Rows outside the buffer are clamped into it rather than
+    /// refused: the ends of a selection are allowed to be dragged past the ends
+    /// of the text.
+    pub fn contents_between_buffer(&self, from: (i64, u16), to: (i64, u16)) -> Option<String> {
+        let mut p = self.parser.lock().ok()?;
+        let saved = p.screen().scrollback();
+        p.screen_mut().set_scrollback(usize::MAX);
+        let held = p.screen().scrollback() as i64;
+        let (rows, cols) = p.screen().size();
+        let last = held + rows as i64 - 1;
+
+        let first_row = from.0.clamp(0, last);
+        let last_row = to.0.clamp(0, last);
+        let mut out = String::new();
+        let mut row = first_row;
+        while row <= last_row {
+            // The offset that brings `row` to the top of the view, or 0 once
+            // `row` is in the live screen and cannot be brought any higher.
+            let offset = (held - row).clamp(0, held);
+            p.screen_mut().set_scrollback(offset as usize);
+            // Where `row` and the last row of this chunk land in that view.
+            let top = held - offset;
+            let chunk_end = last_row.min(top + rows as i64 - 1);
+            let y0 = (row - top) as u16;
+            let y1 = (chunk_end - top) as u16;
+            let start_col = if row == first_row { from.1 } else { 0 };
+            let end_col = if chunk_end == last_row { to.1 } else { cols };
+            out.push_str(&p.screen().contents_between(y0, start_col, y1, end_col));
+            if chunk_end == last_row {
+                break;
+            }
+            // `contents_between` puts no break after its last row, so the join
+            // between two chunks has to supply the one the text needs.
+            if !p.screen().row_wrapped(y1) {
+                out.push('\n');
+            }
+            row = chunk_end + 1;
+        }
+
+        p.screen_mut().set_scrollback(saved);
+        Some(out)
+    }
+
     /// The full command lines of everything running inside this shell.
     ///
     /// Asked at shutdown, so the next run knows what to start again — and knows
@@ -393,6 +495,65 @@ impl Hosted {
         {
             Vec::new()
         }
+    }
+
+    /// Where the child actually is, asked of the system rather than remembered.
+    ///
+    /// Remembering is not good enough: the commander only knows about the `cd`s
+    /// it typed itself, and the whole point of a shell is that you type your
+    /// own. A directory shown on the border has to be the one the shell is in,
+    /// or it is worse than showing nothing — you would trust it.
+    ///
+    /// `None` when it cannot be had: a platform without an answer, a child that
+    /// has gone, or a directory the kernel will not name.
+    #[cfg(target_os = "macos")]
+    pub fn cwd(&self) -> Option<std::path::PathBuf> {
+        let pid = self.child.process_id()? as libc::pid_t;
+        // SAFETY: every field of it is an integer or a byte array, so all
+        // zeroes is a valid value; the call overwrites it anyway.
+        #[allow(unsafe_code)]
+        let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+        // SAFETY: a pid, a constant, and a buffer whose size is its own. The
+        // call fills the buffer or reports that it did not.
+        #[allow(unsafe_code)]
+        let got = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDVNODEPATHINFO,
+                0,
+                std::ptr::from_mut(&mut info).cast(),
+                size,
+            )
+        };
+        if got != size {
+            return None;
+        }
+        // `vip_path` is `MAXPATHLEN` bytes spelled as an array of arrays, so
+        // it is flattened before being read as the C string it is.
+        let bytes: Vec<u8> = info
+            .pvi_cdir
+            .vip_path
+            .iter()
+            .flatten()
+            .take_while(|c| **c != 0)
+            .map(|c| *c as u8)
+            .collect();
+        (!bytes.is_empty()).then(|| {
+            use std::os::unix::ffi::OsStringExt;
+            std::path::PathBuf::from(std::ffi::OsString::from_vec(bytes))
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn cwd(&self) -> Option<std::path::PathBuf> {
+        let pid = self.child.process_id()?;
+        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    pub fn cwd(&self) -> Option<std::path::PathBuf> {
+        None
     }
 
     /// Whether the child has nothing running in the foreground — that is,
@@ -689,6 +850,121 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// A child that has printed `n` numbered lines onto a 6-row screen, so
+    /// most of them are in the scrollback and none of them is ambiguous.
+    #[cfg(unix)]
+    fn counted_to(n: u32) -> Hosted {
+        let script = format!("i=1; while [ $i -le {n} ]; do echo line-$i; i=$((i+1)); done");
+        let h = Hosted::spawn(Spawn {
+            program: "/bin/sh",
+            args: &["-c".into(), script],
+            cols: 40,
+            rows: 6,
+            scrollback: 100,
+            ..Spawn::new("", &[], 0, 0)
+        })
+        .expect("spawn");
+        wait_for(&h, 5.0, |t| t.contains(&format!("line-{n}")));
+        h
+    }
+
+    /// The point of a scrollback: what left the screen is still there to be
+    /// read back. Without this the pane is a six-line window onto a program
+    /// that has said far more than six lines.
+    #[cfg(unix)]
+    #[test]
+    fn what_scrolled_off_the_top_is_still_held() {
+        let mut h = counted_to(30);
+        assert!(
+            h.scrollback_len() >= 24,
+            "only {} lines were kept",
+            h.scrollback_len()
+        );
+        assert_eq!(
+            h.scroll_offset(),
+            0,
+            "a fresh pane looks at the live screen"
+        );
+
+        // The first line is long gone from the screen.
+        let visible = h.with_screen(|s| s.contents()).unwrap_or_default();
+        assert!(!visible.contains("line-1\n"), "got: {visible:?}");
+
+        // But not from the buffer.
+        let all = h
+            .contents_between_buffer((0, 0), (i64::MAX, 40))
+            .unwrap_or_default();
+        for i in [1u32, 7, 19, 30] {
+            assert!(all.contains(&format!("line-{i}")), "line-{i} was lost");
+        }
+        h.kill();
+    }
+
+    /// Scrolling reports what the buffer actually gave, not what was asked for.
+    /// A caller with a highlight on screen moves it by this number, and a
+    /// request returned at the ends of the buffer would slide it off its text.
+    #[cfg(unix)]
+    #[test]
+    fn scrolling_reports_the_distance_it_really_moved() {
+        let mut h = counted_to(30);
+        let held = h.scrollback_len() as i32;
+
+        assert_eq!(h.scroll_by(5), 5);
+        assert_eq!(h.scroll_offset(), 5);
+
+        // Past the oldest line held, and no further.
+        assert_eq!(h.scroll_by(i32::MAX), held - 5);
+        assert_eq!(h.scroll_offset(), held as usize);
+        assert_eq!(h.scroll_by(1), 0, "there is nothing older to show");
+
+        // And all the way back, whatever is asked for.
+        assert_eq!(h.scroll_by(i32::MIN), -held);
+        assert_eq!(h.scroll_offset(), 0);
+        assert_eq!(h.scroll_by(-1), 0, "the live screen is the bottom");
+
+        h.scroll_by(4);
+        h.scroll_to_bottom();
+        assert_eq!(h.scroll_offset(), 0);
+        h.kill();
+    }
+
+    /// A selection taller than the screen has to come back whole. Reading only
+    /// the part that happened to be in view would hand back less than was
+    /// selected while looking exactly right, which is the failure this whole
+    /// coordinate system exists to prevent.
+    #[cfg(unix)]
+    #[test]
+    fn text_can_be_read_across_the_scrollback_boundary() {
+        let mut h = counted_to(30);
+        let held = h.scrollback_len() as i64;
+
+        // Ten lines ending inside the live screen, so the range spans the seam
+        // between the scrollback and the screen itself.
+        let text = h
+            .contents_between_buffer((held - 5, 0), (held + 4, 40))
+            .unwrap_or_default();
+        let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+        assert!(
+            lines.len() >= 8,
+            "only {} lines came back: {text:?}",
+            lines.len()
+        );
+        // Consecutive, in order, and no line repeated at the seam.
+        let numbers: Vec<u32> = lines
+            .iter()
+            .filter_map(|l| l.trim().strip_prefix("line-"))
+            .filter_map(|n| n.parse().ok())
+            .collect();
+        assert!(numbers.len() >= 8, "got {numbers:?} from {text:?}");
+        for pair in numbers.windows(2) {
+            assert_eq!(pair[1], pair[0] + 1, "out of order in {numbers:?}");
+        }
+
+        // Reading it does not move the view, whatever it had to do to get there.
+        assert_eq!(h.scroll_offset(), 0);
+        h.kill();
     }
 
     #[cfg(unix)]

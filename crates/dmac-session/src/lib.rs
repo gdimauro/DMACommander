@@ -225,15 +225,23 @@ impl Session {
             .get_or_insert_with(dmac_core::tools::uuid_v4)
     }
 
+    /// Where this session's shims live, written if they are not there yet.
+    ///
+    /// `None` when there is no agent to attach to, which is also when there is
+    /// nothing to check: a shim that was never written cannot be shadowed.
+    pub fn shim_dir(&mut self) -> Option<std::path::PathBuf> {
+        let root = agent_root()?;
+        let id = self.id.0.to_string();
+        let conversation = self.conversation_id().to_string();
+        agent::prepare(&root, &id, &conversation)
+    }
+
     /// Environment for a shell started in this session: the shim directory on
     /// `PATH`, and the ids in plain sight.
     fn agent_environment(&mut self) -> Vec<(String, String)> {
-        let Some(root) = agent_root() else {
-            return Vec::new();
-        };
-        let (id, name) = (self.id.0.to_string(), self.name.clone());
+        let name = self.name.clone();
         let conversation = self.conversation_id().to_string();
-        match agent::prepare(&root, &id, &conversation) {
+        match self.shim_dir() {
             Some(dir) => agent::environment(&dir, &name, &conversation),
             // No agent installed: no shim, and no PATH surgery for nothing.
             None => Vec::new(),
@@ -296,6 +304,33 @@ pub struct SessionManager {
     /// span all of them, and a per-session list would have to be re-merged on
     /// every keystroke of the filter.
     pub history: dmac_core::history::History,
+    /// How wide the session rail is drawn. It lives here, with the rest of what
+    /// comes back when you reopen the application, rather than in the TUI:
+    /// a width the user set by hand and lost on restart is a width they would
+    /// have to set again every morning.
+    pub rail: RailWidths,
+}
+
+/// The two widths of the session rail, in columns.
+///
+/// Two and not one, because the resting strip and the opened list are answers
+/// to different questions — "how many sessions are there" and "which one do I
+/// want" — and a single width would make one of them wrong. A resting strip
+/// widened to `DETAILED_FROM` or more shows names, which is how you ask to see
+/// the sessions all the time without keeping the list open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RailWidths {
+    pub collapsed: u16,
+    pub expanded: u16,
+}
+
+impl Default for RailWidths {
+    fn default() -> Self {
+        Self {
+            collapsed: 3,
+            expanded: 22,
+        }
+    }
 }
 
 impl SessionManager {
@@ -306,6 +341,7 @@ impl SessionManager {
             current: 0,
             next_id: 1,
             history: dmac_core::history::History::default(),
+            rail: RailWidths::default(),
         }
     }
 
@@ -488,9 +524,10 @@ pub enum CloseError {
     NoSuchSession,
 }
 
-/// `/Users/x/prj/dmac` -> `~/prj/dmac`. The rail is narrow and the home prefix
-/// is the least informative part of any path in it.
-fn abbreviate_home(path: &str) -> String {
+/// `/Users/x/prj/dmac` -> `~/prj/dmac`. Space is short wherever a path is shown
+/// beside something else, and the home prefix is the least informative part of
+/// any path.
+pub fn abbreviate_home(path: &str) -> String {
     let home = if cfg!(windows) {
         std::env::var("USERPROFILE").ok()
     } else {
@@ -512,12 +549,185 @@ pub fn agent_root() -> Option<std::path::PathBuf> {
         .and_then(|s| s.path().parent().map(std::path::Path::to_path_buf))
 }
 
+/// The file a directory tree uses to say which session it belongs to.
+pub const MARKER: &str = ".dmac-session";
+
+/// Enough of one to hold a name, and not enough to be worth reading if it is
+/// not one. A file that opens with a megabyte of anything else is not going to
+/// turn into a session name further in.
+const MARKER_LIMIT: u64 = 4096;
+
+/// Long enough for a name someone chose, short enough to leave the rail room
+/// for the paths beside it.
+const NAME_LIMIT: usize = 64;
+
+/// What a tree had to say about which session it belongs to.
+///
+/// Three answers and not two, because "there is a file and it is not usable" is
+/// not the same as "there is no file": the first is worth a line on the way
+/// past, and silently starting `main` instead would leave someone looking at
+/// the wrong workspace with no idea why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Marker {
+    /// Nothing above this directory claims it.
+    None,
+    /// A name, trimmed and checked.
+    Named(String),
+    /// A file was found and what is in it cannot be a session name. Carries the
+    /// path, because the message has to say which file to go and fix.
+    Unusable(std::path::PathBuf),
+}
+
+/// The session a directory belongs to, from the nearest `.dmac-session` at or
+/// above it.
+///
+/// The third step of the resolution order — after `--session` and
+/// `$DMAC_SESSION`, before auto-resume and the picker — and the one that makes
+/// a checkout carry its own workspace: `cd` into it from anywhere and the
+/// panels, the shells and the agent conversation come back.
+///
+/// Nearest wins, the way every other per-directory file in a tree behaves: a
+/// project inside a checkout that has its own opinion is the one that counts.
+/// The first file found decides, even when it decides badly — walking past an
+/// unusable one to a usable one further up would answer a question nobody
+/// asked.
+pub fn session_from_tree(start: &std::path::Path) -> Marker {
+    use std::io::Read;
+    for dir in start.ancestors() {
+        let path = dir.join(MARKER);
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        let mut text = String::new();
+        // Bounded, and `read_to_string` so a file that is not text is refused
+        // here rather than reaching the rail as replacement characters.
+        if file.take(MARKER_LIMIT).read_to_string(&mut text).is_err() {
+            return Marker::Unusable(path);
+        }
+        let named = text
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with('#'))
+            .and_then(clean_name);
+        return match named {
+            Some(name) => Marker::Named(name),
+            None => Marker::Unusable(path),
+        };
+    }
+    Marker::None
+}
+
+/// A session name that came out of a file, or `None` if what came out cannot be
+/// one.
+///
+/// Narrow on purpose. This is content, not configuration somebody typed: a
+/// `.dmac-session` arrives with a `git clone` like any other file in the tree.
+/// The name reaches the rail, the session file and every hosted shell as
+/// `$DMAC_SESSION`, so a control character in it could rewrite the strip with
+/// escape sequences, a separator would read as a path to whatever consumes the
+/// environment, and a very long one pushes the paths off the side.
+fn clean_name(line: &str) -> Option<String> {
+    let name = line.trim();
+    if name.is_empty() || name.chars().count() > NAME_LIMIT {
+        return None;
+    }
+    if name == "." || name == ".." {
+        return None;
+    }
+    let unusable = |c: char| c.is_control() || c == '/' || c == '\\';
+    (!name.chars().any(unusable)).then(|| name.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn mgr() -> SessionManager {
         SessionManager::new("work", VfsPath::local("/a"), VfsPath::local("/b"))
+    }
+
+    /// A directory deep inside a tree belongs to the session the tree claims,
+    /// which is the whole point: `cd` in from anywhere and the workspace comes
+    /// back with you.
+    #[test]
+    fn a_marker_is_found_from_anywhere_below_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let deep = tmp.path().join("a/b/c");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(tmp.path().join(MARKER), "work\n").unwrap();
+        assert_eq!(session_from_tree(&deep), Marker::Named("work".into()));
+    }
+
+    /// Nearest wins: a project inside a checkout is allowed its own opinion.
+    #[test]
+    fn the_nearest_marker_decides() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inner = tmp.path().join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(tmp.path().join(MARKER), "outer").unwrap();
+        std::fs::write(inner.join(MARKER), "inner").unwrap();
+        assert_eq!(session_from_tree(&inner), Marker::Named("inner".into()));
+    }
+
+    /// A file people will edit by hand deserves comments and room to breathe.
+    #[test]
+    fn comments_and_blank_lines_are_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(MARKER),
+            "# the session this checkout belongs to\n\n  review  \nignored\n",
+        )
+        .unwrap();
+        assert_eq!(
+            session_from_tree(tmp.path()),
+            Marker::Named("review".into())
+        );
+    }
+
+    /// The file arrives with a `git clone` like everything else in the tree, so
+    /// what it may contain is worth being narrow about: an escape sequence in a
+    /// session name is an escape sequence in the rail.
+    #[test]
+    fn a_name_that_could_not_be_one_is_refused_and_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join(MARKER);
+        for bad in [
+            "\u{1b}[2J\u{1b}[H",
+            "../../elsewhere",
+            "one\\two",
+            &"x".repeat(NAME_LIMIT + 1),
+            "#only a comment",
+            "",
+        ] {
+            std::fs::write(&marker, bad).unwrap();
+            assert_eq!(
+                session_from_tree(tmp.path()),
+                Marker::Unusable(marker.clone()),
+                "{bad:?} should not become a session name"
+            );
+        }
+    }
+
+    /// An unusable file stops the walk rather than being stepped over: the
+    /// answer to "which session is this" must not quietly come from a directory
+    /// further up than the one that tried to answer.
+    #[test]
+    fn an_unusable_marker_is_not_walked_past() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inner = tmp.path().join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(tmp.path().join(MARKER), "outer").unwrap();
+        std::fs::write(inner.join(MARKER), "  ").unwrap();
+        assert_eq!(
+            session_from_tree(&inner),
+            Marker::Unusable(inner.join(MARKER))
+        );
+    }
+
+    #[test]
+    fn no_marker_anywhere_is_not_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(session_from_tree(tmp.path()), Marker::None);
     }
 
     #[test]

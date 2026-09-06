@@ -23,7 +23,7 @@ pub const NORMAL: [(&str, &str); 10] = [
     ("6", "Move"),
     ("7", "MkDir"),
     ("8", "Delete"),
-    ("9", "PullDn"),
+    ("9", "Utils"),
     ("10", "Quit"),
 ];
 

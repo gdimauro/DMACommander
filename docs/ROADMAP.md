@@ -7,7 +7,7 @@ For the order it happens in, the acceptance criteria and the risks, see
 
 ## Done
 
-- [x] Cargo workspace, 12 crates, layering enforced by review — `rust-architect`
+- [x] Cargo workspace, 15 crates, layering enforced by review — `rust-architect`
 - [x] `Entry`/`Panel` core: natural-order sort, viewport windowing, orthodox
       selection semantics (`..` unselectable, cursor fallback) — `fileops-engineer`
 - [x] `VfsBackend` trait with a capability matrix; streaming chunked listings;
@@ -16,7 +16,22 @@ For the order it happens in, the acceptance criteria and the risks, see
       abandoned walks stop quietly — `vfs-engineer`
 - [x] TUI: two panels, F-key bar, live command line, Norton keymap, theme,
       panic-safe terminal guard — `tui-engineer`
-- [x] Golden-frame tests via `TestBackend`; 39 tests; clippy clean — `qa-engineer`
+- [x] Golden-frame tests via `TestBackend`; clippy clean, 440 tests — `qa-engineer`
+- [x] **Hosting**: `dmac-pty` runs a child in a real PTY with `vt100` behind it,
+      2000 lines of scrollback that can be read back, selected across screenfuls
+      and copied; `dmac-desktop` launches, raises and tiles external windows —
+      `tui-engineer`
+- [x] **The commander as an MCP server**: ten tools over one socket per run, so a
+      hosted agent sees the panels, the history, the sessions and the screen.
+      Described to the agent inline, never through a file two runs could share —
+      `ai-integration-engineer`
+- [x] **Agents stay attached**: a shim early on `PATH` hands every `claude`
+      started in a session that session's conversation id, and startup checks the
+      shim is actually being reached — an rc file that reorders `PATH` defeats it
+      silently otherwise — `session-engineer`
+- [x] **Directory history** (`Ctrl-H`): everywhere the panels have been, four
+      ways to read it, fuzzy filter, `F5` opens a row in the editor beside the
+      commander — `tui-engineer`
 
 ## Next — the foundation everything else sits on
 
@@ -24,12 +39,16 @@ For the order it happens in, the acceptance criteria and the risks, see
       presets (`norton`/`far`/`mc`/`total`/`vim`), themes — `rust-architect` + `ux-keeper`
 - [x] **Live multi-session + rail** (`Shift-Tab`, `Alt+1..9`, `Ctrl-N`/`Ctrl-W`) — `session-engineer`
 - [x] **Session persistence** — atomic, debounced, crash-aware — `session-engineer`
-- [ ] **Session picker at startup and `--session` resolution**: named sessions, `--session` / `$DMAC_SESSION` /
-      `.dmac-session` / picker resolution, atomic debounced workspace snapshots,
-      crash recovery — `session-engineer`
-- [ ] **Claude session reattach**: record the Claude Code sessions a workspace had
-      open and *resume* them on reopen, never start fresh; degrade loudly when a
-      session is gone — `session-engineer`
+- [x] **`--session` resolution**, three steps of five: `--session`, then
+      `$DMAC_SESSION`, then a `.dmac-session` file walked up from the working
+      directory — `session-engineer`
+- [ ] **Auto-resume and the session picker**: the last two steps of that order,
+      plus the per-session on-disk model (`session.toml`, `workspace.json`) —
+      today every session lives in one file — `session-engineer`
+- [x] **Claude session reattach**: the conversation a session was hosting is
+      recorded and *resumed* on reopen, never started fresh — and the restart
+      asks first, naming each session, conversation and command line —
+      `session-engineer`
 - [ ] **File operation engine**: copy/move/delete with two-phase progress,
       conflict dialogs, resume, verify-before-delete, trash, CoW clones — `fileops-engineer`
 - [ ] **Viewer (F3) and editor (F4)**: syntax highlighting, hex mode, image

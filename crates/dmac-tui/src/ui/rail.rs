@@ -1,10 +1,15 @@
 //! The session rail down the left edge.
 //!
-//! Two states, both always present:
+//! Two widths, both always present and both the user's to set:
 //!
-//! - **Collapsed** — three columns of coloured dots. You can always see how many
-//!   sessions you have and which one you are in, without opening anything.
-//! - **Expanded** — name, position, and what each session is looking at.
+//! - **Resting** — three columns of coloured dots by default. You can always see
+//!   how many sessions you have and which one you are in, without opening
+//!   anything.
+//! - **Opened** — name, position, and what each session is looking at.
+//!
+//! What is *drawn* follows from the width alone, never from which of the two is
+//! in effect: widen the resting strip past [`DETAILED_FROM`] and it shows names
+//! all the time, which is how you ask to keep the sessions in sight.
 //!
 //! It *pushes* the panels rather than covering them. Two reasons: you can see
 //! both at once, and a file can eventually be dragged from a panel onto a session
@@ -12,7 +17,7 @@
 //! clipboard.
 
 use crate::theme::Theme;
-use dmac_session::{SessionColor, SessionManager};
+use dmac_session::{RailWidths, SessionColor, SessionManager};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -20,21 +25,38 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
-pub const COLLAPSED_WIDTH: u16 = 3;
-pub const EXPANDED_WIDTH: u16 = 22;
-
-/// Rows one session occupies when expanded: name, path, blank.
+/// Rows one session occupies when it is shown in detail: name, path, blank.
 const ROWS_PER_SESSION: usize = 3;
 
-/// How wide the rail should be. Never more than a third of the screen — the
-/// panels are the point of the application.
-pub fn width(open: bool, total: u16) -> u16 {
+/// The narrowest a rail can be and still fit a dot, a space and a one-letter
+/// name. Under this there is no room for anything but the dots, so the rail
+/// shows dots however wide it has been made.
+pub const DETAILED_FROM: u16 = 8;
+
+/// How wide the rail should be, given the pair of widths the user has set.
+/// Never more than a third of the screen — the panels are the point of the
+/// application, and a rail that could eat them is a rail that eventually will.
+pub fn width(open: bool, widths: RailWidths, total: u16) -> u16 {
     let want = if open {
-        EXPANDED_WIDTH
+        widths.expanded
     } else {
-        COLLAPSED_WIDTH
+        widths.collapsed
     };
     want.min(total / 3)
+}
+
+/// The widest the user is allowed to drag it, for the same reason.
+pub fn max_width(total: u16) -> u16 {
+    total / 3
+}
+
+/// Whether a rail this wide has room for names and paths, or only for dots.
+///
+/// A property of the width and not of the open flag, so widening the resting
+/// strip is all it takes to see the sessions all the time — which is the whole
+/// reason for being able to widen it.
+pub fn detailed(width: u16) -> bool {
+    width >= DETAILED_FROM
 }
 
 fn colour(c: SessionColor) -> Color {
@@ -49,18 +71,22 @@ fn colour(c: SessionColor) -> Color {
 }
 
 /// Which session a click at `row` selects, accounting for scrolling.
+///
+/// `detail` is [`detailed`] of the rail's own width: how tall each entry is
+/// depends on how much of it is being shown, and a click has to be read with
+/// the same arithmetic that drew it.
 pub fn session_at_row(
     sessions: &SessionManager,
     area: Rect,
-    open: bool,
+    detail: bool,
     row: u16,
 ) -> Option<usize> {
     if row < area.y || row >= area.y + area.height {
         return None;
     }
-    let offset = scroll_offset(sessions, area.height, open);
+    let offset = scroll_offset(sessions, area.height, detail);
     let local = (row - area.y) as usize;
-    let index = if open {
+    let index = if detail {
         offset + local / ROWS_PER_SESSION
     } else {
         offset + local
@@ -69,8 +95,8 @@ pub fn session_at_row(
 }
 
 /// First visible session, chosen so the current one is always on screen.
-fn scroll_offset(sessions: &SessionManager, height: u16, open: bool) -> usize {
-    let per = if open { ROWS_PER_SESSION } else { 1 };
+fn scroll_offset(sessions: &SessionManager, height: u16, detail: bool) -> usize {
+    let per = if detail { ROWS_PER_SESSION } else { 1 };
     let visible = (height as usize / per).max(1);
     let current = sessions.current_index();
     if current < visible {
@@ -89,7 +115,6 @@ pub fn draw(
     frame: &mut Frame,
     area: Rect,
     sessions: &SessionManager,
-    open: bool,
     highlight: Option<usize>,
     theme: &Theme,
 ) -> Rect {
@@ -97,8 +122,18 @@ pub fn draw(
         return area;
     }
 
+    // Detail is decided by the room there is, not by whether the list was
+    // opened: a resting strip the user has widened shows names, and an opened
+    // one squeezed by a narrow terminal falls back to dots rather than to
+    // clipped nonsense.
+    let detail = detailed(area.width);
+
     let block = Block::default()
-        .borders(if open { Borders::RIGHT } else { Borders::NONE })
+        .borders(if detail {
+            Borders::RIGHT
+        } else {
+            Borders::NONE
+        })
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(theme.panel_border).bg(theme.panel_bg))
         .style(theme.panel());
@@ -109,7 +144,7 @@ pub fn draw(
         return inner;
     }
 
-    let offset = scroll_offset(sessions, inner.height, open);
+    let offset = scroll_offset(sessions, inner.height, detail);
     let current = sessions.current_index();
     let mut lines: Vec<Line> = Vec::with_capacity(inner.height as usize);
 
@@ -125,7 +160,7 @@ pub fn draw(
             .fg(colour(session.color))
             .bg(theme.panel_bg);
 
-        if !open {
+        if !detail {
             lines.push(Line::from(vec![
                 Span::styled(" ", Style::default().bg(theme.panel_bg)),
                 Span::styled(dot.to_string(), dot_style),
@@ -229,11 +264,58 @@ mod tests {
         m
     }
 
+    /// The default pair, named so the tests read the way the rail does.
+    const COLLAPSED_WIDTH: u16 = 3;
+    const EXPANDED_WIDTH: u16 = 22;
+
+    fn widths() -> RailWidths {
+        RailWidths::default()
+    }
+
     #[test]
     fn the_rail_never_takes_more_than_a_third_of_the_screen() {
-        assert!(width(true, 30) <= 10);
-        assert_eq!(width(true, 200), EXPANDED_WIDTH);
-        assert_eq!(width(false, 200), COLLAPSED_WIDTH);
+        assert!(width(true, widths(), 30) <= 10);
+        assert_eq!(width(true, widths(), 200), EXPANDED_WIDTH);
+        assert_eq!(width(false, widths(), 200), COLLAPSED_WIDTH);
+    }
+
+    /// The two widths are separate settings, and neither may move the other:
+    /// they answer different questions and are set at different moments.
+    #[test]
+    fn the_resting_and_opened_widths_are_independent() {
+        let w = RailWidths {
+            collapsed: 14,
+            expanded: 30,
+        };
+        assert_eq!(width(false, w, 200), 14);
+        assert_eq!(width(true, w, 200), 30);
+        // Still a third of the screen at most, whatever was asked for.
+        assert_eq!(width(true, w, 60), 20);
+    }
+
+    /// What the rail draws follows from how wide it is, never from whether it
+    /// was opened — which is what makes widening the resting strip a way to
+    /// keep the session names in sight.
+    #[test]
+    fn a_wide_enough_rail_shows_names_whether_or_not_it_was_opened() {
+        assert!(!detailed(COLLAPSED_WIDTH), "a strip of dots has no room");
+        assert!(detailed(DETAILED_FROM));
+        assert!(detailed(EXPANDED_WIDTH));
+        // An opened rail squeezed by a narrow terminal falls back to dots
+        // rather than to clipped nonsense.
+        assert!(!detailed(width(true, widths(), 18)));
+    }
+
+    /// A rail set to nothing is nothing: someone who wants the columns back
+    /// can have them, and Ctrl-T still opens the list.
+    #[test]
+    fn a_resting_width_of_zero_hides_it_entirely() {
+        let w = RailWidths {
+            collapsed: 0,
+            ..RailWidths::default()
+        };
+        assert_eq!(width(false, w, 200), 0);
+        assert_eq!(width(true, w, 200), EXPANDED_WIDTH);
     }
 
     /// With more sessions than fit, the current one must still be visible —
@@ -303,7 +385,7 @@ mod tests {
                 width: EXPANDED_WIDTH,
                 height: 14,
             };
-            draw(f, a, &m, true, Some(3), &theme);
+            draw(f, a, &m, Some(3), &theme);
         })
         .unwrap();
         assert_eq!(m.current_index(), 0, "drawing must not switch sessions");
@@ -345,8 +427,8 @@ mod tests {
                     width: w,
                     height: h,
                 };
-                draw(f, a, &m, true, Some(2), &theme);
-                draw(f, a, &m, false, None, &theme);
+                draw(f, a, &m, Some(2), &theme);
+                draw(f, a, &m, None, &theme);
             })
             .unwrap_or_else(|e| panic!("rail failed at {w}x{h}: {e}"));
         }

@@ -63,6 +63,13 @@ pub(crate) enum Update {
     /// message exists only to break the event loop out of its wait, and the
     /// frame that follows reads the emulator directly.
     ShellOutput,
+    /// A hosted shell would not reach the agent shim: something else on
+    /// `PATH` answers to `claude` first. Only sent when that is the case —
+    /// there is nothing to say when it works.
+    ShimShadowed {
+        by: std::path::PathBuf,
+        rc: Option<std::path::PathBuf>,
+    },
     /// One line of MCP, from an agent talking to the commander it is running
     /// inside. Parsed on the connection's task, answered here — so no
     /// application state is ever behind a lock, and a slow client cannot stall
@@ -142,6 +149,9 @@ pub(crate) enum Mode {
     Reattach {
         selected: usize,
     },
+    /// "The agent shim is being shadowed — fix it?". What was found and which
+    /// file would change live on `App`.
+    ShimPath,
 }
 
 /// An agent the last run was hosting, waiting to be resumed.
@@ -157,12 +167,30 @@ pub(crate) struct Pending {
     pub session_name: String,
     /// `claude`, `codex`, whatever it was.
     pub program: String,
-    /// The command line, already rewritten to resume rather than create.
+    /// What will actually be run: the command, not the expansion of it. The
+    /// shim on `PATH` puts the conversation and the commander's description
+    /// back, correctly quoted — see [`dmac_session::agent::as_resume`].
     pub command: String,
     pub conversation: String,
     /// Unticked rows are left alone: their conversation id is kept, so running
     /// the agent by hand later still comes back to it.
     pub chosen: bool,
+}
+
+/// A shim a hosted shell would not reach, and what could be done about it.
+///
+/// Worth interrupting for, because nothing else will ever mention it: the
+/// agent starts, works, and is simply blind — no conversation of its own, no
+/// panels, no sessions. The symptom is an absence, which is the hardest kind
+/// of thing to go looking for.
+#[derive(Debug, Clone)]
+pub(crate) struct ShimShadowed {
+    /// What the shell runs instead.
+    pub by: std::path::PathBuf,
+    /// The rc file that would have to change. `None` for a shell whose
+    /// configuration we do not know how to write — then this is a warning and
+    /// not an offer, and there is nothing to say yes to.
+    pub rc: Option<std::path::PathBuf>,
 }
 
 /// What a prompt is collecting. The value itself lives on `App`, because a
@@ -262,6 +290,9 @@ pub struct App {
     pub(crate) fullscreen: bool,
     /// Agents from the last run, waiting for an answer to "resume?".
     pub(crate) pending: Vec<Pending>,
+    /// A shim a hosted shell would not reach, waiting for an answer to "fix
+    /// it?". Cleared once asked, either way: it is a question, not a nag.
+    pub(crate) shim: Option<ShimShadowed>,
     /// Which session the MCP call being handled belongs to — the session the
     /// calling agent is hosted in. Set for the duration of one call, so a tool
     /// answers about the agent's own panels rather than about whichever session
@@ -504,6 +535,7 @@ impl App {
             should_quit: false,
             fullscreen: false,
             pending: Vec::new(),
+            shim: None,
             mcp_session: None,
             history_filter: String::new(),
             last_history_click: None,
@@ -734,6 +766,10 @@ impl App {
                 items,
             } => self.apply_completion(session, generation, start, items),
             Update::Editor(Ok(message) | Err(message)) => self.status = message,
+            Update::ShimShadowed { by, rc } => {
+                self.shim = Some(ShimShadowed { by, rc });
+                self.raise_shim_question();
+            }
             Update::Rebuilt(Ok(())) => self.restart_in_place(),
             // A failed build changes nothing: the point of building first is
             // that a broken tree costs you a message, not your session.
@@ -914,7 +950,9 @@ impl App {
             ToggleFullscreen => self.toggle_fullscreen(),
             UtilitiesMenu => {
                 self.mode = Mode::Utilities {
-                    selected: crate::ui::menu::first_selectable(&crate::utilities::items()),
+                    selected: crate::ui::menu::first_selectable(&crate::utilities::items(
+                        &self.elsewhere(),
+                    )),
                 };
             }
             ExtendCommandSelection(delta) => self.extend_command_selection(delta),
@@ -1021,7 +1059,6 @@ impl App {
             Move => self.status = self.pending_op("F6 move"),
             MakeDir => self.status = "F7 mkdir — not implemented yet".into(),
             Delete => self.status = self.pending_op("F8 delete"),
-            Menu => self.status = "F9 menu — not implemented yet".into(),
             Unimplemented(what) => self.status = format!("{what} — not implemented yet"),
         }
     }
@@ -1427,6 +1464,27 @@ impl App {
         self.reload_session(index, PanelId::Right);
     }
 
+    /// Find out, in the background, whether a shell started here would reach
+    /// the shim at all — and say so if it would not.
+    ///
+    /// In the background because the only honest way to ask is to start the
+    /// user's shell and let it read its rc files, which is as slow as their rc
+    /// files are. Nothing is sent unless there is a problem, so the common
+    /// case costs a thread and no interruption.
+    pub(crate) fn check_shim(&mut self) {
+        let Some(dir) = self.ses_mut().shim_dir() else {
+            return;
+        };
+        let tx = self.tx.clone();
+        tokio::task::spawn_blocking(move || {
+            if let dmac_session::agent::ShimCheck::Shadowed { by, rc } =
+                dmac_session::agent::check(&dir)
+            {
+                let _ = tx.send(Update::ShimShadowed { by, rc });
+            }
+        });
+    }
+
     pub(crate) fn reattach_agents(&mut self) {
         self.pending.clear();
         for i in 0..self.sessions.len() {
@@ -1497,6 +1555,9 @@ impl App {
                 n => format!("resumed {started} — cleared {n} left over"),
             };
         }
+        // Especially now: what was just resumed went through the same `PATH`,
+        // and if the shim is not on it those agents are the blind ones.
+        self.raise_shim_question();
     }
 
     /// Say no. The conversation ids are kept either way: running the agent by
@@ -1508,6 +1569,85 @@ impl App {
         if n > 0 {
             self.status = format!("left {n} conversation(s) alone — run the agent to pick one up");
         }
+        self.raise_shim_question();
+    }
+
+    /// Bring this session's editor window forward, if it has one.
+    ///
+    /// Raised, never moved: the placement is a thing you asked for once, when
+    /// you opened the directory, and a window you have since dragged somewhere
+    /// is where you wanted it. Switching session is not a request to rearrange
+    /// the screen — only to see the right project on it.
+    fn raise_editor_here(&mut self) {
+        let Ok(dir) = self.editor_here_target() else {
+            return;
+        };
+        // Off the render thread, and only when there is one to be off: a test
+        // switches sessions too, and it has no runtime to spawn onto.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn_blocking(move || {
+                let _ = dmac_desktop::raise_editor_for(&dir);
+            });
+        }
+    }
+
+    /// The sessions you are not in, for the menu that offers to jump to them.
+    ///
+    /// Only the others: a row that takes you where you already are is a row
+    /// that does nothing, and a menu of those teaches people not to read it.
+    pub(crate) fn elsewhere(&self) -> Vec<crate::utilities::Elsewhere> {
+        let here = self.sessions.current_index();
+        self.sessions
+            .all()
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != here)
+            .map(|(index, s)| crate::utilities::Elsewhere {
+                index,
+                name: s.name.clone(),
+            })
+            .collect()
+    }
+
+    /// Ask about the shim, if there is anything to ask and nothing else is
+    /// asking. Called from the event loop, so it waits for whatever else is
+    /// open — "resume?" comes first, and a second dialog appearing over it
+    /// would take an answer meant for the first.
+    pub(crate) fn raise_shim_question(&mut self) {
+        if self.shim.is_some() && self.mode == Mode::Normal {
+            self.mode = Mode::ShimPath;
+        }
+    }
+
+    /// Driving the "fix it?" question.
+    fn shim_key(&mut self, k: KeyEvent) {
+        let shim = self.shim.take();
+        self.mode = Mode::Normal;
+        let Some(shim) = shim else {
+            return;
+        };
+        let yes = matches!(
+            k.code,
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y')
+        );
+        let Some(rc) = shim.rc.filter(|_| yes) else {
+            // Either they said no, or there was nothing to offer. Both leave
+            // the file alone, and both are worth a line: the agent in this
+            // session is blind either way, and that should not be a surprise
+            // later.
+            self.status = format!(
+                "left alone \u{2014} the agent here runs {} and joins no conversation",
+                shim.by.display()
+            );
+            return;
+        };
+        self.status = match dmac_session::agent::repair(&rc) {
+            Ok(()) => format!(
+                "{} now puts the shim first \u{2014} open a new shell for it to take",
+                rc.display()
+            ),
+            Err(e) => format!("could not write {}: {e}", rc.display()),
+        };
     }
 
     /// Driving the "resume?" question.
@@ -1955,6 +2095,7 @@ impl App {
     /// point of holding them all live. Only the transient, per-view state that
     /// belonged to the session we just left is cleared.
     pub(crate) fn after_session_switch(&mut self) {
+        self.raise_editor_here();
         self.ensure_loaded(self.sessions.current_index());
         self.touch_sessions();
         self.quick_search.clear();
@@ -1979,7 +2120,7 @@ impl App {
     ///
     /// Built fresh each time rather than filtered from a fixed list: a menu that
     /// offers Delete on `..` is a menu that will eventually delete the wrong thing.
-    pub(crate) fn context_items(&self) -> Vec<crate::ui::menu::Item> {
+    pub(crate) fn context_items(&self) -> Vec<crate::ui::menu::Item<'static>> {
         use crate::ui::menu::Item;
         let Some(entry) = self.ses().active_panel().current() else {
             return vec![Item::new("Refresh", "Ctrl-R")];
@@ -2155,6 +2296,7 @@ impl App {
             Mode::Utilities { selected } => return self.utilities_key(k, selected),
             Mode::History { selected } => return self.history_key(k, selected),
             Mode::Reattach { selected } => return self.reattach_key(k, selected),
+            Mode::ShimPath => return self.shim_key(k),
             Mode::Normal => {}
         }
 
@@ -2270,8 +2412,8 @@ impl App {
 
     /// Driving the utilities menu.
     fn utilities_key(&mut self, k: KeyEvent, selected: usize) {
-        use crate::utilities::Utility;
-        let items = crate::utilities::items();
+        let elsewhere = self.elsewhere();
+        let items = crate::utilities::items(&elsewhere);
         match k.code {
             KeyCode::Esc => self.mode = Mode::Normal,
             KeyCode::Up => {
@@ -2285,19 +2427,32 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                if let Some(u) = Utility::at(selected) {
-                    self.run_utility(u);
+                if let Some(c) = crate::utilities::at(selected, &elsewhere) {
+                    self.chose(c);
                 }
             }
             // The accelerator shown in the hint column. A menu that lists its
             // shortcuts and does not answer to them is worse than one that
             // lists none.
             KeyCode::Char(c) => {
-                if let Some(u) = Utility::from_key(c.to_ascii_lowercase()) {
-                    self.run_utility(u);
+                if let Some(c) = crate::utilities::from_key(c.to_ascii_lowercase(), &elsewhere) {
+                    self.chose(c);
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Act on a row of the utilities menu.
+    fn chose(&mut self, choice: crate::utilities::Choice) {
+        match choice {
+            crate::utilities::Choice::Do(u) => self.run_utility(u),
+            crate::utilities::Choice::GoTo(index) => {
+                self.mode = Mode::Normal;
+                if self.sessions.switch_to(index) {
+                    self.after_session_switch();
+                }
+            }
         }
     }
 
@@ -2340,7 +2495,23 @@ impl App {
             selected_paths: paths,
         };
 
-        let text = match crate::utilities::run(u, &cx) {
+        // Once: half of these produce a fresh random value every time they are
+        // asked, and asking twice to look at the answer twice would generate a
+        // token, throw it away, and hand over a different one.
+        let outcome = crate::utilities::run(u, &cx);
+
+        // A deed is not text: nothing to insert, nothing to copy, and the
+        // menu's job is over the moment it is named.
+        if let Outcome::Do(deed) = outcome {
+            self.mode = Mode::Normal;
+            match deed {
+                crate::utilities::Deed::OpenEditorHere => self.open_editor_here(),
+                crate::utilities::Deed::StartAgentHere => self.start_agent_here(),
+            }
+            return;
+        }
+
+        let text = match outcome {
             Outcome::Insert(text) if self.ses().view != View::Shell => {
                 let line = &mut self.ses_mut().command_line;
                 // A separating space, but only where one is wanted: after
@@ -2375,6 +2546,8 @@ impl App {
                 self.status = why.to_string();
                 return;
             }
+            // Answered above, before anything was computed for the line.
+            Outcome::Do(_) => return,
         };
         // And on the clipboard as well, always. A utility exists to produce
         // something you are about to use somewhere — often in another window
@@ -3023,7 +3196,7 @@ impl App {
             6 => Action::Move,
             7 => Action::MakeDir,
             8 => Action::Delete,
-            9 => Action::Menu,
+            9 => Action::UtilitiesMenu,
             _ => Action::Quit,
         };
         self.handle(action);
@@ -3133,6 +3306,7 @@ impl App {
         if index >= self.sessions.len() {
             return;
         }
+        let current = self.sessions.current_index();
         let i = Self::idx(panel);
         let session = self.sessions.at_mut(index);
         session.cwd[i] = path;
@@ -3142,6 +3316,22 @@ impl App {
         self.sessions
             .history
             .record(&display, id, dmac_core::history::now());
+
+        // The shell goes where the panels go — from the history, from a jump,
+        // from anything that moves this session's active panel. Only this
+        // session's, and only its active panel: an agent moving the panel of a
+        // session nobody is looking at must not type into that session's shell.
+        //
+        // Whether anything is actually typed is the shell's own call: a `cd`
+        // sent to something that is running is not a command, it is a line
+        // handed to whatever has the keyboard. When it declines, nothing is
+        // lost — the next `Ctrl-O`, with the shell back at a prompt, does it.
+        if index == current {
+            let session = self.sessions.at_mut(index);
+            if session.active == panel {
+                session.follow_panel_cwd();
+            }
+        }
     }
 
     /// Record where every session already is. Called once, at startup.
@@ -3345,20 +3535,86 @@ impl App {
         };
 
         self.close_history();
+        self.launch_editor(dir);
+    }
+
+    /// Start this session's agent in its shell, and show the shell.
+    ///
+    /// Typed at the shell rather than spawned beside it: the shim on `PATH` is
+    /// what gives the agent this session's conversation and the commander's own
+    /// MCP description, and it only gets to do that for something the shell
+    /// runs. Starting the binary directly would produce an agent that knows
+    /// none of it.
+    fn start_agent_here(&mut self) {
+        let agent = dmac_session::agent::attached_program();
+        let waker = self.waker();
+        let (cols, rows) = self.shell_size();
+        let session = self.sessions.current_mut();
+        let shell = match session.shell(cols, rows, waker) {
+            Ok(shell) => shell,
+            Err(e) => {
+                self.status = format!("could not start a shell here: {e}");
+                return;
+            }
+        };
+        // Into a prompt or not at all. A line typed at something already
+        // running is not a command — it is a sentence handed to whatever has
+        // the keyboard, and if that is an agent it will answer it.
+        if !shell.at_prompt() {
+            self.status = format!("the shell here is busy \u{2014} {agent} not started");
+            return;
+        }
+        if let Err(e) = shell.run(agent) {
+            self.status = format!("could not start {agent}: {e}");
+            return;
+        }
+        session.view = View::Shell;
+        self.status = format!("started {agent}");
+    }
+
+    /// The same, for the directory the active panel is showing — the utilities
+    /// menu's route to it, for when you are already looking at the place you
+    /// want opened and going through the history to name it would be absurd.
+    fn open_editor_here(&mut self) {
+        match self.editor_here_target() {
+            Ok(dir) => self.launch_editor(dir),
+            Err(why) => self.status = why,
+        }
+    }
+
+    /// Where the utilities menu would open the editor. Split out from the
+    /// launching so it can be tested without starting anything.
+    pub(crate) fn editor_here_target(&self) -> Result<std::path::PathBuf, String> {
+        let ses = self.ses();
+        let path = &ses.cwd[Self::idx(ses.active)];
+        // An editor opens directories on this machine. One inside an archive or
+        // on a remote host has no name it could be given.
+        if !path.is_local() {
+            return Err("the editor can only open local directories".into());
+        }
+        Ok(path.as_path().to_path_buf())
+    }
+
+    /// Launch the editor on `dir` and put the two windows side by side.
+    ///
+    /// On a task, never here: launching waits on the editor's window appearing,
+    /// which takes as long as starting an editor takes.
+    fn launch_editor(&mut self, dir: std::path::PathBuf) {
         self.status = format!("opening {} \u{2026}", dir.display());
         let tx = self.tx.clone();
-        // On a task, never here: launching waits on the editor's window
-        // appearing, which takes as long as starting an editor takes.
         tokio::task::spawn_blocking(move || {
             let shown = dir.display().to_string();
-            let update = match dmac_desktop::open_editor(&dir) {
+            // Opening and placing as one act, and one at a time: they are the
+            // same request, and three of them at once are three scripts moving
+            // the same two windows.
+            let update = match dmac_desktop::open_beside(&dir, 4, 5) {
                 Err(e) => Update::Editor(Err(format!("{e}"))),
-                Ok(()) => match dmac_desktop::tile(4, 5) {
-                    Ok(()) => Update::Editor(Ok(format!("opened {shown}"))),
-                    // It opened. That is the thing that was asked for, and the
-                    // windows not moving is worth a line but is not a failure.
-                    Err(e) => Update::Editor(Ok(format!("opened {shown} \u{2014} {e}"))),
-                },
+                Ok(dmac_desktop::Opened::Placed) => Update::Editor(Ok(format!("opened {shown}"))),
+                // It opened. That is the thing that was asked for, and the
+                // windows not moving is worth a line but is not a failure.
+                Ok(dmac_desktop::Opened::NotPlaced(why)) => {
+                    Update::Editor(Ok(format!("opened {shown} \u{2014} {why}")))
+                }
             };
             let _ = tx.send(update);
         });
@@ -3565,6 +3821,11 @@ pub async fn run(mut start: Startup) -> anyhow::Result<()> {
     let mut first_frame = true;
 
     loop {
+        // Cheap, and here rather than only where the answer arrives: the check
+        // lands a second or two into the run, by which time the user may have
+        // opened something. Asked from the loop, the question waits for them to
+        // be back at the panels instead of being lost to whatever was open.
+        app.raise_shim_question();
         app.before_frame();
         guard.terminal().draw(|f| ui::draw(f, &mut app))?;
         app.sync_shell_size();
@@ -3573,6 +3834,7 @@ pub async fn run(mut start: Startup) -> anyhow::Result<()> {
             // After the frame, so a cold start still shows something inside its
             // budget and the spawning happens where the user can watch it.
             app.reattach_agents();
+            app.check_shim();
         }
         // After the frame, never during it: stdout is shared with ratatui and
         // interleaving with a half-written frame corrupts both.
@@ -4173,21 +4435,27 @@ mod tests {
         );
     }
 
-    /// The saved line named the conversation it *created*; replaying it
-    /// verbatim would ask for one that already exists, which is exactly the
-    /// "session id is already in use" everyone hits.
+    /// The saved line is an `argv` seen through `ps`, quoting and all already
+    /// gone — replaying it verbatim asks for a conversation that already exists
+    /// *and* hands the shell a JSON object to glob. The offer is the command;
+    /// the conversation travels beside it, for the shim to name.
     #[tokio::test]
-    async fn the_offer_is_a_resume_not_a_second_creation() {
+    async fn the_offer_is_the_command_and_not_the_old_expansion() {
         let mut app = fixture();
         let id = app.sessions.current_mut().conversation_id().to_string();
         app.sessions.current_mut().reattach = Some(format!("claude --session-id {id} --verbose"));
 
         app.reattach_agents();
 
-        let command = &app.pending[0].command;
-        assert!(command.contains("--resume"), "{command}");
-        assert!(!command.contains("--session-id"), "{command}");
-        assert!(command.contains("--verbose"), "the rest is kept: {command}");
+        let p = &app.pending[0];
+        // The shim names the conversation, from the session, quoted properly.
+        // Carrying the old id here means carrying it through a shell, and a
+        // saved line has already lost the quoting that made it one argument.
+        assert_eq!(p.command, "claude --verbose");
+        assert_eq!(
+            p.conversation, id,
+            "the conversation must still be the one being offered"
+        );
     }
 
     /// Saying no starts nothing and loses nothing: the conversation id stays on
@@ -4208,6 +4476,116 @@ mod tests {
             app.sessions.current_mut().conversation_id(),
             id,
             "the conversation is still ours to come back to"
+        );
+    }
+
+    /// The rail has had the sessions all along, on a key that is one more thing
+    /// to know. F9 is the menu people actually reach for.
+    #[test]
+    fn the_utilities_offer_the_other_sessions_and_go_there() {
+        let mut app = App::for_test();
+        app.sessions
+            .create("second", VfsPath::local("/c"), VfsPath::local("/d"));
+        assert_eq!(app.sessions.current_index(), 1, "creating switches to it");
+
+        let elsewhere = app.elsewhere();
+        assert_eq!(elsewhere.len(), 1, "only the one we are not in");
+        assert_eq!(elsewhere[0].index, 0);
+
+        app.on_key(KeyEvent::from(KeyCode::F(9)));
+        assert!(matches!(app.mode, Mode::Utilities { .. }));
+        // The digit the rail gives it, which is the digit Alt already answers to.
+        app.on_key(KeyEvent::from(KeyCode::Char('1')));
+        assert_eq!(app.sessions.current_index(), 0, "the menu did not go there");
+        assert_eq!(app.mode, Mode::Normal, "and it closed behind itself");
+    }
+
+    /// F9 used to be a pull-down menu that was never written, and answered
+    /// with "not implemented yet". One key, one meaning, everywhere: from the
+    /// panels it now opens the same menu it opens from inside a shell.
+    #[test]
+    fn f9_opens_the_utilities_from_the_panels() {
+        let mut app = App::for_test();
+        assert_eq!(app.mode, Mode::Normal);
+        app.on_key(KeyEvent::from(KeyCode::F(9)));
+        assert!(
+            matches!(app.mode, Mode::Utilities { .. }),
+            "F9 left the panels in {:?}",
+            app.mode
+        );
+        assert!(
+            !app.status.contains("not implemented"),
+            "F9 still apologises: {}",
+            app.status
+        );
+    }
+
+    /// The utilities menu opens the editor where the panel already is. Tested
+    /// through the target rather than the launch: a test that starts the user's
+    /// editor is a test nobody runs twice.
+    #[test]
+    fn the_menu_opens_the_editor_on_the_active_panel() {
+        let mut app = App::for_test();
+        app.ses_mut().cwd[0] = VfsPath::local("/tmp/here");
+        app.ses_mut().active = PanelId::Left;
+        assert_eq!(
+            app.editor_here_target(),
+            Ok(std::path::PathBuf::from("/tmp/here"))
+        );
+    }
+
+    /// An editor opens directories on this machine. One inside an archive has
+    /// no name it could be given, and saying so beats launching nothing.
+    #[test]
+    fn the_menu_will_not_pretend_a_remote_directory_can_be_opened() {
+        let mut app = App::for_test();
+        let mut remote = VfsPath::local("/bucket/key");
+        remote.scheme = dmac_vfs::Scheme::S3;
+        app.ses_mut().cwd[0] = remote;
+        app.ses_mut().active = PanelId::Left;
+        assert!(app.editor_here_target().is_err());
+    }
+
+    /// The check comes back a second or two into the run, by which time the
+    /// user may have opened something. A question that arrived while another
+    /// was on screen used to be kept and never shown again.
+    #[test]
+    fn the_shim_question_waits_for_whatever_is_open() {
+        let mut app = App::for_test();
+        app.mode = Mode::History { selected: 0 };
+        app.apply(Update::ShimShadowed {
+            by: std::path::PathBuf::from("/usr/local/bin/claude"),
+            rc: Some(std::path::PathBuf::from("/tmp/rc")),
+        });
+        assert_eq!(app.mode, Mode::History { selected: 0 }, "must not barge in");
+
+        app.mode = Mode::Normal;
+        app.raise_shim_question();
+        assert_eq!(app.mode, Mode::ShimPath, "and must not be forgotten either");
+    }
+
+    /// Once answered it is done: a warning that comes back every time the
+    /// panels are on screen is a warning nobody reads.
+    #[test]
+    fn the_shim_question_is_asked_once() {
+        let mut app = App::for_test();
+        app.apply(Update::ShimShadowed {
+            by: std::path::PathBuf::from("/usr/local/bin/claude"),
+            rc: None,
+        });
+        assert_eq!(app.mode, Mode::ShimPath);
+
+        app.on_key(KeyEvent::from(KeyCode::Char('n')));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.shim.is_none());
+        app.raise_shim_question();
+        assert_eq!(app.mode, Mode::Normal);
+        // Saying no is not silence: the agent in this session is blind, and the
+        // status line is where that gets said.
+        assert!(
+            app.status.contains("/usr/local/bin/claude"),
+            "{}",
+            app.status
         );
     }
 

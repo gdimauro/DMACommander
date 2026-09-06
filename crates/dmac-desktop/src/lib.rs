@@ -69,6 +69,12 @@ fn resolve_editor(name: &str) -> Result<PathBuf, DesktopError> {
     which(name).ok_or_else(|| DesktopError::NoEditor(name.into()))
 }
 
+/// What the editor is launched with: the directory, and deliberately nothing
+/// else. Split out so the "nothing else" is a thing a test can hold on to.
+fn editor_args(dir: &Path) -> Vec<std::ffi::OsString> {
+    vec![dir.as_os_str().to_owned()]
+}
+
 fn which(program: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
@@ -87,18 +93,23 @@ fn is_executable(p: &Path) -> bool {
     p.is_file()
 }
 
-/// Open `dir` in the editor, reusing a window rather than adding one.
+/// Open `dir` in the editor, without taking anything away.
 ///
-/// `-r` is the difference between "show me this folder" and "give me a fifth
-/// window": VS Code reuses the last active one, and if that window already has
-/// this folder open it simply comes forward. Which is the asked-for behaviour
-/// exactly — the editor already knows whether it has the folder, and asking it
-/// is more reliable than any window title we could match on ourselves.
+/// The directory and nothing else. This used to pass `-r`, which is
+/// `--reuse-window`: "force to open a folder in an already opened window". It
+/// was chosen to avoid handing someone a fifth window, and it was the wrong
+/// trade — reusing a window means the folder that was in it is gone, which
+/// from the other side of the screen is indistinguishable from the editor
+/// having closed. Losing what you had open is never worth saving a window.
+///
+/// Left to itself the editor does the right thing and does it better than we
+/// could: a window already showing this folder comes forward, and otherwise it
+/// opens one, in whichever way that user configured it to. It knows what it has
+/// open, which is more than any window title we could match on would tell us.
 pub fn open_editor(dir: &Path) -> Result<(), DesktopError> {
     let editor = editor()?;
     Command::new(editor)
-        .arg("-r")
-        .arg(dir)
+        .args(editor_args(dir))
         // Detached from our terminal in all three directions. An editor that
         // wrote a line of its own to stdout would land in the middle of a
         // rendered frame.
@@ -109,6 +120,191 @@ pub fn open_editor(dir: &Path) -> Result<(), DesktopError> {
         .map(|_| ())
         .map_err(DesktopError::Launch)
 }
+
+/// How many windows the editor has right now.
+///
+/// Asked *before* launching, because "the editor's window" is not a thing that
+/// can be identified afterwards: a second project opens a second window, and
+/// the one at the front the instant the launch returns is still the old one.
+/// Placing that is placing the window the user was already happy with, while
+/// the new one arrives seconds later wherever the editor felt like putting it.
+#[cfg(target_os = "macos")]
+pub fn editor_windows() -> usize {
+    let Ok(name) = editor().map(|_| EDITOR_PROCESS) else {
+        return 0;
+    };
+    let out = Command::new("osascript")
+        .args(["-l", "JavaScript", "-e", COUNT_SCRIPT])
+        .arg(name)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    out.ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
+        .unwrap_or(0)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn editor_windows() -> usize {
+    0
+}
+
+/// Open `dir` in the editor and put the two windows side by side, as one act.
+///
+/// One at a time, process-wide. Three of these at once are three scripts
+/// moving the same two windows, each undoing the last and each retrying
+/// because the others keep changing what it just read — which is how three
+/// requests produce one window placed twice and two left at their default
+/// size. Serialising them costs the third request the time of the first two,
+/// and that is the correct price.
+pub fn open_beside(dir: &Path, share: u32, of: u32) -> Result<Opened, DesktopError> {
+    let _one_at_a_time = placing()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Counted inside the lock: a count taken before waiting for someone else's
+    // placement is a count of a different world.
+    let before = editor_windows();
+    open_editor(dir)?;
+    match tile_after(before, share, of) {
+        Ok(()) => Ok(Opened::Placed),
+        // It opened. That is what was asked for, and the windows not moving is
+        // worth a line but is not a failure.
+        Err(e) => Ok(Opened::NotPlaced(e.to_string())),
+    }
+}
+
+/// What [`open_beside`] managed. Launching and placing fail separately.
+#[derive(Debug)]
+pub enum Opened {
+    Placed,
+    NotPlaced(String),
+}
+
+fn placing() -> &'static std::sync::Mutex<()> {
+    static PLACING: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    PLACING.get_or_init(Default::default)
+}
+
+/// The editor as the window server names its process.
+const EDITOR_PROCESS: &str = "Code";
+
+#[cfg(target_os = "macos")]
+const COUNT_SCRIPT: &str = r#"
+function run(argv) {
+  try { return String(Application('System Events').processes.byName(argv[0]).windows().length); }
+  catch (e) { return '0'; }
+}
+"#;
+
+/// Bring the editor's window for `dir` to the front of the editor's own
+/// windows, leaving it exactly where it is.
+///
+/// The window is raised, not the application: activating the editor would take
+/// the keyboard away from the terminal the user is typing in, and switching
+/// session is not asking to leave. Within its own app the window comes to the
+/// front, which — with the two tiled side by side and neither on top of the
+/// other — is all that "bring it forward" can honestly mean.
+///
+/// `Ok(false)` when the editor has no window for that directory. That is the
+/// ordinary case and not a failure: most sessions have no editor open.
+#[cfg(target_os = "macos")]
+pub fn raise_editor_for(dir: &Path) -> Result<bool, DesktopError> {
+    let titles = editor_titles();
+    let Some(title) = window_for(&titles, dir) else {
+        return Ok(false);
+    };
+    let out = Command::new("osascript")
+        .args(["-l", "JavaScript", "-e", RAISE_SCRIPT])
+        .arg(EDITOR_PROCESS)
+        .arg(title)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| DesktopError::Placement(format!("osascript: {e}")))?;
+    Ok(String::from_utf8_lossy(&out.stdout).trim() == "ok")
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn raise_editor_for(_dir: &Path) -> Result<bool, DesktopError> {
+    Ok(false)
+}
+
+/// The titles of the editor's windows, front to back.
+#[cfg(target_os = "macos")]
+fn editor_titles() -> Vec<String> {
+    let Ok(out) = Command::new("osascript")
+        .args(["-l", "JavaScript", "-e", TITLES_SCRIPT])
+        .arg(EDITOR_PROCESS)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+/// Which window belongs to `dir`, by the only thing the window server will say
+/// about it.
+///
+/// Matching on a title is a guess, and it is the guess the editor invites: it
+/// titles a window `file — folder`, or `folder` alone, and puts its own notes
+/// in between — `file (Working Tree) — folder`. So the title is split on the
+/// dash and a segment has to *be* the directory's name rather than merely
+/// contain it: a folder called `src` would otherwise match every window with a
+/// file from some `src` open.
+///
+/// Deliberately the last resort and not the first. It decides which window to
+/// *raise*, never which to move: a wrong guess here brings the wrong project
+/// forward, which is visible and undone by looking away; a wrong guess about
+/// what to place moves a window somebody had arranged.
+fn window_for<'a>(titles: &'a [String], dir: &Path) -> Option<&'a str> {
+    let name = dir.file_name()?.to_str()?;
+    titles
+        .iter()
+        .find(|t| {
+            t.split('\u{2014}')
+                .flat_map(|part| part.split(" - "))
+                .any(|part| part.trim() == name)
+        })
+        .map(String::as_str)
+}
+
+#[cfg(target_os = "macos")]
+const TITLES_SCRIPT: &str = r#"
+function run(argv) {
+  var se = Application('System Events');
+  try {
+    return se.processes.byName(argv[0]).windows().map(function (w) {
+      try { return String(w.name()); } catch (e) { return ''; }
+    }).join('\n');
+  } catch (e) { return ''; }
+}
+"#;
+
+/// Raised by an exact title rather than by an index: the list was taken a
+/// moment ago, and a window that closed in between would make an index name
+/// somebody else's window.
+#[cfg(target_os = "macos")]
+const RAISE_SCRIPT: &str = r#"
+function run(argv) {
+  var se = Application('System Events');
+  var ws;
+  try { ws = se.processes.byName(argv[0]).windows(); } catch (e) { return 'no'; }
+  for (var i = 0; i < ws.length; i++) {
+    var t = '';
+    try { t = String(ws[i].name()); } catch (e) { continue; }
+    if (t !== argv[1]) continue;
+    // The window, not the application: `frontmost` would take the keyboard
+    // away from the terminal the user is typing in.
+    try { ws[i].actions.byName('AXRaise').perform(); return 'ok'; } catch (e) { return 'no'; }
+  }
+  return 'no';
+}
+"#;
 
 /// The application hosting this process, named as the window server names it.
 ///
@@ -176,12 +372,27 @@ pub fn host_application() -> Option<String> {
 /// rest of it.
 ///
 /// The screen is the one the terminal is already on, not the main one: someone
-/// with two monitors asked for this on the monitor they are looking at.
+/// with two monitors asked for this on the monitor they are looking at. Which
+/// screen that is, for a window straddling two of them, is decided by where
+/// its centre falls — for two screens side by side that is also the one
+/// holding most of it, since the split is a single line.
 ///
 /// Blocks for as long as it takes the editor's window to exist — it may have
 /// been launched a moment ago — so never call it on the render thread.
 #[cfg(target_os = "macos")]
 pub fn tile(share: u32, of: u32) -> Result<(), DesktopError> {
+    tile_after(usize::MAX, share, of)
+}
+
+/// The same, waiting for a window the editor does not have yet.
+///
+/// `existing` is how many windows it had before it was asked to open one. The
+/// placement waits for one more than that before touching anything, so it
+/// moves the window that was just asked for rather than the one that happened
+/// to be at the front. `usize::MAX` means "do not wait", for a caller that has
+/// no before to compare against.
+#[cfg(target_os = "macos")]
+pub fn tile_after(existing: usize, share: u32, of: u32) -> Result<(), DesktopError> {
     let terminal = host_application().ok_or_else(|| {
         DesktopError::Placement("cannot tell which terminal this is running in".into())
     })?;
@@ -194,9 +405,10 @@ pub fn tile(share: u32, of: u32) -> Result<(), DesktopError> {
         .arg("-e")
         .arg(TILE_SCRIPT)
         .arg(&terminal)
-        .arg("Code")
+        .arg(EDITOR_PROCESS)
         .arg(share.to_string())
         .arg(of.to_string())
+        .arg(existing.to_string())
         .output()
         .map_err(|e| DesktopError::Placement(format!("osascript: {e}")))?;
 
@@ -239,6 +451,11 @@ pub fn tile(_share: u32, _of: u32) -> Result<(), DesktopError> {
     Err(DesktopError::Unsupported)
 }
 
+#[cfg(not(target_os = "macos"))]
+pub fn tile_after(_existing: usize, _share: u32, _of: u32) -> Result<(), DesktopError> {
+    Err(DesktopError::Unsupported)
+}
+
 /// Cocoa measures screens from the bottom left of the main one; System Events
 /// measures windows from the top left of it. Everything below is in the second
 /// system, so the screen rectangles are converted once on the way in and the
@@ -249,29 +466,99 @@ function run(argv) {
   ObjC.import('AppKit');
   var termName = argv[0], editorName = argv[1];
   var share = parseInt(argv[2], 10), of = parseInt(argv[3], 10);
+  // How many windows the editor had before it was asked for another one.
+  var existing = parseInt(argv[4], 10);
+  if (isNaN(existing)) existing = -1;
   var se = Application('System Events');
 
-  function frontWindow(name) {
-    try {
-      var ws = se.processes.byName(name).windows();
-      return ws.length ? ws[0] : null;
-    } catch (e) { return null; }
+  // A specifier, resolved again on every use. A window object held across a
+  // resize goes stale: the next thing asked of it fails with -1728, "Can't get
+  // object", and takes the rest of the placement with it — which is what left
+  // the terminal moved but never resized.
+  function win(name) { return se.processes.byName(name).windows[0]; }
+  function windows(name) {
+    try { return se.processes.byName(name).windows().length; } catch (e) { return 0; }
   }
 
   // The editor may have been launched a heartbeat ago; wait for its window
-  // rather than reporting a failure that fixes itself.
-  var ed = null;
-  for (var i = 0; i < 60 && ed === null; i++) {
-    ed = frontWindow(editorName);
-    // Foundation, not the scripting additions: `delay` belongs to Standard
-    // Additions, which `osascript -l JavaScript -e` does not always have — and
-    // when it does not, the call fails with "Message not understood" (-1708)
-    // and takes the whole placement with it. Sleeping through ObjC always works.
-    if (ed === null) $.NSThread.sleepForTimeInterval(0.1);
+  // rather than reporting a failure that fixes itself. And when it already had
+  // windows, wait for the *new* one: a second project opens a second window,
+  // which arrives seconds after the launch returns, and until it does the
+  // window at the front is the one the user was already happy with.
+  // The editor is also entitled to reuse a window instead of opening one, and
+  // then no new window is ever coming. Its title changing is the other end of
+  // the same wait — used only to stop waiting, never to choose a window.
+  function frontTitle() {
+    try { return String(win(editorName).name()); } catch (e) { return ''; }
   }
-  if (ed === null) return 'the editor never showed a window';
-  var term = frontWindow(termName);
-  if (term === null) return 'no window found for ' + termName;
+  var wanted = existing < 0 ? 1 : existing + 1;
+  var was = frontTitle();
+  for (var i = 0; i < 60 && windows(editorName) < wanted && frontTitle() === was; i++) {
+    // Foundation, not the scripting additions: `delay` belongs to Standard
+    // Additions, which `osascript -l JavaScript -e` does not always have.
+    $.NSThread.sleepForTimeInterval(0.1);
+  }
+  // Not an error when it simply reused one — the editor is entitled to decide
+  // that — so what follows places whatever is at the front.
+  if (windows(editorName) === 0) return 'the editor never showed a window';
+  if (windows(termName) === 0) return 'no window found for ' + termName;
+
+  // Assert one property until it takes. The window server applies these
+  // asynchronously and silently drops what it cannot honour yet, so a single
+  // assignment is a request and not a result. `tolerance` because a window is
+  // entitled to argue: Terminal rounds its height to whole rows. Ending up
+  // somewhere else anyway is not reported — the windows are placed for the
+  // user's benefit and roughly right is worth more than an error message.
+  // Never managing to assign at all is the real failure, and the only one
+  // they can act on: it is what a missing Accessibility permission looks like.
+  // What a window is allowed to argue about: Terminal rounds its height to
+  // whole rows, and a screen's usable top is a menu bar lower than its frame.
+  var TOLERANCE = 40;
+
+  function apply(name, prop, want, tolerance) {
+    var applied = false, err = 'no window';
+    for (var i = 0; i < 20; i++) {
+      try { win(name)[prop] = want; applied = true; } catch (e) { err = String(e); }
+      var got = null;
+      try { got = win(name)[prop](); } catch (e) { err = String(e); }
+      if (got !== null) {
+        if (Math.abs(got[0] - want[0]) <= tolerance && Math.abs(got[1] - want[1]) <= tolerance) {
+          return null;
+        }
+      }
+      $.NSThread.sleepForTimeInterval(0.05);
+    }
+    return applied ? null : 'could not place ' + name + ': ' + err;
+  }
+
+  // Position and size argue with each other, and each one is only true until
+  // the other is asserted: a resize at the edge of a screen is pushed back by
+  // the window server, and a move *after* a resize quietly costs the window
+  // part of its height. Asserting them in some clever order does not settle
+  // it — what settles it is asking for both and then checking both, together,
+  // until the pair holds at once.
+  function near(got, want) {
+    return got !== null
+        && Math.abs(got[0] - want[0]) <= TOLERANCE
+        && Math.abs(got[1] - want[1]) <= TOLERANCE;
+  }
+
+  function place(name, x, y, w, h) {
+    var p = null, s = null;
+    for (var pass = 0; pass < 4; pass++) {
+      var why = apply(name, 'position', [x, y], TOLERANCE)
+             || apply(name, 'size', [w, h], TOLERANCE);
+      if (why !== null) return why;
+      try { p = win(name).position(); s = win(name).size(); } catch (e) { p = null; s = null; }
+      if (near(p, [x, y]) && near(s, [w, h])) return null;
+    }
+    // Said out loud, with both numbers. A window that would not go where it
+    // was put used to report success, which is how a placement that visibly
+    // did not happen came back as 'opened' and nothing else.
+    return name + ' would not take ' + w + '\u{d7}' + h + ' at ' + x + ',' + y
+         + ' \u{2014} it is ' + (s === null ? '?' : s[0] + '\u{d7}' + s[1])
+         + ' at ' + (p === null ? '?' : p[0] + ',' + p[1]);
+  }
 
   var screens = $.NSScreen.screens;
   var mainH = screens.objectAtIndex(0).frame.size.height;
@@ -282,7 +569,7 @@ function run(argv) {
                  w: f.size.width, h: f.size.height });
   }
 
-  var p = term.position(), s = term.size();
+  var p = win(termName).position(), s = win(termName).size();
   var cx = p[0] + s[0] / 2, cy = p[1] + s[1] / 2;
   var scr = rects[0];
   for (var i = 0; i < rects.length; i++) {
@@ -291,10 +578,19 @@ function run(argv) {
   }
 
   var left = Math.round(scr.w * share / of);
-  ed.position = [scr.x, scr.y];
-  ed.size = [left, scr.h];
-  term.position = [scr.x + left, scr.y];
-  term.size = [scr.w - left, scr.h];
+  var why = place(editorName, scr.x, scr.y, left, scr.h);
+  if (why !== null) return why;
+
+  // Where the editor actually landed, rather than where it was asked to go:
+  // a screen's usable rectangle is not quite what `visibleFrame` says — a
+  // second display carries its own menu bar, and the window server clamps to
+  // it. Fitting the terminal to the editor's own top, height and right edge
+  // takes that out of the arithmetic: whatever the first window was allowed,
+  // the second one gets the rest of the row, exactly adjacent to it.
+  var edP = win(editorName).position(), edS = win(editorName).size();
+  var x = edP[0] + edS[0];
+  why = place(termName, x, edP[1], scr.x + scr.w - x, edS[1]);
+  if (why !== null) return why;
   return 'ok';
 }
 "#;
@@ -302,6 +598,55 @@ function run(argv) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The editor's own titling, in the shapes it really produces.
+    #[test]
+    fn a_window_is_found_by_the_folder_in_its_title() {
+        let titles: Vec<String> = [
+            "Welcome — /",
+            "spa.gateway.feature.changes.log.yaml — back-office",
+            "context-menu.component.tsx (Working Tree) — TimePulse",
+            "plank",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let found = |p: &str| window_for(&titles, Path::new(p));
+        assert_eq!(found("/Users/x/prj/back-office"), Some(titles[1].as_str()));
+        assert_eq!(found("/Users/x/prj/TimePulse"), Some(titles[2].as_str()));
+        // A window titled by its folder alone.
+        assert_eq!(found("/Users/x/prj/plank"), Some(titles[3].as_str()));
+        assert_eq!(found("/Users/x/prj/nothing-here"), None);
+    }
+
+    /// A segment has to *be* the name, not contain it. Otherwise a session in
+    /// any `src` raises whichever project happens to have a file open from one.
+    #[test]
+    fn a_folder_name_inside_another_word_is_not_a_match() {
+        let titles: Vec<String> = ["main.rs — src-tauri", "index.ts — websrc"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(window_for(&titles, Path::new("/x/src")), None);
+        assert_eq!(
+            window_for(&titles, Path::new("/x/src-tauri")),
+            Some(titles[0].as_str())
+        );
+    }
+
+    /// Reusing a window throws away the folder that was in it. Someone who
+    /// opens three projects wants three, and a flag that quietly closes the
+    /// last one is a flag that loses their work in progress.
+    #[test]
+    fn the_editor_is_never_told_to_reuse_a_window() {
+        let args = editor_args(Path::new("/tmp/project"));
+        assert!(
+            !args.iter().any(|a| a == "-r" || a == "--reuse-window"),
+            "{args:?}"
+        );
+        assert_eq!(args, vec![std::ffi::OsString::from("/tmp/project")]);
+    }
 
     #[test]
     fn an_absolute_editor_is_taken_as_given() {

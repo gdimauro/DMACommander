@@ -60,6 +60,10 @@ struct Persisted {
     /// and nothing else.
     #[serde(default)]
     history: Vec<dmac_core::history::Visit>,
+    /// How wide the session rail was left. Absent in files written before it
+    /// could be resized, which reads as the default pair.
+    #[serde(default)]
+    rail: crate::RailWidths,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +192,7 @@ impl SessionStore {
         }
 
         manager.history = dmac_core::history::History::from_visits(saved.history);
+        manager.rail = saved.rail;
         manager.switch_to(saved.current.min(manager.len() - 1));
         Ok(Some((manager, saved.clean_exit)))
     }
@@ -204,6 +209,7 @@ impl SessionStore {
             current: manager.current_index(),
             sessions: manager.all().iter().map(persist).collect(),
             history: manager.history.visits().to_vec(),
+            rail: manager.rail,
         };
         let json = serde_json::to_string_pretty(&saved).map_err(|source| StoreError::Corrupt {
             path: self.path.display().to_string(),

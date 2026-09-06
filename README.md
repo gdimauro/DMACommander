@@ -22,8 +22,31 @@ cargo run -- . ~
 ```
 
 `Tab` switches panels · arrows and PgUp/PgDn navigate · `Enter` enters a
-directory · `Backspace` goes up · `Ins` selects · `Ctrl-U` swaps panels ·
-`Ctrl-O` hides the panels · `Ctrl-F3..F6` sort · `F10` quits.
+directory · `Backspace` goes up · `Ins` selects · `Alt-U` swaps panels ·
+`Ctrl-U` the utilities · `Ctrl-H` everywhere you have been · `Ctrl-O` hides the
+panels · `Shift-F3..F6` sort · `F10` quits.
+
+A directory tree can name the session it belongs to: put the name in a
+`.dmac-session` file and `cd` into it from anywhere — `dmac` picks it up, after
+`--session` and `$DMAC_SESSION` and before anything else.
+
+In a hosted shell, `Shift-PgUp/PgDn` reads back through what it has printed and
+`Shift`+arrows selects it, over as many screenfuls as you like; `Ctrl-T` opens
+the session rail, whose two widths you can drag or resize with `Left`/`Right`.
+See [docs/TERMINAL-KEYS.md](docs/TERMINAL-KEYS.md).
+
+Run `claude` in a hosted shell and it comes up already knowing where it is:
+DMACommander describes itself to it as an MCP server, so the agent can see both
+panels, the history and the sessions it is running inside, and it rejoins the
+same conversation every time rather than starting a fresh one. Nothing to
+install — a shim early on `PATH` does it.
+
+That shim is also the one thing your own shell can quietly defeat: a `.zshrc`
+that does `PATH="$HOME/.local/bin:$PATH"` runs *after* DMACommander has had its
+say and puts its own directory first, and then `claude` starts from your `PATH`
+knowing none of the above. Startup asks your shell where `claude` actually
+resolves and offers to add a line to your rc file if the answer is wrong —
+nothing is written unless you say yes. See [docs/MCP.md](docs/MCP.md).
 
 Keys bound to subsystems that do not exist yet say so in the status line rather
 than doing nothing.

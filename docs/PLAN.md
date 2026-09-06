@@ -54,6 +54,48 @@ screensaver takes the whole screen and needs nothing that did not already exist.
 They were blocked by association, not by dependency. Corrected, and worth
 remembering as a failure mode when sequencing the rest.
 
+**M2 — Sessions, hosting and continuity: most of it landed, out of order.**
+
+The plan says the phases are sequential and M1 comes first. They did not happen
+that way, and it is worth writing down why rather than quietly renumbering: what
+the author actually needed was to keep an agent's conversation alive across a
+restart, and none of that is blocked by copying files. M1 is still the gap it
+always was — this program still cannot move a byte.
+
+What is running:
+
+- **`dmac-pty`** hosts a child in a real PTY with `vt100` behind it. Two thousand
+  lines of scrollback that can be read back, selected across screenfuls and
+  copied out. `dmac-desktop` launches, raises and tiles external windows.
+- **Live sessions and the rail.** Several at once, never swapped; `Shift-Tab`,
+  `F11` or `Ctrl-T`; two widths, dragged or given on the command line, both kept
+  across restarts. Per-session view: panels or the hosted process, `Ctrl-O`
+  between them.
+- **Persistence.** One file, written atomically and debounced, quarantined when
+  it is corrupt rather than blocking startup, with an unclean exit announced on
+  the next run.
+- **Startup resolution**, three of the five steps: `--session`, then
+  `$DMAC_SESSION`, then a `.dmac-session` file walked up from the working
+  directory. Auto-resume and the picker are still to come.
+- **Agents are attached, not merely launched.** A shim early on `PATH` gives
+  every `claude` started in a session that session's conversation id, so closing
+  the commander and coming back reopens the conversation rather than a fresh
+  one — and the restart *asks* before resuming anything. Startup also checks
+  that the shim is actually being reached, because an rc file that reorders
+  `PATH` silently defeats it.
+- **The commander is itself an MCP server**, so a hosted agent can see the
+  panels, the history, the sessions and the screen. Ten tools, one socket per
+  run, described to the agent inline so two commanders never share a file.
+- **The directory history** (`Ctrl-H`), everywhere the panels have been, four
+  ways to read it, fuzzy filter, and `F5` to open a row in the editor beside the
+  commander.
+
+What M2 still owes: the per-session on-disk model (`session.toml`,
+`workspace.json` — today every session lives in one file), the startup picker,
+auto-resume, the cross-session clipboard, and the acceptance gates that are
+measurements rather than features — eight sessions against the RSS budget, a
+grep of the written tree for secrets, and an older binary reading a newer file.
+
 ---
 
 ## Critical path

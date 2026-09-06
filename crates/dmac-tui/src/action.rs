@@ -100,7 +100,6 @@ pub enum Action {
     Move,
     MakeDir,
     Delete,
-    Menu,
     Quit,
 
     /// Contextual commands for whatever the cursor is on. Right-click, or

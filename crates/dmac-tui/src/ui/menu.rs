@@ -14,16 +14,16 @@ use unicode_width::UnicodeWidthStr;
 
 /// One row. A separator is an item with no label and no action.
 #[derive(Debug, Clone, Copy)]
-pub struct Item {
-    pub label: &'static str,
+pub struct Item<'a> {
+    pub label: &'a str,
     /// The keyboard equivalent, right-aligned — this is how a context menu
     /// teaches its own shortcuts.
-    pub hint: &'static str,
+    pub hint: &'a str,
     pub separator: bool,
 }
 
-impl Item {
-    pub const fn new(label: &'static str, hint: &'static str) -> Self {
+impl<'a> Item<'a> {
+    pub const fn new(label: &'a str, hint: &'a str) -> Self {
         Self {
             label,
             hint,
@@ -31,7 +31,7 @@ impl Item {
         }
     }
 
-    pub const SEPARATOR: Self = Self {
+    pub const SEPARATOR: Item<'static> = Item {
         label: "",
         hint: "",
         separator: true,
@@ -40,7 +40,7 @@ impl Item {
 
 /// Index of the next selectable item in `step` direction, skipping separators
 /// and wrapping. Returns `None` if there is nothing selectable at all.
-pub fn next_selectable(items: &[Item], from: usize, step: isize) -> Option<usize> {
+pub fn next_selectable(items: &[Item<'_>], from: usize, step: isize) -> Option<usize> {
     let n = items.len();
     if n == 0 {
         return None;
@@ -55,7 +55,7 @@ pub fn next_selectable(items: &[Item], from: usize, step: isize) -> Option<usize
 }
 
 /// The first selectable item, for opening a fresh menu.
-pub fn first_selectable(items: &[Item]) -> usize {
+pub fn first_selectable(items: &[Item<'_>]) -> usize {
     items.iter().position(|i| !i.separator).unwrap_or(0)
 }
 
@@ -65,7 +65,7 @@ pub fn draw(
     frame: &mut Frame,
     area: Rect,
     anchor: (u16, u16),
-    items: &[Item],
+    items: &[Item<'_>],
     selected: usize,
     theme: &Theme,
 ) -> Rect {
@@ -155,7 +155,7 @@ fn clip(s: String, width: usize) -> String {
 mod tests {
     use super::*;
 
-    fn items() -> Vec<Item> {
+    fn items() -> Vec<Item<'static>> {
         vec![
             Item::new("Open", "Enter"),
             Item::SEPARATOR,

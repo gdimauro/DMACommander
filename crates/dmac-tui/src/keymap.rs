@@ -48,7 +48,7 @@ pub fn resolve(key: KeyEvent, focus: Focus) -> Option<Action> {
         (F(6), _, _) => Action::Move,
         (F(7), _, _) => Action::MakeDir,
         (F(8), _, _) | (Delete, false, false) => Action::Delete,
-        (F(9), _, _) => Action::Menu,
+        (F(9), _, _) => Action::UtilitiesMenu,
         (F(10), _, _) => Action::Quit,
 
         // --- Shift+cursor on the command line selects text there. Left and

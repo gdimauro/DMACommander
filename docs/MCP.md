@@ -45,8 +45,57 @@ The environment carries the same facts for anything that is not `claude`:
 | Variable            | What it is                          |
 | ------------------- | ----------------------------------- |
 | `DMAC_MCP_SOCKET`   | The socket to connect to            |
+| `DMAC_SHIM_DIR`     | Where this session's shims live     |
 | `DMAC_SESSION`      | The session's name                  |
 | `DMAC_CONVERSATION` | The agent conversation it owns      |
+
+## When the shim is not reached
+
+The shim only works while it is the first `claude` on `PATH`, and `PATH` is not
+DMACommander's to keep. The environment above is handed to the shell *before* it
+reads its rc files, and the ordinary
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+in a `.zshrc` runs afterwards and puts that directory in front of ours. The
+agent then starts from your own `PATH`, perfectly well, knowing nothing about
+which conversation it belongs to and unable to see the panels it is running
+inside — and nothing anywhere says so. The symptom is an absence, which is the
+hardest kind of thing to go looking for.
+
+One case is immune: when **DMACommander itself** launches the agent — resuming a
+conversation at startup — there is no interactive shell in between, no rc file
+runs, and the shim wins. It is only what *you* type in a hosted shell that your
+own configuration gets to reorder.
+
+So startup asks. Not by reading `PATH` here — the answer depends on what the rc
+files do after we hand over, and the only thing that knows that is the shell.
+It is started the way a session starts it, interactive and with the same
+environment, and asked where `claude` resolves. When the answer is not the shim,
+you are told what runs instead and offered the fix:
+
+```sh
+# Added by DMACommander …
+if [ -n "$DMAC_SHIM_DIR" ] && [ "${PATH%%:*}" != "$DMAC_SHIM_DIR" ]; then
+  PATH="$DMAC_SHIM_DIR:$PATH"
+  export PATH
+fi
+```
+
+Appended to your rc file, never inserted: it has to run after whatever else that
+file does to `PATH`, and that is the entire point. Written in terms of the
+variable and not the directory, because the directory is named after this run's
+pid and will not exist tomorrow — so the line stays correct for every future
+run, and does nothing at all in a shell DMACommander did not start.
+
+Nothing is written without a yes. Saying no leaves the file alone and says, in
+the status line, what the agent in that session will be running instead.
+
+Shells whose configuration we do not know how to write are told rather than
+asked: the same diagnosis, and `$DMAC_SHIM_DIR` to put in front of `PATH`
+wherever that shell's last word on it lives.
 
 ## The tools
 

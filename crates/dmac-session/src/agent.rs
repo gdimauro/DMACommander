@@ -52,6 +52,15 @@ pub enum AgentError {
     Io(#[from] std::io::Error),
 }
 
+/// The agent a session hosts, named once. The menu that offers to start it and
+/// the shim that intercepts it have to agree, and the way to guarantee that is
+/// for there to be one name. The first of [`ATTACHED`] because that is the one
+/// that exists; a second agent needs a second menu entry, and whoever adds it
+/// will find this.
+pub fn attached_program() -> &'static str {
+    ATTACHED[0].program
+}
+
 /// Which attached program, if any, is among these running commands.
 ///
 /// Asked at shutdown so the next run knows what to start again — this is what
@@ -93,27 +102,64 @@ fn is_attached(line: &str) -> bool {
     false
 }
 
-/// The same command line, but resuming rather than creating.
+/// What to run to get this conversation back, as something a shell can be
+/// handed safely.
 ///
-/// A saved command line names the conversation it *created*; running it again
-/// verbatim asks for a conversation that already exists, which is exactly the
-/// "already in use" the user hits. Everything else — the model, the permission
-/// mode, whatever else they chose — is left alone, because it is part of what
-/// they set up.
+/// The input is not a command line. It is an `argv` observed through `ps` and
+/// rejoined with spaces, so every quote its author wrote is already gone —
+/// which matters enormously, because the shim's `--mcp-config` argument is a
+/// JSON object full of braces and containing a path with a space in it. Handed
+/// back to a shell it is not one argument any more: `zsh` word-splits it,
+/// tries to glob `{"mcpServers":{...}}`, and refuses the whole line with "bad
+/// pattern". That is not a thing to fix by quoting it again — the quoting that
+/// was lost cannot be recovered — so what comes back here is the *command*, not
+/// the expansion of it:
+///
+/// - the program by its bare name, so the shim on `PATH` is what runs, rather
+///   than the absolute path the shim itself resolved to last time;
+/// - nothing of what the shim added — the socket in an old `--mcp-config` died
+///   with the run that printed it, and the conversation is the shim's to name,
+///   from the session, correctly quoted;
+/// - everything the *user* chose, untouched: a model, a permission mode, a
+///   directory. That is what they set up, and it is not ours to drop.
+///
+/// Above all, never a bare `--resume`. A resume flag whose id went missing does
+/// not fail — it silently opens whichever conversation was most recent, which
+/// is how you end up somewhere you have never been with no idea why.
 pub fn as_resume(line: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut words = line.split_whitespace().peekable();
+
+    if let Some(first) = words.next() {
+        out.push(first.rsplit('/').next().unwrap_or(first).to_string());
+    }
+
     while let Some(w) = words.next() {
         match w {
-            "--session-id" => {
-                out.push("--resume".to_string());
-                if let Some(id) = words.next() {
-                    out.push(id.to_string());
+            // Ours. The value is JSON that has already lost its quotes, so it
+            // is not one word any more: skip until the braces balance, or the
+            // remains of it end up on the command line as globs.
+            "--mcp-config" => {
+                let mut depth = 0i32;
+                for v in words.by_ref() {
+                    depth += v.matches('{').count() as i32 - v.matches('}').count() as i32;
+                    if depth <= 0 {
+                        break;
+                    }
                 }
             }
-            _ if w.starts_with("--session-id=") => {
-                out.push(w.replacen("--session-id=", "--resume=", 1));
+            // Ours as well, and the value with it. Dropping the flag and
+            // keeping what came after it would leave the id standing on the
+            // command line as a positional argument — which for an agent is
+            // not a stray word, it is a prompt.
+            "--session-id" | "--resume" | "-r" => {
+                if words.peek().is_some_and(|v| !v.starts_with('-')) {
+                    words.next();
+                }
             }
+            _ if w.starts_with("--mcp-config=")
+                || w.starts_with("--session-id=")
+                || w.starts_with("--resume=") => {}
             _ => out.push(w.to_string()),
         }
     }
@@ -329,6 +375,12 @@ pub fn environment(
     };
     let mut env = vec![
         ("PATH".to_string(), path),
+        // Named as well as prepended, because prepending is not the last word:
+        // the shell reads its rc files after this, and an rc file that puts its
+        // own directory in front of `PATH` puts it in front of ours too. A
+        // shell that can name the directory can put it back — which is what
+        // `repair` writes, and what `check` looks for the absence of.
+        (SHIM_DIR_VAR.to_string(), shim_dir.display().to_string()),
         ("DMAC_SESSION".to_string(), session_name.to_string()),
         ("DMAC_CONVERSATION".to_string(), conversation.to_string()),
     ];
@@ -341,6 +393,180 @@ pub fn environment(
     }
     env
 }
+
+/// The variable naming the shim directory to a hosted shell.
+///
+/// Also the marker that says the rc file has already been repaired: a file
+/// that mentions it at all is left alone, so running the repair twice writes
+/// nothing the second time.
+const SHIM_DIR_VAR: &str = "DMAC_SHIM_DIR";
+
+/// Marks off the one line of a shell's output that is an answer to us.
+const FENCE: &str = "--dmac--";
+
+/// Whether a hosted shell would actually reach the shim.
+///
+/// It is worth asking because the failure is silent. The shim is only reached
+/// while it is the first `claude` on `PATH`, and `PATH` is not ours to keep:
+/// what we hand the shell is read before its rc files, and the usual
+/// `PATH="$HOME/.local/bin:$PATH"` in a `.zshrc` puts that directory in front
+/// of ours. The agent then starts perfectly well, knowing nothing about which
+/// conversation it belongs to and unable to see the panels it is running
+/// inside — and nothing anywhere says why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShimCheck {
+    /// The shim wins. Nothing to do.
+    Reached,
+    /// Something else wins. Names it, and the file that would have to change
+    /// for it not to — `None` when the shell is one whose configuration we do
+    /// not know how to write, where offering to edit it would be worse than
+    /// saying nothing.
+    Shadowed { by: PathBuf, rc: Option<PathBuf> },
+    /// No answer worth acting on: no shell, or one that would not say.
+    Unknown,
+}
+
+/// Ask the user's shell, the way the user's shell will be asked.
+///
+/// Not by reading `PATH` here: the answer depends on what the rc files do
+/// after we hand the environment over, and the only thing that knows that is
+/// the shell itself. So it is started the way a session starts it —
+/// interactive, same environment — and asked where the agent resolves.
+///
+/// Costs a whole shell startup, rc files and all, so it belongs on a thread
+/// that is not drawing anything.
+#[cfg(unix)]
+pub fn check(shim_dir: &Path) -> ShimCheck {
+    let Some(program) = ATTACHED.first().map(|a| a.program) else {
+        return ShimCheck::Unknown;
+    };
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let path = match std::env::var("PATH") {
+        Ok(p) => format!("{}:{p}", shim_dir.display()),
+        Err(_) => shim_dir.display().to_string(),
+    };
+    let out = std::process::Command::new(&shell)
+        .arg("-i")
+        .arg("-c")
+        // Fenced, because an interactive shell is not a quiet one: rc files
+        // greet, print tips, and restore sessions, and the first line of that
+        // is not the answer to anything. `echo` and `;` are the two pieces of
+        // syntax every shell worth asking agrees on, fish included.
+        .arg(format!("echo {FENCE}; command -v {program}; echo {FENCE}"))
+        .env("PATH", path)
+        .env("DMAC", "1")
+        .env(SHIM_DIR_VAR, shim_dir)
+        // An rc file that reads from its input gets end of file rather than
+        // the user's keyboard: this runs behind their back and must not be
+        // able to sit there waiting for them. Complaints about job control go
+        // the same way — a shell that is interactive without a terminal says
+        // so, and it is not an answer to anything.
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    let Ok(out) = out else {
+        return ShimCheck::Unknown;
+    };
+    let answer = String::from_utf8_lossy(&out.stdout);
+    let Some(found) = answer
+        .lines()
+        .skip_while(|l| l.trim() != FENCE)
+        .skip(1)
+        .take_while(|l| l.trim() != FENCE)
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+    else {
+        // Nothing between the fences, or no fences at all: nothing found, or a
+        // shell that would not answer. Neither is a shadowed shim — there is
+        // no agent here to shadow, and `prepare` would not have written one.
+        return ShimCheck::Unknown;
+    };
+    let found = PathBuf::from(found);
+    if found.parent() == Some(shim_dir) {
+        return ShimCheck::Reached;
+    }
+    ShimCheck::Shadowed {
+        by: found,
+        rc: rc_file(&shell),
+    }
+}
+
+#[cfg(not(unix))]
+pub fn check(_shim_dir: &Path) -> ShimCheck {
+    ShimCheck::Unknown
+}
+
+/// The file that gets the last word on `PATH`, for the shells whose answer we
+/// know how to write.
+fn rc_file(shell: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    match Path::new(shell).file_name()?.to_str()? {
+        // Not `$HOME` blindly: a `ZDOTDIR` is where that user's zsh actually
+        // reads from, and writing to the other file would change nothing while
+        // looking like it had.
+        "zsh" => Some(
+            std::env::var_os("ZDOTDIR")
+                .map(PathBuf::from)
+                .unwrap_or(home)
+                .join(".zshrc"),
+        ),
+        "bash" => Some(home.join(".bashrc")),
+        "fish" => Some(home.join(".config/fish/config.fish")),
+        _ => None,
+    }
+}
+
+/// Put the shim directory back in front, from inside the user's own rc file.
+///
+/// Appended, never inserted: it has to run after whatever else the file does
+/// to `PATH`, and that is the whole point of it. Written in terms of the
+/// variable rather than the directory, because the directory is named after
+/// this run's pid and will not exist tomorrow — so the line is correct for
+/// every future run, and does nothing at all in a shell DMACommander did not
+/// start.
+///
+/// Idempotent: a file that already mentions the variable is left alone.
+pub fn repair(rc: &Path) -> Result<(), AgentError> {
+    let existing = std::fs::read_to_string(rc).unwrap_or_default();
+    if existing.contains(SHIM_DIR_VAR) {
+        return Ok(());
+    }
+    let fish = rc.extension().is_some_and(|e| e == "fish");
+    let mut out = existing;
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(if fish { FISH_REPAIR } else { POSIX_REPAIR });
+    if let Some(parent) = rc.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(rc, out)?;
+    Ok(())
+}
+
+/// Why the line is there, in the file the user will find it in one day.
+const POSIX_REPAIR: &str = r#"
+# Added by DMACommander. It puts its own directory in front of PATH before this
+# file runs, and this file then puts yours in front of that — so without these
+# lines the `claude` started here is the one from your PATH, which knows nothing
+# about which conversation this session is or that there are panels to look at.
+# Outside DMACommander it does nothing: nothing else sets DMAC_SHIM_DIR.
+if [ -n "$DMAC_SHIM_DIR" ] && [ "${PATH%%:*}" != "$DMAC_SHIM_DIR" ]; then
+  PATH="$DMAC_SHIM_DIR:$PATH"
+  export PATH
+fi
+"#;
+
+const FISH_REPAIR: &str = r#"
+# Added by DMACommander. It puts its own directory in front of PATH before this
+# file runs, and this file then puts yours in front of that — so without these
+# lines the `claude` started here is the one from your PATH, which knows nothing
+# about which conversation this session is or that there are panels to look at.
+# Outside DMACommander it does nothing: nothing else sets DMAC_SHIM_DIR.
+if set -q DMAC_SHIM_DIR
+    fish_add_path --path --prepend --move $DMAC_SHIM_DIR
+end
+"#;
 
 /// The first `program` on `PATH` that is not our own shim.
 ///
@@ -423,13 +649,21 @@ for arg in "$@"; do
     {explicit}) exec '{real}' {mcp}"$@" ;;
   esac
 done
-# Ask {program}'s own store whether this conversation exists, and fall back to
-# our marker only if that store is not where we expect. Trusting the marker
-# alone is what produces "Session ID ... is already in use": the conversation
-# outlives the marker whenever the marker is cleaned up, moved, or never
-# written because the first run was killed before it got that far.
+# Ask {program}'s own store whether this conversation exists. That store is the
+# truth: the conversation outlives our marker whenever the marker is cleaned up
+# or never written, and the marker outlives the conversation whenever one was
+# reserved and never used. Resuming on the marker alone gets both wrong, in
+# opposite directions.
 existing=$(ls "$HOME"/.claude/projects/*/'{conversation}'.jsonl 2>/dev/null | head -1)
-if [ -n "$existing" ] || [ -e '{marker}' ]; then
+if [ -n "$existing" ]; then
+  exec '{real}' {mcp}{resume_flag} '{conversation}' "$@"
+fi
+# Only when the store cannot be consulted at all does the marker get a say.
+# It used to have one whenever it existed, and that is a resume of a
+# conversation that is not there — which does not start empty, it refuses to
+# start. The marker is written the moment a conversation is *reserved*, and a
+# reserved conversation nobody ever typed into leaves no transcript behind.
+if [ ! -d "$HOME/.claude/projects" ] && [ -e '{marker}' ]; then
   exec '{real}' {mcp}{resume_flag} '{conversation}' "$@"
 fi
 : > '{marker}'
@@ -673,12 +907,15 @@ mod tests {
             "the description travels inline, not as a path: {s}"
         );
         // On every route out, including the one the user's own flags take:
-        // choosing a conversation is not choosing to be blind.
+        // choosing a conversation is not choosing to be blind. Counted against
+        // the `exec`s themselves, so adding a route cannot quietly add a blind
+        // one.
         assert_eq!(
             s.matches("--mcp-config").count(),
-            3,
+            s.matches("exec '/usr/local/bin/claude'").count(),
             "every exec should carry it: {s}"
         );
+        assert!(s.matches("--mcp-config").count() >= 4, "{s}");
     }
 
     /// ...and without one, the shim is exactly what it was.
@@ -692,6 +929,132 @@ mod tests {
             None,
         );
         assert!(!s.contains("--mcp-config"), "{s}");
+    }
+
+    /// A directory named by pid, so two runs of the suite cannot collide.
+    fn scratch(what: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("dmac-{what}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    /// The shim's one decision, exercised by running it. All of resuming lives
+    /// in a few lines of `sh`, and asserting on the text of them proves nothing
+    /// about what `sh` does with it.
+    #[cfg(unix)]
+    #[test]
+    fn the_shim_resumes_only_a_conversation_that_is_really_there() {
+        const CONV: &str = "d0754a32-dd64-4d19-891b-d5bcf3de3d4b";
+        let dir = scratch("decide");
+        let home = dir.join("home");
+        let argv = dir.join("argv");
+        let marker = dir.join("marker");
+
+        // Stands in for the agent: writes down what it was handed, and stops.
+        let real = dir.join("agent");
+        write_executable(
+            &real,
+            &format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n", argv.display()),
+        )
+        .expect("agent");
+
+        let shim = dir.join("claude");
+        write_executable(&shim, &shim_script(claude(), &real, CONV, &marker, None)).expect("shim");
+
+        let transcript = home
+            .join(".claude/projects/somewhere")
+            .join(format!("{CONV}.jsonl"));
+        let run = || {
+            let _ = std::fs::remove_file(&argv);
+            let ok = std::process::Command::new(&shim)
+                .env("HOME", &home)
+                .status()
+                .expect("the shim runs")
+                .success();
+            assert!(ok, "the shim exited badly");
+            std::fs::read_to_string(&argv).expect("the agent recorded nothing")
+        };
+
+        // A conversation with a transcript is resumed.
+        std::fs::create_dir_all(transcript.parent().expect("parent")).expect("projects");
+        std::fs::write(&transcript, "{}").expect("transcript");
+        assert!(
+            run().contains("--resume"),
+            "a real conversation was not resumed"
+        );
+
+        // One that was reserved and never typed into leaves a marker and no
+        // transcript. Resuming that does not start empty — it refuses to start.
+        std::fs::remove_file(&transcript).expect("remove");
+        std::fs::write(&marker, "").expect("marker");
+        let args = run();
+        assert!(args.contains("--session-id"), "a ghost was resumed: {args}");
+
+        // Unless the store cannot be looked at at all, which is the one case
+        // the marker was ever for.
+        std::fs::remove_dir_all(home.join(".claude")).expect("remove store");
+        assert!(
+            run().contains("--resume"),
+            "with no store to consult, the marker has the say"
+        );
+    }
+
+    /// Running it twice must not write it twice: the offer is made once per
+    /// run, and a user who says yes on three mornings should not find three
+    /// copies of the same block in their `.zshrc`.
+    #[test]
+    fn the_repair_is_written_once() {
+        let rc = scratch("rc").join(".zshrc");
+        std::fs::write(&rc, "export PATH=\"$HOME/.local/bin:$PATH\"").expect("write");
+        repair(&rc).expect("first");
+        repair(&rc).expect("second");
+        let text = std::fs::read_to_string(&rc).expect("read");
+        assert_eq!(
+            text.matches(SHIM_DIR_VAR).count(),
+            POSIX_REPAIR.matches(SHIM_DIR_VAR).count(),
+            "{text}"
+        );
+        // And what was there before is still there, untouched and still first:
+        // the whole point is to run after it.
+        assert!(
+            text.starts_with("export PATH=\"$HOME/.local/bin:$PATH\"\n"),
+            "{text}"
+        );
+    }
+
+    /// fish is not a POSIX shell and `${PATH%%:*}` is a syntax error in it.
+    #[test]
+    fn a_fish_rc_is_written_in_fish() {
+        let rc = scratch("fish").join("config.fish");
+        repair(&rc).expect("write");
+        let text = std::fs::read_to_string(&rc).expect("read");
+        assert!(text.contains("fish_add_path"), "{text}");
+        assert!(!text.contains("${PATH%%:*}"), "{text}");
+    }
+
+    /// The shell is told the directory as well as given it, because being
+    /// given it is not enough — the rc files run afterwards.
+    #[test]
+    fn the_shell_is_told_where_the_shim_is() {
+        let env = environment(Path::new("/tmp/shims/s1"), "work", "abc");
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == SHIM_DIR_VAR && v == "/tmp/shims/s1"),
+            "{env:?}"
+        );
+    }
+
+    /// What this machine's shell would really do, which no assertion can know.
+    /// Ignored because it starts a whole interactive shell:
+    ///
+    ///     cargo test -p dmac-session -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn what_this_shell_would_run() {
+        let dir = scratch("check");
+        write_executable(&dir.join("claude"), "#!/bin/sh\nexit 0\n").expect("write");
+        println!("{:?}", check(&dir));
     }
 
     #[test]
@@ -764,15 +1127,50 @@ mod tests {
     /// verbatim asks for one that already exists, which is the "already in use"
     /// the user actually hits.
     #[test]
-    fn replaying_a_command_line_resumes_instead_of_creating() {
+    fn what_is_replayed_is_the_command_and_not_its_expansion() {
+        // The line exactly as `ps` hands it back: one `argv` rejoined with
+        // spaces, so the quoting around the JSON — which itself contains a path
+        // with a space in it — is already gone.
+        let seen = concat!(
+            "/Users/x/.local/bin/claude --mcp-config ",
+            "{\"mcpServers\":{\"dmac\":{\"args\":[\"--mcp\",\"/Users/x/Library/Application ",
+            "Support/DMACommander/mcp/42891.sock\",\"--mcp-session\",\"2\"],",
+            "\"command\":\"/Users/x/dmac\"}}} --resume d0754a32-dd64-4d19-891b-d5bcf3de3d4b"
+        );
+        // Not a fragment of that object survives: handed to a shell, the braces
+        // are globs and the whole line is refused with "bad pattern".
+        assert_eq!(as_resume(seen), "claude");
+    }
+
+    /// What the *user* chose is theirs, and is not ours to drop.
+    #[test]
+    fn the_arguments_the_user_chose_survive() {
         assert_eq!(
             as_resume("claude --session-id 1234 --model opus"),
-            "claude --resume 1234 --model opus"
+            "claude --model opus"
         );
         assert_eq!(
-            as_resume("claude --session-id=1234"),
-            "claude --resume=1234"
+            as_resume("/opt/bin/claude --resume=abc --permission-mode auto"),
+            "claude --permission-mode auto"
         );
+    }
+
+    /// The one that cost an evening. A resume flag whose id has gone missing
+    /// does not fail — it opens whichever conversation was most recent, and
+    /// lands someone in a conversation they have never seen with no clue why.
+    #[test]
+    fn a_resume_flag_never_comes_back_without_its_id() {
+        for line in [
+            "claude --resume",
+            "claude --mcp-config {\"a\":1} --resume",
+            "claude --session-id",
+            "/abs/claude -r",
+        ] {
+            let out = as_resume(line);
+            assert!(!out.contains("resume"), "{line:?} became {out:?}");
+            assert!(!out.contains("session-id"), "{line:?} became {out:?}");
+            assert!(!out.contains(" -r"), "{line:?} became {out:?}");
+        }
     }
 
     /// Everything the user chose is part of what they set up, and giving back

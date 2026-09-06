@@ -12,6 +12,7 @@ pub(crate) mod rail;
 pub(crate) mod reattach;
 mod screen;
 pub(crate) mod shell;
+mod shim;
 mod splash;
 
 pub use screen::draw_canvas;
@@ -95,7 +96,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let rail_w = if full && !rail_open {
         0
     } else {
-        rail::width(rail_open, rows[0].width)
+        rail::width(rail_open, app.sessions.rail, rows[0].width)
     };
     let body = Layout::default()
         .direction(Direction::Horizontal)
@@ -110,16 +111,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         crate::app::Mode::Rail { selected } => Some(selected),
         _ => None,
     };
-    app.layout.rail = rail::draw(
-        frame,
-        body[0],
-        &app.sessions,
-        rail_open,
-        rail_cursor,
-        &theme,
-    );
+    // The outer rect as well as the interior: the last column of it is the grip
+    // the pointer drags to resize, and the interior does not include it.
+    app.layout.rail_outer = body[0];
+    app.layout.rail = rail::draw(frame, body[0], &app.sessions, rail_cursor, &theme);
     let software_cursor = app.software_cursor();
     let shell_selection = app.shell_selection;
+    let shell_caret = app.shell_caret;
 
     // Split the borrow: the current session's panels are drawn mutably (they
     // record their viewport height) while the theme is read.
@@ -139,6 +137,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // both halves too little room to be useful.
     if session.view == dmac_session::View::Shell {
         if let Some(sh) = session.shell.as_ref() {
+            // Asked of the system, not remembered: the commander only knows
+            // about the `cd`s it typed itself, and the whole point of a shell
+            // is that you type your own.
+            let here = sh
+                .cwd()
+                .map(|p| dmac_session::abbreviate_home(&p.display().to_string()));
+            let panel = dmac_session::abbreviate_home(
+                &session.cwd[dmac_session::Session::index_of(session.active)].display(),
+            );
+            // Only when they differ, which is only when something is running:
+            // a shell at a prompt has already been sent after the panels.
+            let pending = (here.as_deref() != Some(panel.as_str())).then_some(panel.as_str());
             layout.shell = shell::draw(
                 frame,
                 body[1],
@@ -148,6 +158,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     bordered: !full,
                     software_cursor,
                     selection: shell_selection,
+                    caret: shell_caret,
+                    cwd: here.as_deref(),
+                    pending,
                 },
                 theme,
             );
@@ -245,7 +258,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 frame,
                 area,
                 anchor,
-                &crate::utilities::items(),
+                &crate::utilities::items(&app.elsewhere()),
                 selected,
                 theme,
             );
@@ -267,6 +280,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
         crate::app::Mode::Reattach { selected } => {
             reattach::draw(frame, area, &app.pending, selected, theme);
+        }
+        crate::app::Mode::ShimPath => {
+            if let Some(shim) = &app.shim {
+                shim::draw(frame, area, shim, theme);
+            }
         }
         crate::app::Mode::Rail { .. } | crate::app::Mode::Normal => {
             app.layout.picker = ratatui::layout::Rect::default();

@@ -6,6 +6,75 @@ Notable changes, newest first. Versions follow the policy in
 ## Unreleased
 
 ### Added
+- **Switching session brings that session's editor forward.** If a window is
+  open on the directory the session is showing, it comes to the front of the
+  editor's windows — the per-window Alt-Tab macOS does not have. Raised, never
+  moved: the placement is something you asked for once, when you opened the
+  directory, and a window you have dragged since is where you wanted it.
+
+  The *window* is raised and not the application, so the keyboard stays in the
+  terminal you are typing in — switching session is not a request to leave it.
+  The window is found by its title, split on the dash the editor puts between
+  the file and the folder, with a segment having to *be* the directory's name
+  rather than merely contain it: a session in some `src` must not raise whatever
+  project happens to have a file from one open. A guess, and deliberately one
+  that only ever decides what to raise — never what to move.
+- **F9 lists the other sessions, and goes to them.** Under the utilities, behind
+  a separator, one row per session you are not in — answering to the same digit
+  the rail gives it, which is the digit `Alt` already jumps on. The rail has had
+  this list all along, on a key that is one more thing to know; a list that
+  exists somewhere other than the menu people reach for is a list nobody finds.
+- **F9 starts the agent, too.** `c` in the utilities runs `claude` in this
+  session's shell and shows it. Typed at the shell rather than spawned beside
+  it, because the shim on `PATH` is what hands the agent this session's
+  conversation and the commander's own MCP description, and it only gets to do
+  that for something the shell runs. A shell that is busy is left alone and says
+  so: a line typed at something already running is not a command, it is a
+  sentence handed to whatever has the keyboard.
+- **F9 opens the editor where you already are.** The utilities menu gained one
+  entry that does something rather than producing something: `o` opens the
+  active panel's directory in the editor and tiles the two windows, the same as
+  `F5` in the history — for when you are already looking at the place you want
+  opened and going through the history to name it would be absurd. The menu
+  still touches nothing itself: it returns the deed, and the application
+  performs it on a thread that is not drawing.
+- **`.dmac-session`: a checkout can name the session it belongs to.** The third
+  step of the startup resolution — after `--session` and `$DMAC_SESSION` — walks
+  up from the working directory and takes the first one it finds, nearest first,
+  so `cd` into a project from anywhere and its panels, shells and conversation
+  come back with it. The file is one line, `#` comments and blank lines skipped.
+
+  It is treated as content and not as configuration, because it arrives with a
+  `git clone` like everything else in the tree: a name with a control character,
+  a separator, or more than 64 characters in it is refused, and refused *out
+  loud* — the file is named on stderr before the screen is taken over, because a
+  session silently called `main` when the tree asked for something else is
+  someone looking at the wrong workspace and not knowing why.
+- **A hosted shell can be read back and copied out of.** Two thousand lines are
+  kept above the top of the pane. `Shift-PgUp`/`PgDn` walks through them and the
+  wheel scrolls three lines a notch; `Shift` with the arrows, `Home`/`End` and
+  the page keys selects, from wherever the shell's own cursor is, and
+  `Ctrl-Shift-C` copies. Holding the selection past the top of the pane scrolls
+  the view and grows the selection with it, so what you copy is the whole of what
+  you selected and not the part that happened to be on screen. Typing snaps back
+  to the live screen the way every terminal does, and `Esc` means "back to live"
+  only while there is something to come back from — otherwise it reaches the
+  program, which needs it. `Ctrl-Shift` looks, `Shift` selects: the quick keys
+  need a terminal that reports modifiers, and the ones that work everywhere cover
+  all of it. See [docs/TERMINAL-KEYS.md](docs/TERMINAL-KEYS.md).
+- **The session rail has two widths, and both are yours.** One for resting and
+  one for open, remembered separately and kept across restarts. Drag its
+  right-hand edge, or open it with `Ctrl-T` and use `Left`/`Right` or `-`/`+`.
+  Widen the resting strip past eight columns and it stops being dots and shows
+  names and paths all the time; drag it to nothing and it disappears, with
+  `Ctrl-T` still opening it. `--rail-width` and `--rail-collapsed-width` set both
+  from the command line, which is how you undo a drag that went too far.
+- **[docs/TERMINAL-KEYS.md](docs/TERMINAL-KEYS.md): which keys your terminal can
+  actually send.** Not a preference and not a bug — `Ctrl-H`, `Backspace` and
+  `Ctrl-Shift-H` are the same byte in a terminal that does not report modifiers,
+  and the information never left the keyboard driver. The page says which keys
+  are safe everywhere, which need the kitty keyboard protocol, and what to press
+  instead: `Ctrl-O` chords and `F9`/`F12` need nothing at all.
 - **DMACommander is an MCP server.** An agent hosted in a session can see both
   panels, the directory history, the sessions and the screen itself, through ten
   tools that follow one rule: read freely, write visibly. Nothing to install —
@@ -25,11 +94,105 @@ Notable changes, newest first. Versions follow the policy in
   Ctrl-H is now the history.
 
 ### Changed
+- **The shell goes where the panels go.** It used to follow only on the way in
+  through `Ctrl-O`; now any move of the current session's active panel — the
+  history, a jump, an agent — sends it after them. What is typed is still the
+  shell's own call: a `cd` sent to something that is running is not a command,
+  it is a line handed to whatever has the keyboard, so a busy shell is left
+  alone and catches up at the next `Ctrl-O`.
+- **The shell's border says where it is, not just what it is running.** The one
+  view where you type commands was the one view that would not tell you where
+  they would land. The directory is asked of the system rather than remembered:
+  the commander only knows about the `cd`s it typed itself, and the whole point
+  of a shell is that you type your own. When the panels have gone somewhere the
+  shell could not follow, both are shown with an arrow between them — the
+  answer to "did it come with me?" belongs on the screen.
+- **F9 is the utilities, everywhere.** It used to be Norton's pull-down menu in
+  the panels — which was never written, and answered "not implemented yet" —
+  while meaning the utilities inside a hosted shell. One key with one meaning
+  beats fidelity to a menu whose contents (panel modes, sort orders, options)
+  live on their own keys here anyway. The F-key bar says `Utils`.
+- **Opening a directory in the editor no longer takes away the one you had.**
+  It used to pass `-r`, `--reuse-window`, chosen so that asking for four
+  projects would not hand you four windows. That was the wrong trade: reusing a
+  window means the folder that was in it is gone, which from the other side of
+  the screen is indistinguishable from the editor having closed. Left to itself
+  the editor does better than we could — a window already showing that folder
+  comes forward, and otherwise it opens one, the way its owner configured it to.
 - **Restarting asks before resuming an agent.** It used to spawn whatever the
   last run was hosting, silently, on every rebuild. Now it names each session,
   conversation and command line, and waits. Saying no loses nothing.
 
 ### Fixed
+- **A second project was opened and then not placed.** Since the editor stopped
+  reusing its window, asking for another one produces another window — and the
+  placement was not waiting for it. It took the editor's front window the
+  instant the launch returned, which is still the *old* one: the new window
+  arrives seconds later, wherever the editor felt like putting it, and the one
+  that got tiled was the one already sitting where the user wanted it. Opening
+  three projects left one window placed three times and two at 1440×900.
+
+  The count of windows is now taken before the launch and the placement waits
+  for one more than that, or for the front window's title to change when the
+  editor reused one instead. Opening and placing also became a single act taken
+  one at a time: three requests at once were three scripts moving the same two
+  windows, each undoing the last and each retrying because the others kept
+  changing what it had just read.
+- **The shim resumed conversations that were not there.** It asked the agent's
+  own store whether a conversation existed and then, if a marker file said so,
+  resumed anyway. But the marker is written when a conversation is *reserved*,
+  and one nobody ever typed into leaves no transcript behind — so the marker
+  outlives the conversation just as easily as the conversation outlives the
+  marker. Resuming on it is not an empty conversation, it is a refusal to
+  start. The store now decides; the marker only speaks when there is no store
+  to consult. Tested by running the shim rather than by reading it: all of this
+  lives in five lines of `sh`, and assertions about their text prove nothing
+  about what `sh` does with them.
+- **Resuming an agent replayed a command line that could not survive a shell.**
+  What a session was hosting is observed through `ps`, which hands back an
+  `argv` rejoined with spaces — every quote its author wrote already gone. The
+  shim's own `--mcp-config` argument is a JSON object full of braces containing
+  a path with a space in it, so replaying that line word for word gave `zsh` a
+  glob to expand and got the whole command refused with `bad pattern`. Worse,
+  anything lost from the tail of it turned `--resume <id>` into a bare
+  `--resume`, which does not fail: it opens whichever conversation was most
+  recent, and lands you somewhere you have never been with no idea why.
+
+  What is replayed now is the *command* — the program by its bare name, plus
+  everything the user chose, and nothing the shim added. The shim puts its own
+  arguments back, naming this run's socket and this session's conversation,
+  quoted properly because it is the one writing them. A resume flag can no
+  longer come back without its id: the flag goes with it.
+- **The agent shim was silently bypassed.** DMACommander puts its shim directory
+  in front of `PATH` before the hosted shell starts — and then the shell reads
+  its rc files, and a `.zshrc` doing `PATH="$HOME/.local/bin:$PATH"` puts that
+  directory in front of ours. `claude` then started from the user's own `PATH`:
+  no conversation of its own, and no MCP server, so the agent could not see the
+  panels it was running inside. Nothing said so; the symptom was an absence.
+
+  Startup now asks the user's own shell, interactively, where `claude` resolves,
+  and offers to put a few lines at the end of the rc file that put the shim back
+  in front. The lines are written in terms of `$DMAC_SHIM_DIR`, which is now in
+  the environment too — so they stay correct for every future run and do nothing
+  at all in a shell DMACommander did not start.
+- **The tiled windows came out short, and said nothing about it.** Position and
+  size argue with each other, and each is only true until the other is asserted:
+  a resize at the edge of a screen is pushed back by the window server, and a
+  move *after* a resize quietly costs the window part of its height — 175 pixels
+  of it, measured. No ordering settles that. Both are now asked for and then
+  checked *together*, up to four passes, and a window that will not take what it
+  was given says so with both numbers instead of reporting success. The silence
+  was the worse half of the bug: a placement that visibly did not happen came
+  back as `opened` and nothing else.
+- **F5 moved the terminal without resizing it.** The placement script held on to
+  a window object across a resize. A System Events window reference goes stale
+  the moment the window actually changes size: the next thing asked of it fails
+  with -1728, which aborted the placement half-done and left the terminal moved,
+  still its old size, and mostly off-screen. Every window is now re-resolved on
+  each use, each move and resize is asserted until it takes rather than sent
+  once and hoped for, and the terminal is fitted to where the editor actually
+  landed instead of to `visibleFrame` — a second display carries its own menu
+  bar, which is why the windows came up short.
 - **A pseudo-terminal race.** Two threads calling `openpty` at once
   intermittently lose it, which is why the suite failed at random and why
   restoring several sessions together could fail to start a shell. Opening one is

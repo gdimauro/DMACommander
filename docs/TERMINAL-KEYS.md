@@ -14,8 +14,12 @@ This page says which keys are safe, which are not, and what to press instead.
 | Leave the shell | `Ctrl-O` | — |
 | Directory history | `Ctrl-O` `h`, or `F12` | `Ctrl-Shift-H`, `Cmd-H` |
 | Utilities | `Ctrl-O` `u`, or `F9` | `Ctrl-Shift-U`, `Cmd-U` |
+| Open this directory in the editor | `F9` then `o` | — |
 | Next / previous session | `Ctrl-O` `Tab` | `Ctrl-Shift-Tab`, `Ctrl-PgUp/PgDn` |
+| Go to a session by name | `F9`, then its digit | `Ctrl-T`, `Alt`+digit |
 | Copy / paste | your terminal's own | `Ctrl-Shift-C/V`, `Ctrl/Shift-Insert` |
+| Read back through a shell | `Shift-PgUp/PgDn` | `Ctrl-Shift-Up/Down/Home/End` |
+| Select text in a shell | `Shift` + arrows | — |
 
 From the **panels** everything works, because there a plain `Ctrl` is enough:
 `Ctrl-H` is the history and `Ctrl-U` the utilities. The problem is only inside a
@@ -73,12 +77,73 @@ F9      utilities
 F12     directory history
 ```
 
-In the panels these keep their canon meanings — `F9` is the menu, `F12` the
-screensavers — and this is the only place in the program where a key means two
-different things. It is also the only place where a terminal without modifier
-reporting has no other way in. The cost is real and worth naming: a program
-running inside the shell never sees those two keys.
+`F9` means the same thing in the panels: the utilities. It used to be Norton's
+pull-down menu, which was never written and answered "not implemented yet" — a
+key that apologises is worse than a key that does the useful thing, and one key
+with one meaning everywhere is worth more than fidelity to a menu whose
+contents live on their own keys here anyway.
+
+`F12` is the one key in the program that means two different things: the
+screensaver picker in the panels, the directory history in a shell. It is also
+the only way in for a terminal that cannot report modifiers. The cost is real
+and worth naming: a program running inside the shell never sees either key.
 
 Both are printed on the shell's bottom border, which is the only documentation
 visible in that view — the F-key bar is deliberately hidden there, because a
 legend for keys the shell has taken is a legend that lies.
+
+## Reading back through a shell, and selecting what is up there
+
+A hosted shell keeps 2000 lines above the top of the pane. The rule is one line
+long:
+
+> **Ctrl-Shift looks. Shift selects.**
+
+```
+Shift-PgUp / PgDn        a page back, and forward again
+Ctrl-Shift-Up / Down     a line at a time
+Ctrl-Shift-PgUp / PgDn   a page, even while something is selected
+Ctrl-Shift-Home / End    the oldest line held, and back to the live screen
+wheel                    three lines a notch
+
+Shift + arrows           select, from where the shell's cursor is
+Shift + Home / End       to the start or the end of the line
+Shift + PgUp / PgDn      extend the selection by a page
+Ctrl-Shift-C             copy it
+Esc                      back to the live screen, selection cleared
+```
+
+Holding `Shift-Up` at the top of the pane keeps going: the view scrolls and the
+selection grows with it, so a selection may be many screenfuls tall, and copying
+it gives you all of it — not the part that happened to be on screen.
+
+Typing anything else snaps back to the live screen, the way every terminal does.
+`Esc` only means "back to live" while there is something to come back from;
+otherwise it reaches the hosted program, which needs it.
+
+Of these, only the `Ctrl-Shift` family needs modifier reporting. `Shift-PgUp`,
+`Shift` with the arrows and the wheel work in every terminal, and between them
+they cover everything — the `Ctrl-Shift` keys are quicker, not necessary.
+
+## Resizing the session rail
+
+The strip of coloured dots down the left edge has two widths, remembered
+separately and kept across restarts: one for when it is resting and one for when
+it is open.
+
+```
+Ctrl-T  or  Shift-Tab    open the rail (it takes the keyboard)
+  Left / Right, - / +    make it narrower or wider
+drag its right-hand edge  the same, with the pointer, open or not
+```
+
+Widen the **resting** strip past 8 columns and it stops being dots: it shows the
+session names and paths all the time, without being opened. Drag it down to
+nothing and it disappears entirely — `Ctrl-T` still opens it.
+
+Both widths can also be set on the command line, which is the way to undo a drag
+that went too far:
+
+```sh
+dmac --rail-collapsed-width 20 --rail-width 30
+```
