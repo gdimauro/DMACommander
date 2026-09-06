@@ -6,6 +6,35 @@ Notable changes, newest first. Versions follow the policy in
 ## Unreleased
 
 ### Added
+- **DMACommander is an MCP server.** An agent hosted in a session can see both
+  panels, the directory history, the sessions and the screen itself, through ten
+  tools that follow one rule: read freely, write visibly. Nothing to install —
+  starting a shell writes the configuration and the shim hands it to `claude`.
+  `dmac --mcp <socket>` is the pipe. See [docs/MCP.md](docs/MCP.md).
+- **Ctrl-H: the directory history.** Everywhere the panels have been, kept across
+  sessions and restarts, read three ways — newest first, most used anywhere, or
+  this session only — on F1/F2/F3, with the bar at the bottom becoming the list's
+  own. Typing filters, fuzzily, with the matched characters highlighted.
+- **Backspace leaves the directory.** The quick search only owns the key while it
+  has something to delete.
+- **A launcher, an app bundle and an icon.** `packaging/install.sh` puts `dmac`
+  on the PATH and DMACommander in the Dock, on the Desktop and in
+  `~/Applications`, preferring terminals that speak the kitty keyboard protocol.
+  `--uninstall` takes all of it back out.
+- Hidden files move to Alt-H and Alt-period, where `mc` keeps them, because
+  Ctrl-H is now the history.
+
+### Changed
+- **Restarting asks before resuming an agent.** It used to spawn whatever the
+  last run was hosting, silently, on every rebuild. Now it names each session,
+  conversation and command line, and waits. Saying no loses nothing.
+
+### Fixed
+- **A pseudo-terminal race.** Two threads calling `openpty` at once
+  intermittently lose it, which is why the suite failed at random and why
+  restoring several sessions together could fail to start a shell. Opening one is
+  now serialised.
+
 - **Sessions survive a restart.** They are written to one file, atomically
   (temp file plus rename, in the same directory so the rename stays atomic), and
   debounced — renaming a session one keystroke at a time should not mean one file
