@@ -160,7 +160,7 @@ pub fn draw(frame: &mut Frame, area: Rect, shell: &Hosted, c: &Chrome, theme: &T
             // documentation of the keys that still reach the commander from
             // inside a hosted program. It has to name all of them.
             .title_bottom(Span::styled(
-                " Ctrl-O panels · F9 utilities · F12 history ",
+                " Ctrl-O DMAC commander · F9 utilities · F12 history ",
                 theme.border(false),
             ))
     } else {
