@@ -17,6 +17,9 @@ This page says which keys are safe, which are not, and what to press instead.
 | Open this directory in the editor | `F9` then `o` | — |
 | Next / previous session | `Ctrl-O` `Tab` | `Ctrl-Shift-Tab`, `Ctrl-PgUp/PgDn` |
 | Go to a session by name | `F9`, then its digit | `Ctrl-T`, `Alt`+digit |
+| The help | `F1`; from a shell, `Ctrl-O` `F1` | — |
+| A screensaver, right now | `F12` `F12` | `Shift-F12` |
+| The next screensaver, while one shows | `F12` | `Shift-F12` |
 | Copy / paste | your terminal's own | `Ctrl-Shift-C/V`, `Ctrl/Shift-Insert` |
 | Read back through a shell | `Shift-PgUp/PgDn` | `Ctrl-Shift-Up/Down/Home/End` |
 | Select text in a shell | `Shift` + arrows | — |
@@ -61,6 +64,7 @@ Ctrl-O          leave the shell            (unchanged)
 Ctrl-O  h       leave, and open the history
 Ctrl-O  u       leave, and open the utilities
 Ctrl-O  Tab     leave, and go to the next session
+Ctrl-O  F1      leave, and open the help
 ```
 
 Anything else you type is an ordinary keypress, so the chord costs nothing but
@@ -136,6 +140,13 @@ Ctrl-T  or  Shift-Tab    open the rail (it takes the keyboard)
   Left / Right, - / +    make it narrower or wider
 drag its right-hand edge  the same, with the pointer, open or not
 ```
+
+`Shift-Tab` opens it **from the panels only**. Inside a shell that key belongs to
+whatever is hosted — it is how `claude` cycles its permission modes — so it goes
+to the child and the rail stays on `Ctrl-T`. `Ctrl-Shift-Tab` still moves between
+sessions from in there, but only in a terminal that reports modifiers: without
+the kitty protocol it arrives as the same three bytes as `Shift-Tab`, and nothing
+on this side can tell the two apart.
 
 Widen the **resting** strip past 8 columns and it stops being dots: it shows the
 session names and paths all the time, without being opened. Drag it down to

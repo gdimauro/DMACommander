@@ -67,6 +67,8 @@ pub struct Screensaver {
     last_input: Instant,
     /// Position in the rotation, so `"rotation"` advances rather than repeating.
     rotation: usize,
+    /// Handed to every effect as it starts; see [`Effect::set_text`].
+    text: Vec<String>,
 }
 
 impl Screensaver {
@@ -76,7 +78,14 @@ impl Screensaver {
             running: None,
             last_input: Instant::now(),
             rotation: 0,
+            text: Vec::new(),
         }
+    }
+
+    /// The text effects may show — the help page. Set once by the frontend;
+    /// every effect started afterwards is handed it.
+    pub fn set_text(&mut self, lines: Vec<String>) {
+        self.text = lines;
     }
 
     pub fn config(&self) -> &ScreensaverConfig {
@@ -156,9 +165,38 @@ impl Screensaver {
         crate::build(name).unwrap_or_else(crate::build_random)
     }
 
+    /// Start now if nothing is running; otherwise move on to the next entry in
+    /// the catalogue, wrapping at the end. One key, pressed again and again,
+    /// walks through every effect — games included, since pressing it is as
+    /// deliberate as choosing one from the picker.
+    pub fn next(&mut self, width: u16, height: u16) {
+        let Some(running) = &self.running else {
+            return self.start_now(width, height);
+        };
+        // Keep the size a running effect already has, unless told a new one:
+        // the caller mostly does not know it, and passes zero.
+        let (width, height) = if width == 0 && height == 0 {
+            running.size
+        } else {
+            (width, height)
+        };
+        let catalog = crate::catalog();
+        let current = running.effect.name();
+        let after = catalog
+            .iter()
+            .position(|e| e.name == current)
+            .map(|i| (i + 1) % catalog.len())
+            .unwrap_or(0);
+        match catalog.get(after).and_then(|e| crate::build(e.name)) {
+            Some(effect) => self.start_with(effect, width, height),
+            None => self.start_now(width, height),
+        }
+    }
+
     pub fn start_with(&mut self, mut effect: Box<dyn Effect>, width: u16, height: u16) {
         let mut canvas = Canvas::new(width, height);
         canvas.clear();
+        effect.set_text(&self.text);
         effect.resize(width, height);
         self.running = Some(Running {
             effect,
@@ -325,6 +363,67 @@ mod tests {
         s.start_with(crate::build("snake").expect("snake"), 60, 20);
         assert_eq!(s.on_activity(), Wake::Passthrough);
         assert!(s.is_active());
+    }
+
+    /// One key walks the whole catalogue, games and all, and comes back round.
+    #[test]
+    fn next_walks_the_whole_catalogue_and_wraps() {
+        let mut s = Screensaver::new(cfg(0));
+        assert!(!s.is_active());
+        s.next(40, 12);
+        assert!(s.is_active(), "next must start something when nothing runs");
+        assert_eq!(s.current(), Some("matrix"), "the configured effect first");
+
+        let names: Vec<&str> = crate::catalog().iter().map(|e| e.name).collect();
+        let mut seen = vec![s.current().expect("running")];
+        for _ in 1..names.len() {
+            s.next(0, 0);
+            seen.push(s.current().expect("still running"));
+        }
+        assert_eq!(seen, names, "next must visit the catalogue in order");
+        s.next(0, 0);
+        assert_eq!(s.current(), Some(names[0]), "and wrap");
+    }
+
+    /// Stepping to the next effect keeps the size the running one had; the
+    /// caller passes zero because it does not know it.
+    #[test]
+    fn next_keeps_the_running_size() {
+        let mut s = Screensaver::new(cfg(0));
+        s.start_now(64, 20);
+        s.next(0, 0);
+        let canvas = s.update(64, 20).expect("running");
+        assert_eq!((canvas.width(), canvas.height()), (64, 20));
+    }
+
+    /// The text the frontend sets reaches an effect before it is sized.
+    #[test]
+    fn the_text_reaches_an_effect_that_wants_it() {
+        use std::sync::{Arc, Mutex};
+
+        struct Reader(Arc<Mutex<Vec<String>>>, bool);
+        impl Effect for Reader {
+            fn name(&self) -> &'static str {
+                "reader"
+            }
+            fn set_text(&mut self, lines: &[String]) {
+                assert!(!self.1, "set_text must come before resize");
+                *self.0.lock().expect("lock") = lines.to_vec();
+            }
+            fn resize(&mut self, _: u16, _: u16) {
+                self.1 = true;
+            }
+            fn tick(&mut self, _: Duration, _: &mut Canvas) {}
+        }
+
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let mut s = Screensaver::new(cfg(0));
+        s.set_text(vec!["F1  help".to_string()]);
+        s.start_with(Box::new(Reader(got.clone(), false)), 40, 12);
+        assert_eq!(
+            got.lock().expect("lock").as_slice(),
+            ["F1  help".to_string()]
+        );
     }
 
     #[test]

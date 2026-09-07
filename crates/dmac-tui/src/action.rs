@@ -110,6 +110,11 @@ pub enum Action {
     /// rotation. Ctrl+Shift+F1, with F12 as the reliably-encodable equivalent.
     ScreensaverMenu,
 
+    /// Shift+F12: a screensaver, right now — and while one is showing, the
+    /// next one in the catalogue. The picker's own key does the same once one
+    /// is running, for terminals that cannot send Shift with an F-key.
+    ScreensaverNext,
+
     /// Typed text going to the command line — only while it has focus.
     CommandChar(char),
     CommandBackspace,

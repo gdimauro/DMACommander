@@ -2,6 +2,8 @@
 //! a line in `build()`. That is the whole extension cost, by design.
 
 pub mod asteroids;
+pub mod cannon;
+pub mod helix;
 pub mod life;
 pub mod matrix;
 pub mod pipes;

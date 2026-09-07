@@ -89,21 +89,30 @@ pub fn session_at_row(
     if row < area.y || row >= area.y + area.height {
         return None;
     }
+    let rows = sessions.visible();
     let offset = scroll_offset(sessions, area.height, detail);
     let local = (row - area.y) as usize;
-    let index = if detail {
+    let nth = if detail {
         offset + local / ROWS_PER_SESSION
     } else {
         offset + local
     };
-    (index < sessions.len()).then_some(index)
+    // Through the visible list, never straight into the session list: a folded
+    // group takes rows away, and a click read against the unfolded list picks
+    // whatever has slid up into that row instead.
+    rows.get(nth).copied()
 }
 
 /// First visible session, chosen so the current one is always on screen.
 fn scroll_offset(sessions: &SessionManager, height: u16, detail: bool) -> usize {
     let per = if detail { ROWS_PER_SESSION } else { 1 };
     let visible = (height as usize / per).max(1);
-    let current = sessions.current_index();
+    // Counted in drawn rows, so a folded group scrolls as the one row it is.
+    let rows = sessions.visible();
+    let current = rows
+        .iter()
+        .position(|&i| i == sessions.current_index())
+        .unwrap_or(0);
     if current < visible {
         0
     } else {
@@ -153,10 +162,23 @@ pub fn draw(
     let current = sessions.current_index();
     let mut lines: Vec<Line> = Vec::with_capacity(inner.height as usize);
 
-    for (i, session) in sessions.all().iter().enumerate().skip(offset) {
+    for i in sessions.visible().into_iter().skip(offset) {
         if lines.len() >= inner.height as usize {
             break;
         }
+        let Some(session) = sessions.get(i) else {
+            continue;
+        };
+        // A group reads as a group at a glance: the marker says whether it is
+        // open, the indent says what belongs to it. Both are one column, which
+        // is all a rail this narrow can spare — and the marker is a character
+        // rather than a colour, so it survives a terminal that has none.
+        let nested = sessions.depth(i) == 1;
+        let marker = match (sessions.has_children(i), session.collapsed) {
+            (true, true) => '\u{25B8}',
+            (true, false) => '\u{25BE}',
+            (false, _) => ' ',
+        };
         let is_current = i == current;
         // Filled for the session you are in, hollow for the others — legible even
         // when the terminal has no colour at all.
@@ -166,8 +188,14 @@ pub fn draw(
             .bg(theme.panel_bg);
 
         if !detail {
+            // Even at three columns the shape of the group survives: a child's
+            // dot sits one over, which is the whole of what the resting strip
+            // has room to say.
             lines.push(Line::from(vec![
-                Span::styled(" ", Style::default().bg(theme.panel_bg)),
+                Span::styled(
+                    if nested { "  " } else { " " },
+                    Style::default().bg(theme.panel_bg),
+                ),
                 Span::styled(dot.to_string(), dot_style),
             ]));
             continue;
@@ -188,9 +216,17 @@ pub fn draw(
         // The number is the Alt-N shortcut. Showing it is how anyone learns the
         // shortcut exists.
         let number = format!("{}", i + 1);
-        let room = (inner.width as usize).saturating_sub(4 + number.width());
+        let lead = if nested {
+            format!("{marker} \u{2514}")
+        } else {
+            format!("{marker} ")
+        };
+        let room = (inner.width as usize).saturating_sub(3 + lead.width() + number.width());
         lines.push(Line::from(vec![
-            Span::styled(" ", Style::default().bg(theme.panel_bg)),
+            Span::styled(
+                lead,
+                Style::default().fg(theme.status_fg).bg(theme.panel_bg),
+            ),
             Span::styled(dot.to_string(), dot_style),
             Span::styled(" ", Style::default().bg(theme.panel_bg)),
             Span::styled(fit(&session.name, room), name_style),

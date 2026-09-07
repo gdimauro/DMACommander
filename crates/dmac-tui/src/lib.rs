@@ -9,6 +9,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 pub mod action;
 pub mod app;
+pub mod help;
 pub mod keymap;
 pub mod mcp;
 pub mod terminal;

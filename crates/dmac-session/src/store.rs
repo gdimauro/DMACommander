@@ -94,6 +94,24 @@ struct PersistedSession {
     /// can start it again in the same conversation.
     #[serde(default)]
     agent: Option<String>,
+    /// Which session this one hangs off, by *position in this file*.
+    ///
+    /// Position and not id: ids are handed out again on load, in file order, so
+    /// an id written yesterday means nothing today. The order is what survives,
+    /// and a group is contiguous, so an index is the one reference that cannot
+    /// come back pointing at the wrong session.
+    #[serde(default)]
+    parent: Option<usize>,
+    /// Whether the group was folded away. A fold is a thing you did to your
+    /// workspace, like a rail width, and having to redo it every morning is
+    /// what makes people stop using it.
+    #[serde(default)]
+    collapsed: bool,
+    /// The editor window this session had open, and where. Absent in files
+    /// written before it was remembered, which reads as "no editor" and is
+    /// exactly right: nothing was recorded, so nothing is reopened.
+    #[serde(default)]
+    editor: Option<crate::EditorWindow>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -170,6 +188,14 @@ impl SessionStore {
             return Ok(None);
         }
 
+        // Kept before the list is consumed: a parent is written as a position,
+        // and turning positions back into ids needs every session to exist
+        // first — so it is a second pass, after the loop below.
+        let groups: Vec<(Option<usize>, bool)> = saved
+            .sessions
+            .iter()
+            .map(|s| (s.parent, s.collapsed))
+            .collect();
         let mut it = saved.sessions.into_iter();
         // There is always at least one; the check above guarantees it.
         let Some(first) = it.next() else {
@@ -191,6 +217,22 @@ impl SessionStore {
             apply(manager.at_mut(i), &s);
         }
 
+        // Second pass: positions to ids, now that every session has one. A
+        // parent that is out of range, or that points at a session which is
+        // itself nested, is dropped rather than honoured — two levels is the
+        // rule, and a file that says otherwise was not written by this program.
+        for (i, (parent, collapsed)) in groups.iter().enumerate() {
+            let ok = parent
+                .filter(|&p| p < manager.len() && p != i)
+                .filter(|&p| groups.get(p).is_some_and(|(gp, _)| gp.is_none()));
+            let id = ok.and_then(|p| manager.get(p).map(|s| s.id));
+            if i < manager.len() {
+                let s = manager.at_mut(i);
+                s.parent = id;
+                s.collapsed = *collapsed;
+            }
+        }
+
         manager.history = dmac_core::history::History::from_visits(saved.history);
         manager.rail = saved.rail;
         manager.switch_to(saved.current.min(manager.len() - 1));
@@ -207,7 +249,18 @@ impl SessionStore {
             version: FORMAT_VERSION,
             clean_exit,
             current: manager.current_index(),
-            sessions: manager.all().iter().map(persist).collect(),
+            sessions: {
+                let all = manager.all();
+                let at = |id: crate::SessionId| all.iter().position(|s| s.id == id);
+                all.iter()
+                    .map(|s| {
+                        let mut p = persist(s);
+                        p.parent = s.parent.and_then(at);
+                        p.collapsed = s.collapsed;
+                        p
+                    })
+                    .collect()
+            },
             history: manager.history.visits().to_vec(),
             rail: manager.rail,
         };
@@ -257,6 +310,11 @@ fn persist(s: &Session) -> PersistedSession {
         // respawned on demand, in the directory that was restored.
         view_shell: s.view == View::Shell,
         conversation: s.conversation.clone(),
+        // Filled in by the caller, which is the only place the whole list — and
+        // so the position of anything in it — is in hand.
+        parent: None,
+        collapsed: s.collapsed,
+        editor: s.editor.clone(),
         command_line: s.command_line.clone(),
         agent: s.agent.clone(),
         panels: [
@@ -289,6 +347,10 @@ fn apply(session: &mut Session, saved: &PersistedSession) {
     // The process is gone, the conversation is not. This is what makes the
     // next `claude` in this session pick up where the last one left off.
     session.conversation = saved.conversation.clone();
+    // The window is gone; where it was is not. This is what lets an editor come
+    // back on the screen it was on rather than wherever the window server feels
+    // like putting a fresh one.
+    session.editor = saved.editor.clone();
     // Nothing has been listed yet; the first visit does that.
     session.loaded = false;
     session.command_line = saved.command_line.clone();
@@ -554,6 +616,82 @@ mod tests {
         assert!(
             !loaded.ensure_conversations(),
             "a second pass must not re-mint over conversations that exist"
+        );
+    }
+
+    /// A group is part of the workspace, like a rail width or a folded panel.
+    /// Rebuilding it every morning is what makes people stop using it.
+    #[test]
+    fn a_group_and_its_fold_come_back() {
+        let (_d, s) = store();
+        let mut m = manager();
+        m.create_sibling(0, "agent-a", VfsPath::local("/a"), VfsPath::local("/b"));
+        m.create_sibling(0, "agent-b", VfsPath::local("/a"), VfsPath::local("/b"));
+        assert!(m.toggle_collapsed(0));
+        m.switch_to(0);
+        s.save(&m, true).expect("save");
+
+        let (loaded, _) = s.load().expect("load").expect("some");
+        assert_eq!(loaded.len(), 4);
+        assert_eq!(loaded.depth(1), 1, "agent-a came back on its own");
+        assert_eq!(loaded.depth(2), 1);
+        assert_eq!(loaded.parent_of(1), Some(0));
+        assert_eq!(loaded.parent_of(2), Some(0));
+        assert!(loaded.all()[0].collapsed, "the fold was not remembered");
+        assert_eq!(loaded.visible(), vec![0, 3], "a folded group draws one row");
+    }
+
+    /// A window belongs to another application and does not survive us. What
+    /// survives is what it takes to make an equivalent one, which is the only
+    /// sense in which a window can be restored across a restart.
+    #[test]
+    fn where_the_editor_window_was_comes_back() {
+        let (_d, s) = store();
+        let mut m = manager();
+        m.current_mut().editor = Some(crate::EditorWindow {
+            dir: "/Users/x/prj/thing".into(),
+            x: -1512,
+            y: 38,
+            width: 1210,
+            height: 1000,
+        });
+        s.save(&m, true).expect("save");
+
+        let (loaded, _) = s.load().expect("load").expect("some");
+        assert_eq!(
+            loaded.current().editor,
+            m.current().editor,
+            "the coordinates have to come back exactly, or it is not the same window"
+        );
+        // A session that had none keeps none: nothing recorded, nothing opened.
+        // (`manager()` leaves the *second* session current, which is the one
+        // given a window above.)
+        assert_eq!(loaded.all()[0].editor, None);
+    }
+
+    /// A file claiming three levels was not written by this program. Honouring
+    /// it would put a session where nothing knows how to draw it.
+    #[test]
+    fn a_file_claiming_more_than_two_levels_is_flattened() {
+        let (_d, s) = store();
+        std::fs::create_dir_all(s.path().parent().expect("parent")).expect("mkdir");
+        std::fs::write(
+            s.path(),
+            r#"{"version":1,"clean_exit":true,"current":0,"sessions":[
+                 {"name":"a","left":"/a","right":"/b"},
+                 {"name":"b","left":"/a","right":"/b","parent":0},
+                 {"name":"c","left":"/a","right":"/b","parent":1},
+                 {"name":"d","left":"/a","right":"/b","parent":99}]}"#,
+        )
+        .expect("write");
+
+        let (loaded, _) = s.load().expect("load").expect("some");
+        assert_eq!(loaded.depth(1), 1, "one real level survives");
+        assert_eq!(loaded.depth(2), 0, "a grandchild was let through");
+        assert_eq!(
+            loaded.depth(3),
+            0,
+            "a parent that is not there was let through"
         );
     }
 

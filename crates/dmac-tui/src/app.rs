@@ -64,6 +64,12 @@ pub(crate) enum Update {
     /// shutdown, so a commander that never gets to shut down still leaves
     /// behind what its agents were.
     Agents(Vec<(SessionId, Option<String>)>),
+    /// Where a session's editor window is, read off the window server away from
+    /// the render loop. `None` means it has none open any more.
+    EditorFrame {
+        session: SessionId,
+        window: Option<dmac_session::EditorWindow>,
+    },
     /// A hosted shell changed what is on its screen. Carries nothing: the
     /// message exists only to break the event loop out of its wait, and the
     /// frame that follows reads the emulator directly.
@@ -119,6 +125,10 @@ pub(crate) enum Mode {
     /// The screensaver picker, with the highlighted row.
     Picker {
         selected: usize,
+    },
+    /// The help page, and how far down it is scrolled.
+    Help {
+        scroll: usize,
     },
     /// Contextual commands for the entry under the cursor.
     Context {
@@ -210,6 +220,35 @@ struct Drag {
     toggling: bool,
 }
 
+/// The help page on its way in: the effect, the surface it draws on, and when
+/// it was last advanced.
+///
+/// Held here rather than in the screensaver engine because it is not a
+/// screensaver — it does not take the screen, it does not cycle, and it ends by
+/// handing over to a page the user then reads. What it shares with the
+/// screensaver is only the effect and the rasterizer, which is exactly the
+/// amount of sharing that costs nothing.
+pub(crate) struct HelpEntrance {
+    effect: dmac_fx::effects::helix::Helix,
+    canvas: dmac_fx::Canvas,
+    last: std::time::Instant,
+}
+
+/// The editor's window for `dir`, as something a session can keep.
+///
+/// `None` when the editor has no window for it, which is the ordinary case and
+/// not a failure: most directories have no editor open on them.
+fn read_frame(dir: &std::path::Path) -> Option<dmac_session::EditorWindow> {
+    let f = dmac_desktop::editor_frame_for(dir)?;
+    Some(dmac_session::EditorWindow {
+        dir: dir.display().to_string(),
+        x: f.x,
+        y: f.y,
+        width: f.width,
+        height: f.height,
+    })
+}
+
 /// Where things were drawn last frame, so a click maps back to a row. Rebuilt
 /// on every draw, so a resize can never leave it stale.
 #[derive(Debug, Clone, Copy, Default)]
@@ -229,6 +268,8 @@ pub(crate) struct LayoutCache {
     pub menu: Rect,
     /// Interior of the screensaver picker while it is open.
     pub picker: Rect,
+    /// Interior of the help page while it is open.
+    pub help: Rect,
     /// Interior of the directory history's list, while it is open.
     pub history: Rect,
     /// The whole frame. Needed to render a second, off-screen copy at the same
@@ -271,6 +312,12 @@ pub struct App {
     /// syscall per shell; reading the process table is a fork, and this is what
     /// keeps the second from happening on a timer.
     agent_fg: Vec<(dmac_session::SessionId, i32)>,
+    /// The session that was on screen last time we looked. Kept only so that
+    /// leaving one can write down where its editor window was.
+    last_session: Option<dmac_session::SessionId>,
+    /// The help arriving. `Some` only while it is flying in; the page itself
+    /// takes over the moment it settles.
+    pub(crate) help_entrance: Option<HelpEntrance>,
     /// Full screen: the frame stripped off, leaving only contents on black.
     pub(crate) fullscreen: bool,
     /// Agents from the last run, waiting for an answer to "resume?".
@@ -490,6 +537,11 @@ impl App {
             restored: _,
             rail: _,
         } = start;
+        // The help page goes to the screensaver engine once, here: an effect
+        // that shows text is handed it as it starts, and `dmac-fx` never has
+        // to know where the words came from.
+        let mut screensaver = Screensaver::new(screensaver);
+        screensaver.set_text(crate::help::plain_lines());
         Self {
             sessions: SessionManager::new(session_name, left, right),
             rail_open: false,
@@ -499,12 +551,14 @@ impl App {
             store,
             dirty_at: None,
             agent_fg: Vec::new(),
+            last_session: None,
+            help_entrance: None,
             cursor_style: cursor,
             cursor_phase: std::time::Instant::now(),
             theme: Theme::default(),
             status: String::new(),
             backend: Arc::new(LocalBackend::new()),
-            screensaver: Screensaver::new(screensaver),
+            screensaver,
             mode: Mode::Normal,
             layout: LayoutCache::default(),
             quick_search: String::new(),
@@ -553,6 +607,16 @@ impl App {
 
     fn ses_mut(&mut self) -> &mut Session {
         self.sessions.current_mut()
+    }
+
+    /// Give this session's shell the directory move it was too busy to take.
+    ///
+    /// Only this session's: an owed `cd` belongs to the panels it was owed to,
+    /// and a shell nobody is looking at must not be typed into on the strength
+    /// of a navigation from somewhere else. A session switched away from keeps
+    /// what it owes and is paid when it comes back.
+    pub(crate) fn catch_up_shell_cwd(&mut self) {
+        self.ses_mut().catch_up_cwd();
     }
 
     fn idx(id: PanelId) -> usize {
@@ -639,6 +703,59 @@ impl App {
     /// drawn. Called once per frame by the renderer.
     pub(crate) fn screensaver_canvas(&mut self, width: u16, height: u16) -> Option<&Canvas> {
         self.screensaver.update(width, height)
+    }
+
+    /// Start the help's arrival.
+    ///
+    /// The same effect the screensaver runs, in its one-shot form: it flies in
+    /// and stays, because what it settles into here is the real page — the one
+    /// the user scrolls and leaves on `Esc` — rather than something that flies
+    /// away again while they are halfway down it.
+    fn begin_help_entrance(&mut self) {
+        let mut effect = dmac_fx::effects::helix::Helix::entrance();
+        // The words, from the one place that has them. `dmac-fx` sits below the
+        // crate that owns the help and must not go looking for it.
+        dmac_fx::Effect::set_text(&mut effect, &crate::help::plain_lines());
+        self.help_entrance = Some(HelpEntrance {
+            effect,
+            canvas: dmac_fx::Canvas::new(0, 0),
+            last: std::time::Instant::now(),
+        });
+    }
+
+    /// The next frame of that arrival, or `None` once the page has landed.
+    ///
+    /// Drops the entrance as it finishes, so the check that decides what to
+    /// draw is also what cleans up: an animation that has ended but is still
+    /// held is an animation that will eventually be drawn again.
+    pub(crate) fn help_canvas(&mut self, width: u16, height: u16) -> Option<&Canvas> {
+        let done = match self.help_entrance.as_mut() {
+            None => return None,
+            Some(e) => {
+                if e.canvas.width() != width || e.canvas.height() != height {
+                    e.canvas.resize(width, height);
+                    dmac_fx::Effect::resize(&mut e.effect, width, height);
+                }
+                let now = std::time::Instant::now();
+                let dt = now.saturating_duration_since(e.last);
+                e.last = now;
+                dmac_fx::Effect::tick(&mut e.effect, dt, &mut e.canvas);
+                e.effect.settled()
+            }
+        };
+        if done {
+            self.help_entrance = None;
+            return None;
+        }
+        self.help_entrance.as_ref().map(|e| &e.canvas)
+    }
+
+    /// While the help is arriving, ask for the next frame soon. Without this
+    /// the loop waits for a keypress and the animation shows one frame.
+    fn help_deadline(&self) -> Option<std::time::Instant> {
+        self.help_entrance
+            .as_ref()
+            .map(|_| std::time::Instant::now() + std::time::Duration::from_millis(33))
     }
 
     pub(crate) fn cwd_display(&self, id: PanelId) -> String {
@@ -749,6 +866,16 @@ impl App {
             } => self.apply_completion(session, generation, start, items),
             Update::Editor(Ok(message) | Err(message)) => self.status = message,
             Update::Agents(seen) => self.record_agents(&seen),
+            Update::EditorFrame { session, window } => {
+                if let Some(i) = self.sessions.index_of_id(session)
+                    && self.sessions.at_mut(i).editor != window
+                {
+                    self.sessions.at_mut(i).editor = window;
+                    // At once, like the agent: it is what a restart needs, and
+                    // the debounce is exactly the window a `kill -9` falls into.
+                    self.save_now();
+                }
+            }
             Update::Rebuilt(Ok(())) => self.restart_in_place(),
             // A failed build changes nothing: the point of building first is
             // that a broken tree costs you a message, not your session.
@@ -930,7 +1057,7 @@ impl App {
             UtilitiesMenu => {
                 self.mode = Mode::Utilities {
                     selected: crate::ui::menu::first_selectable(&crate::utilities::items(
-                        &self.elsewhere(),
+                        &self.session_menu_rows(),
                     )),
                 };
             }
@@ -975,6 +1102,7 @@ impl App {
             }
 
             ScreensaverMenu => self.mode = Mode::Picker { selected: 0 },
+            ScreensaverNext => self.screensaver_next(),
 
             ContextMenu => {
                 // Anchored on the cursor row, so the keyboard route opens the
@@ -1024,13 +1152,13 @@ impl App {
                 }
             }
 
+            Help => {
+                self.mode = Mode::Help { scroll: 0 };
+                self.begin_help_entrance();
+            }
+
             // Everything below is claimed by the keymap but owned by an agent
             // that has not built it yet. Say so out loud rather than doing nothing.
-            // Until there is a help window, say the one thing people are
-            // most often stuck on: which keys their terminal can send.
-            Help => {
-                self.status = "F1 help — not implemented yet · keys: docs/TERMINAL-KEYS.md".into();
-            }
             UserMenu => self.status = "F2 user menu — not implemented yet".into(),
             View => self.status = "F3 viewer — dmac-view, not implemented yet".into(),
             Edit => self.status = "F4 editor — dmac-view, not implemented yet".into(),
@@ -1162,6 +1290,20 @@ impl App {
         // table for every session, not one per session — and through the same
         // path the running commander uses, so a clean exit and a crash leave
         // the same kind of record rather than two that can disagree.
+        // Where the editor window is, asked once and here: this is the last
+        // moment it can be observed, and the session that is on screen is the
+        // one whose window the user has most likely just moved. The others were
+        // read when they were last entered.
+        let here = self.sessions.current_index();
+        if let Some(cwd) = self
+            .sessions
+            .get(here)
+            .map(|s| s.cwd[Self::idx(s.active)].clone())
+            .filter(dmac_vfs::VfsPath::is_local)
+        {
+            let window = read_frame(cwd.as_path());
+            self.sessions.at_mut(here).editor = window;
+        }
         #[cfg(unix)]
         {
             let shells = self.sessions.shell_pids();
@@ -1240,18 +1382,35 @@ impl App {
     }
 
     /// The rail as a manager: navigate, switch, create, rename, close.
+    /// The next row up or down in the rail, skipping what is folded away.
+    ///
+    /// Wraps, as the list always has. Falls back to the row it was given when
+    /// there is nothing drawn to move to, which cannot happen with a session
+    /// open but is cheaper to handle than to prove impossible.
+    fn rail_step(&self, selected: usize, by: isize) -> usize {
+        let rows = self.sessions.visible();
+        if rows.is_empty() {
+            return selected;
+        }
+        let at = rows.iter().position(|&i| i == selected).unwrap_or(0) as isize;
+        let next = (at + by).rem_euclid(rows.len() as isize) as usize;
+        rows.get(next).copied().unwrap_or(selected)
+    }
+
     fn rail_key(&mut self, k: KeyEvent, selected: usize) {
-        let n = self.sessions.len();
         match k.code {
             KeyCode::Esc => self.close_rail(),
+            // Through the rows that are drawn, not through the sessions: the
+            // children of a folded group are not on screen, and a cursor that
+            // walks onto one lands on a row nobody can see.
             KeyCode::Up => {
                 self.mode = Mode::Rail {
-                    selected: (selected + n - 1) % n,
+                    selected: self.rail_step(selected, -1),
                 }
             }
             KeyCode::Down => {
                 self.mode = Mode::Rail {
-                    selected: (selected + 1) % n,
+                    selected: self.rail_step(selected, 1),
                 }
             }
             KeyCode::Enter => {
@@ -1266,6 +1425,27 @@ impl App {
             KeyCode::Left | KeyCode::Char('-') => self.resize_rail(-1),
             KeyCode::Right | KeyCode::Char('+' | '=') => self.resize_rail(1),
             KeyCode::Char('n') => self.open_prompt(PromptIntent::NewSession, String::new()),
+            // Fold the group under this row away, or open it. Space because it
+            // is what folds a row in every tree anyone has used, and because
+            // the letters here are spoken for.
+            KeyCode::Char(' ') => {
+                if self.sessions.toggle_collapsed(selected) {
+                    self.touch_sessions();
+                    self.mode = Mode::Rail { selected };
+                } else {
+                    self.status = "nothing is grouped under that one".into();
+                }
+            }
+            // A second agent on the same work, in its own session, drawn under
+            // the one it came from. The same thing F9 offers, on the key that
+            // is already about managing sessions.
+            KeyCode::Char('a') => {
+                if self.sessions.switch_to(selected) {
+                    self.after_session_switch();
+                }
+                self.close_rail();
+                self.start_agent_beside();
+            }
             KeyCode::Char('r') => {
                 let current = self
                     .sessions
@@ -1274,16 +1454,28 @@ impl App {
                     .unwrap_or_default();
                 self.open_prompt(PromptIntent::RenameSession(selected), current);
             }
-            KeyCode::Char('d') | KeyCode::Delete => match self.sessions.close(selected) {
-                Ok(()) => {
-                    let keep = selected.min(self.sessions.len() - 1);
-                    self.mode = Mode::Rail { selected: keep };
-                    self.after_session_switch();
-                    self.status = format!("session closed \u{2014} {} left", self.sessions.len());
+            KeyCode::Char('d') | KeyCode::Delete => {
+                // Asked before, not reported after: closing a group takes what
+                // hangs off it, and "closed 4 sessions" is a thing that has
+                // already happened to you.
+                let going = self.sessions.group_size(selected);
+                match self.sessions.close(selected) {
+                    Ok(()) => {
+                        let keep = selected.min(self.sessions.len() - 1);
+                        self.mode = Mode::Rail { selected: keep };
+                        self.after_session_switch();
+                        self.status = match going {
+                            1 => format!("session closed \u{2014} {} left", self.sessions.len()),
+                            n => format!(
+                                "group closed, {n} sessions \u{2014} {} left",
+                                self.sessions.len()
+                            ),
+                        };
+                    }
+                    // Quitting is a different action with a different confirmation.
+                    Err(e) => self.status = format!("{e} (F10 quits)"),
                 }
-                // Quitting is a different action with a different confirmation.
-                Err(e) => self.status = format!("{e} (F10 quits)"),
-            },
+            }
             // Bare digits while the rail has focus: the numbers are on screen
             // right there, so demanding a modifier would be perverse.
             KeyCode::Char(c @ '1'..='9') => {
@@ -1641,29 +1833,96 @@ impl App {
         let Ok(dir) = self.editor_here_target() else {
             return;
         };
+        // What this session had open last time, and where. Only used when the
+        // editor turns out to have no window for that folder — see below.
+        let remembered = self
+            .ses()
+            .editor
+            .clone()
+            .filter(|w| w.dir == dir.display().to_string());
+        let id = self.sessions.current().id;
+        let tx = self.tx.clone();
         // Off the render thread, and only when there is one to be off: a test
         // switches sessions too, and it has no runtime to spawn onto.
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn_blocking(move || {
-                let _ = dmac_desktop::raise_editor_for(&dir);
+                // Already open somewhere: bring it forward and leave it exactly
+                // where the user put it. Restoring a window that is on screen
+                // is not restoring anything, it is moving something.
+                if matches!(dmac_desktop::raise_editor_for(&dir), Ok(true)) {
+                    let _ = tx.send(Update::EditorFrame {
+                        session: id,
+                        window: read_frame(&dir),
+                    });
+                    return;
+                }
+                if let Some(w) = remembered {
+                    let frame = dmac_desktop::Frame {
+                        x: w.x,
+                        y: w.y,
+                        width: w.width,
+                        height: w.height,
+                    };
+                    let _ = dmac_desktop::restore_editor(&dir, frame);
+                }
             });
         }
     }
 
-    /// The sessions you are not in, for the menu that offers to jump to them.
+    /// Write down where this session's editor window is, if it has one.
     ///
-    /// Only the others: a row that takes you where you already are is a row
-    /// that does nothing, and a menu of those teaches people not to read it.
-    pub(crate) fn elsewhere(&self) -> Vec<crate::utilities::Elsewhere> {
+    /// Off the render loop, because asking the window server costs a fork and
+    /// an Apple Event round trip. Asked when leaving a session and again on the
+    /// way out, which between them covers every way a window's position stops
+    /// being observable — the alternative, polling it, spends the idle budget
+    /// watching a rectangle that changes twice a day.
+    pub(crate) fn capture_editor_frame(&mut self, index: usize) {
+        let Some(session) = self.sessions.get(index) else {
+            return;
+        };
+        let id = session.id;
+        let cwd = session.cwd[Self::idx(session.active)].clone();
+        if !cwd.is_local() {
+            return;
+        }
+        let dir = cwd.as_path().to_path_buf();
+        let tx = self.tx.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn_blocking(move || {
+                let _ = tx.send(Update::EditorFrame {
+                    session: id,
+                    window: read_frame(&dir),
+                });
+            });
+        }
+    }
+
+    /// Every session, for the menu that offers to jump to them — in the rail's
+    /// order, with the rail's marks.
+    ///
+    /// The one you are in comes along, flagged: the menu draws it and refuses
+    /// to act on it. Filtering it out here was tidier and read worse — the rail
+    /// listed five, the menu four, and the digits skipped the missing one, so
+    /// what the eye found was a lost session rather than a place you already
+    /// are.
+    pub(crate) fn session_menu_rows(&self) -> Vec<crate::utilities::SessionRow> {
         let here = self.sessions.current_index();
-        self.sessions
-            .all()
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != here)
-            .map(|(index, s)| crate::utilities::Elsewhere {
-                index,
-                name: s.name.clone(),
+        // The visible list, and in its order: a folded group shows its own row
+        // and not what is under it, exactly as the rail draws it. Two lists that
+        // disagree about which sessions there are is worse than either.
+        let rows = self.sessions.visible();
+        let tree = rows.iter().any(|&i| self.sessions.depth(i) == 1);
+        rows.into_iter()
+            .filter_map(|index| {
+                let s = self.sessions.get(index)?;
+                Some(crate::utilities::SessionRow::new(
+                    index,
+                    &s.name,
+                    index == here,
+                    self.sessions.depth(index),
+                    self.sessions.has_children(index).then_some(s.collapsed),
+                    tree,
+                ))
             })
             .collect()
     }
@@ -2113,6 +2372,18 @@ impl App {
     /// point of holding them all live. Only the transient, per-view state that
     /// belonged to the session we just left is cleared.
     pub(crate) fn after_session_switch(&mut self) {
+        // Where the session we just left had its editor window. Asked here
+        // rather than at the moment of switching because the switch happens in
+        // half a dozen places — a key, a click, the rail, an agent's tool call —
+        // and a capture that has to be remembered at each of them is a capture
+        // that will be forgotten at one.
+        if let Some(left) = self.last_session.take()
+            && let Some(i) = self.sessions.index_of_id(left)
+            && i != self.sessions.current_index()
+        {
+            self.capture_editor_frame(i);
+        }
+        self.last_session = Some(self.sessions.current().id);
         self.raise_editor_here();
         self.ensure_loaded(self.sessions.current_index());
         self.touch_sessions();
@@ -2298,6 +2569,19 @@ impl App {
         if self.dismiss_splash() {
             return;
         }
+        // While a screensaver is showing, the keys that start one move on to
+        // the next instead, so one key walks the whole catalogue. Before the
+        // effect sees the key: a game would otherwise keep it, and a
+        // screensaver would be dismissed by the key meant to change it.
+        if self.screensaver.is_active()
+            && matches!(
+                keymap::resolve(k, self.ses().focus),
+                Some(Action::ScreensaverNext | Action::ScreensaverMenu)
+            )
+        {
+            self.screensaver_next();
+            return;
+        }
         match self.screensaver.on_key(effect_key(k)) {
             // A game used the key, or a screensaver was dismissed by it. Either
             // way the application must not also act on it — waking a screen is
@@ -2308,6 +2592,7 @@ impl App {
 
         match self.mode {
             Mode::Picker { selected } => return self.picker_key(k, selected),
+            Mode::Help { scroll } => return self.help_key(k, scroll),
             Mode::Context { selected, anchor } => return self.context_key(k, selected, anchor),
             Mode::Rail { selected } => return self.rail_key(k, selected),
             Mode::Prompt { intent } => return self.prompt_key(k, intent),
@@ -2343,7 +2628,9 @@ impl App {
                     self.handle(Action::UtilitiesMenu);
                     return;
                 }
-                KeyCode::F(12) => {
+                // The bare key only: Shift-F12 is the screensaver in here as
+                // everywhere else, and resolves below.
+                KeyCode::F(12) if !k.modifiers.contains(KeyModifiers::SHIFT) => {
                     self.handle(Action::DirectoryHistory);
                     return;
                 }
@@ -2362,11 +2649,27 @@ impl App {
                     self.handle(a);
                     return;
                 }
+                // Shift-Tab, never: a hosted program uses it for its own modes
+                // — it is how `claude` cycles between asking and not asking —
+                // and a rail that opened on it would be reaching into the
+                // program it hosts. Falls through to the child, which is the
+                // only place it can mean anything here.
+                //
+                // Ctrl-Shift-Tab keeps the rail, but only where the terminal
+                // can spell it: without the kitty protocol the two arrive as
+                // the same three bytes, and no application can tell them apart.
+                // What works everywhere is `Ctrl-T`, and `Ctrl-O` then Tab.
+                Some(Action::ToggleRail)
+                    if matches!(k.code, KeyCode::Tab | KeyCode::BackTab)
+                        && !k.modifiers.contains(KeyModifiers::CONTROL) => {}
                 // Sessions stay reachable from inside a shell. Being able to
                 // start something long-running and then leave it to look at
                 // another session is most of what several sessions are for.
                 Some(
-                    a @ (Action::ToggleRail | Action::CycleSession(_) | Action::SwitchSession(_)),
+                    a @ (Action::ToggleRail
+                    | Action::CycleSession(_)
+                    | Action::SwitchSession(_)
+                    | Action::ScreensaverNext),
                 ) => {
                     self.handle(a);
                     return;
@@ -2429,8 +2732,8 @@ impl App {
 
     /// Driving the utilities menu.
     fn utilities_key(&mut self, k: KeyEvent, selected: usize) {
-        let elsewhere = self.elsewhere();
-        let items = crate::utilities::items(&elsewhere);
+        let sessions = self.session_menu_rows();
+        let items = crate::utilities::items(&sessions);
         match k.code {
             KeyCode::Esc => self.mode = Mode::Normal,
             KeyCode::Up => {
@@ -2444,7 +2747,7 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                if let Some(c) = crate::utilities::at(selected, &elsewhere) {
+                if let Some(c) = crate::utilities::at(selected, &sessions) {
                     self.chose(c);
                 }
             }
@@ -2452,7 +2755,7 @@ impl App {
             // shortcuts and does not answer to them is worse than one that
             // lists none.
             KeyCode::Char(c) => {
-                if let Some(c) = crate::utilities::from_key(c.to_ascii_lowercase(), &elsewhere) {
+                if let Some(c) = crate::utilities::from_key(c.to_ascii_lowercase(), &sessions) {
                     self.chose(c);
                 }
             }
@@ -2524,6 +2827,7 @@ impl App {
             match deed {
                 crate::utilities::Deed::OpenEditorHere => self.open_editor_here(),
                 crate::utilities::Deed::StartAgentHere => self.start_agent_here(),
+                crate::utilities::Deed::StartAgentBeside => self.start_agent_beside(),
             }
             return;
         }
@@ -2616,8 +2920,56 @@ impl App {
             KeyCode::Home => self.mode = Mode::Picker { selected: 0 },
             KeyCode::End => self.mode = Mode::Picker { selected: rows - 1 },
             KeyCode::Enter => self.start_picked(selected),
+            // The picker's own key, pressed again, starts what is highlighted:
+            // F12 F12 is a screensaver in two presses, in any terminal at all.
+            _ if matches!(
+                keymap::resolve(k, Focus::Panel),
+                Some(Action::ScreensaverMenu | Action::ScreensaverNext)
+            ) =>
+            {
+                self.start_picked(selected)
+            }
             _ => {}
         }
+    }
+
+    /// The help page has the keyboard: scroll it, or close it.
+    fn help_key(&mut self, k: KeyEvent, scroll: usize) {
+        // Impatience is a legitimate answer to an animation, and a key that
+        // only cancels one is a key that did not do what it says. So the page
+        // lands at once *and* the key still acts: pressing Down during the
+        // arrival scrolls down a line, on a page that is now there to scroll.
+        self.help_entrance = None;
+        let area = self.layout.help;
+        let visible = (area.height as usize).max(1);
+        let max = crate::ui::help::page_len(area.width as usize).saturating_sub(visible);
+        let at = |s: usize| Mode::Help { scroll: s.min(max) };
+        match k.code {
+            KeyCode::Esc | KeyCode::F(1) | KeyCode::F(10) | KeyCode::Char('q') => {
+                self.help_entrance = None;
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.mode = at(scroll.saturating_sub(1)),
+            KeyCode::Down | KeyCode::Char('j') => self.mode = at(scroll + 1),
+            KeyCode::PageUp => self.mode = at(scroll.saturating_sub(visible)),
+            KeyCode::PageDown | KeyCode::Char(' ') => self.mode = at(scroll + visible),
+            KeyCode::Home => self.mode = at(0),
+            KeyCode::End => self.mode = at(max),
+            _ => {}
+        }
+    }
+
+    /// A screensaver now, or the next one in the catalogue if one is showing.
+    fn screensaver_next(&mut self) {
+        // The key that skips the picker also closes it.
+        if matches!(self.mode, Mode::Picker { .. }) {
+            self.mode = Mode::Normal;
+        }
+        self.screensaver.next(0, 0);
+        self.status = match self.screensaver.current() {
+            Some(running) => format!("screensaver: {running}"),
+            None => "screensaver failed to start".into(),
+        };
     }
 
     fn send_to_shell(&mut self, k: KeyEvent) {
@@ -3171,7 +3523,7 @@ impl App {
                 // Hover-to-highlight, as in every desktop context menu.
                 let row = (m.row - area.y) as usize;
                 let items = self.context_items();
-                if items.get(row).is_some_and(|i| !i.separator) {
+                if items.get(row).is_some_and(|i| i.selectable()) {
                     self.mode = Mode::Context {
                         selected: row,
                         anchor,
@@ -3185,7 +3537,7 @@ impl App {
                 }
                 let row = (m.row - area.y) as usize;
                 let items = self.context_items();
-                if items.get(row).is_some_and(|i| !i.separator) {
+                if items.get(row).is_some_and(|i| i.selectable()) {
                     self.run_context_item(row);
                 } else {
                     let _ = selected;
@@ -3223,6 +3575,9 @@ impl App {
     fn mouse_overlay(&mut self, m: MouseEvent) {
         if let Mode::Context { .. } = self.mode {
             return self.mouse_context(m);
+        }
+        if let Mode::Help { scroll } = self.mode {
+            return self.mouse_help(m, scroll);
         }
         if let Mode::History { selected } = self.mode {
             return self.mouse_history(m, selected);
@@ -3561,6 +3916,62 @@ impl App {
     /// own shell that runs it — with their aliases, their functions and their
     /// `PATH` — and so the line is visible, editable, and in the history like
     /// anything else they typed.
+    /// Open a session beside this one, in its group, and start an agent in it.
+    ///
+    /// A whole session and not a second shell in this one: its own panels, its
+    /// own conversation, its own place in the rail. That is what makes it
+    /// something you can come back to — a second agent sharing a session would
+    /// share the one conversation id, and the two would fight over it on every
+    /// restart.
+    ///
+    /// It starts where this session is looking, because that is what "beside"
+    /// means: the same work, another pair of hands.
+    fn start_agent_beside(&mut self) {
+        let here = self.sessions.current_index();
+        let (left, right) = {
+            let s = self.ses();
+            (s.cwd[0].clone(), s.cwd[1].clone())
+        };
+        let name = self.beside_name(here);
+        let i = self.sessions.create_sibling(here, name, left, right);
+        self.ensure_conversations();
+        self.reload_session(i, PanelId::Left);
+        self.reload_session(i, PanelId::Right);
+        self.after_session_switch();
+        self.start_agent_here();
+    }
+
+    /// A name for a session opened beside `anchor`: the group's name and the
+    /// next free number in it.
+    ///
+    /// Named rather than left blank because the rail identifies sessions by
+    /// name and `rename` refuses a duplicate — an unnamed second one would be
+    /// refused before it existed. The number counts the group, not the whole
+    /// list, so a group reads as `work·2`, `work·3` however many other sessions
+    /// are open.
+    fn beside_name(&self, anchor: usize) -> String {
+        let root = self
+            .sessions
+            .parent_of(anchor)
+            .unwrap_or(anchor)
+            .min(self.sessions.len().saturating_sub(1));
+        let stem = self
+            .sessions
+            .get(root)
+            .map(|s| {
+                s.name
+                    .split('\u{00B7}')
+                    .next()
+                    .unwrap_or(&s.name)
+                    .to_string()
+            })
+            .unwrap_or_else(|| "agent".to_string());
+        (2..)
+            .map(|n| format!("{stem}\u{00B7}{n}"))
+            .find(|candidate| self.sessions.all().iter().all(|s| &s.name != candidate))
+            .unwrap_or(stem)
+    }
+
     fn start_agent_here(&mut self) {
         let agent = dmac_session::agent::attached_program();
         let waker = self.waker();
@@ -3679,6 +4090,36 @@ impl App {
     /// Clicking the history: one click highlights, a second on the same row
     /// goes there. The same gesture a panel uses, so there is nothing new to
     /// learn.
+    /// The wheel scrolls the help; a click outside it closes it.
+    fn mouse_help(&mut self, m: MouseEvent, scroll: usize) {
+        let area = self.layout.help;
+        let max =
+            crate::ui::help::page_len(area.width as usize).saturating_sub(area.height as usize);
+        match m.kind {
+            MouseEventKind::ScrollUp => {
+                self.mode = Mode::Help {
+                    scroll: scroll.saturating_sub(3).min(max),
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                self.mode = Mode::Help {
+                    scroll: (scroll + 3).min(max),
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let inside = area.width > 0
+                    && m.column >= area.x
+                    && m.column < area.x + area.width
+                    && m.row >= area.y
+                    && m.row < area.y + area.height;
+                if !inside {
+                    self.mode = Mode::Normal;
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn mouse_history(&mut self, m: MouseEvent, selected: usize) {
         let rows = self.history_rows();
         let last = rows.len().saturating_sub(1);
@@ -3849,6 +4290,12 @@ pub async fn run(mut start: Startup) -> anyhow::Result<()> {
     let mut first_frame = true;
 
     loop {
+        // A directory the panels went to while the shell was busy is written
+        // here, on the first frame after the prompt comes back. Free when
+        // nothing is owed, and there is no timer behind it: the program exiting
+        // is what makes the shell print a prompt, and those bytes are what woke
+        // this loop.
+        app.catch_up_shell_cwd();
         app.before_frame();
         guard.terminal().draw(|f| ui::draw(f, &mut app))?;
         app.sync_shell_size();
@@ -3858,6 +4305,11 @@ pub async fn run(mut start: Startup) -> anyhow::Result<()> {
             // After the frame, so a cold start still shows something inside its
             // budget and the spawning happens where the user can watch it.
             app.reattach_agents();
+            // And the editor this session had open, back where it was. Entering
+            // a session does this already; the session you *start* in is never
+            // entered, so it would otherwise be the one session that never got
+            // its window back.
+            app.raise_editor_here();
         }
         // After the frame, never during it: stdout is shared with ratatui and
         // interleaving with a half-written frame corrupts both.
@@ -3890,6 +4342,7 @@ pub async fn run(mut start: Startup) -> anyhow::Result<()> {
             app.screensaver.deadline(),
             app.cursor_deadline(),
             app.shell_deadline(),
+            app.help_deadline(),
             save_due,
         ]
         .into_iter()
@@ -4458,6 +4911,85 @@ mod tests {
         );
     }
 
+    /// A group is one row while it is folded, and the cursor may not walk into
+    /// what is not drawn — a selection on a row nobody can see is a keypress
+    /// that does something invisible.
+    #[test]
+    fn a_folded_group_is_one_row_to_the_keyboard_and_to_the_mouse() {
+        let mut app = fixture();
+        app.sessions
+            .create_sibling(0, "a", VfsPath::local("/x"), VfsPath::local("/y"));
+        app.sessions
+            .create_sibling(0, "b", VfsPath::local("/x"), VfsPath::local("/y"));
+        app.sessions
+            .create("other", VfsPath::local("/z"), VfsPath::local("/z"));
+        assert_eq!(app.sessions.visible(), vec![0, 1, 2, 3]);
+
+        app.sessions.switch_to(0);
+        app.mode = Mode::Rail { selected: 0 };
+        app.on_key(key(KeyCode::Char(' ')));
+        assert_eq!(app.sessions.visible(), vec![0, 3], "the group did not fold");
+
+        // Down from the folded group lands past it, not inside it.
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.mode, Mode::Rail { selected: 3 });
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.mode, Mode::Rail { selected: 0 }, "it should wrap");
+
+        // And the menu shows what the rail shows.
+        let rows = app.session_menu_rows();
+        assert_eq!(rows.len(), 2, "the menu still lists the folded children");
+        assert_eq!(rows.iter().map(|r| r.index).collect::<Vec<_>>(), vec![0, 3]);
+    }
+
+    /// The nesting rule, from the keys the user actually presses: a sibling
+    /// made from a nested session joins it rather than nesting under it.
+    #[test]
+    fn a_sibling_made_from_a_nested_session_stays_at_its_level() {
+        let mut app = fixture();
+        let child =
+            app.sessions
+                .create_sibling(0, "one", VfsPath::local("/x"), VfsPath::local("/y"));
+        app.sessions.switch_to(child);
+
+        let grandchild = app.sessions.create_sibling(
+            child,
+            app.beside_name(child),
+            VfsPath::local("/x"),
+            VfsPath::local("/y"),
+        );
+        assert_eq!(app.sessions.depth(grandchild), 1, "a third level appeared");
+        assert_eq!(app.sessions.parent_of(grandchild), Some(0));
+
+        // A name is required — the rail identifies sessions by name and a
+        // duplicate is refused, so an unnamed one could not exist.
+        let names: Vec<&str> = app.sessions.all().iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names.len(), 3);
+        assert!(
+            names.iter().collect::<std::collections::HashSet<_>>().len() == 3,
+            "two sessions share a name: {names:?}"
+        );
+    }
+
+    /// A group goes together, and the status line says so — closing three
+    /// things and being told "session closed" is being told the wrong thing.
+    #[test]
+    fn closing_a_group_from_the_rail_says_how_many_went() {
+        let mut app = fixture();
+        app.sessions
+            .create("other", VfsPath::local("/z"), VfsPath::local("/z"));
+        app.sessions
+            .create_sibling(0, "a", VfsPath::local("/x"), VfsPath::local("/y"));
+        app.sessions
+            .create_sibling(0, "b", VfsPath::local("/x"), VfsPath::local("/y"));
+        assert_eq!(app.sessions.len(), 4);
+
+        app.mode = Mode::Rail { selected: 0 };
+        app.on_key(key(KeyCode::Char('d')));
+        assert_eq!(app.sessions.len(), 1, "the children stayed behind");
+        assert!(app.status.contains('3'), "how many went: {}", app.status);
+    }
+
     /// The whole reason for watching while the commander runs.
     ///
     /// An agent written down only at shutdown is an agent lost to a `kill -9`,
@@ -4593,9 +5125,11 @@ mod tests {
             .create("second", VfsPath::local("/c"), VfsPath::local("/d"));
         assert_eq!(app.sessions.current_index(), 1, "creating switches to it");
 
-        let elsewhere = app.elsewhere();
-        assert_eq!(elsewhere.len(), 1, "only the one we are not in");
-        assert_eq!(elsewhere[0].index, 0);
+        let rows = app.session_menu_rows();
+        assert_eq!(rows.len(), 2, "the whole list, as the rail shows it");
+        assert_eq!(rows[0].index, 0);
+        assert!(!rows[0].current);
+        assert!(rows[1].current, "the one we are standing in, flagged");
 
         app.on_key(KeyEvent::from(KeyCode::F(9)));
         assert!(matches!(app.mode, Mode::Utilities { .. }));
@@ -4603,6 +5137,41 @@ mod tests {
         app.on_key(KeyEvent::from(KeyCode::Char('1')));
         assert_eq!(app.sessions.current_index(), 0, "the menu did not go there");
         assert_eq!(app.mode, Mode::Normal, "and it closed behind itself");
+    }
+
+    /// The menu lists every session, the one you are in included — the rail
+    /// shows five and a menu showing four reads as a lost session. That row is
+    /// there to be read: it carries no digit, the cursor steps over it, and its
+    /// own number does nothing rather than closing the menu on a no-op jump.
+    #[test]
+    fn the_session_you_are_in_is_listed_and_does_nothing() {
+        let mut app = App::for_test();
+        app.sessions
+            .create("second", VfsPath::local("/c"), VfsPath::local("/d"));
+        let rows = app.session_menu_rows();
+        let items = crate::utilities::items(&rows);
+        let here = crate::utilities::Utility::MENU.len() + 2;
+
+        assert_eq!(items.len(), crate::utilities::Utility::MENU.len() + 1 + 2);
+        assert!(items[here].label.starts_with('\u{25CF}'), "the rail's mark");
+        assert!(items[here].inert);
+
+        app.on_key(KeyEvent::from(KeyCode::F(9)));
+        // Walking to the bottom of the menu must never land on it.
+        for _ in 0..items.len() {
+            app.on_key(KeyEvent::from(KeyCode::Down));
+            let Mode::Utilities { selected } = app.mode else {
+                panic!("the menu closed: {:?}", app.mode);
+            };
+            assert_ne!(selected, here, "the cursor landed on the current session");
+        }
+
+        app.on_key(KeyEvent::from(KeyCode::Char('2')));
+        assert_eq!(app.sessions.current_index(), 1, "still here");
+        assert!(
+            matches!(app.mode, Mode::Utilities { .. }),
+            "and the menu stayed open rather than closing on nothing"
+        );
     }
 
     /// F9 used to be a pull-down menu that was never written, and answered
@@ -5912,6 +6481,35 @@ mod tests {
         );
     }
 
+    /// Shift-Tab belongs to whatever is hosted: `claude` cycles its permission
+    /// modes on it, and a rail that opened instead would be pressing a key
+    /// inside somebody else's program. In the panels it still opens the rail —
+    /// there is nothing there to take it from.
+    #[tokio::test]
+    async fn shift_tab_belongs_to_the_hosted_program() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = fixture();
+        app.handle(Action::ToggleShell);
+        assert_eq!(app.ses().view, View::Shell);
+
+        // Both spellings terminals use for it, bare and with the Shift flag.
+        for k in [
+            KeyEvent::from(KeyCode::BackTab),
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT),
+        ] {
+            app.on_key(k);
+            assert!(!app.rail_open, "the rail took {k:?} from the shell");
+            assert_eq!(app.mode, Mode::Normal, "{k:?}");
+            assert_eq!(app.ses().view, View::Shell, "{k:?}");
+        }
+
+        // The rail is still one key away from in here — a key no terminal has
+        // an opinion about.
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert!(app.rail_open, "Ctrl-T no longer opens the rail");
+    }
+
     /// A selection you cannot see is one you cannot trust, and this one decides
     /// what Copy puts on the clipboard.
     #[test]
@@ -6216,5 +6814,272 @@ mod tests {
             "Finished in 2s"
         );
         assert_eq!(first_error(""), "no output");
+    }
+    // ---- the help page ----
+
+    /// F1 opens the help over the panels; Esc closes it, and so does F1 again.
+    #[test]
+    fn f1_opens_the_help_and_esc_closes_it() {
+        let mut app = fixture();
+        app.on_key(key(KeyCode::F(1)));
+        assert_eq!(app.mode, Mode::Help { scroll: 0 });
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+        app.on_key(key(KeyCode::F(1)));
+        app.on_key(key(KeyCode::F(1)));
+        assert_eq!(app.mode, Mode::Normal, "F1 must also close it");
+    }
+
+    /// The help scrolls, and never past its end or before its start.
+    #[test]
+    fn the_help_scrolls_and_stops_at_the_ends() {
+        let mut app = fixture();
+        app.on_key(key(KeyCode::F(1)));
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let area = app.layout.help;
+        assert!(area.height > 0, "the help was not drawn");
+        let max = crate::ui::help::page_len(area.width as usize) - area.height as usize;
+        assert!(
+            max > 0,
+            "the page fits in 24 rows; the test needs a longer one"
+        );
+
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.mode, Mode::Help { scroll: 1 });
+        app.on_key(key(KeyCode::End));
+        assert_eq!(app.mode, Mode::Help { scroll: max });
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(
+            app.mode,
+            Mode::Help { scroll: max },
+            "scrolled past the end"
+        );
+        app.on_key(key(KeyCode::PageUp));
+        assert_eq!(
+            app.mode,
+            Mode::Help {
+                scroll: max - area.height as usize
+            }
+        );
+        app.on_key(key(KeyCode::Home));
+        assert_eq!(app.mode, Mode::Help { scroll: 0 });
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(
+            app.mode,
+            Mode::Help { scroll: 0 },
+            "scrolled before the start"
+        );
+    }
+
+    /// The help renders at every size a terminal can be dragged to, and the
+    /// frame stays exactly the terminal's size.
+    #[test]
+    fn the_help_renders_at_absurd_sizes() {
+        let mut app = fixture();
+        app.on_key(key(KeyCode::F(1)));
+        for (w, h) in [
+            (1u16, 1u16),
+            (3, 2),
+            (20, 5),
+            (200, 1),
+            (80, 24),
+            (300, 100),
+        ] {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| crate::ui::draw(f, &mut app))
+                .unwrap_or_else(|e| panic!("draw failed at {w}x{h}: {e}"));
+            assert_eq!(term.backend().buffer().area.width, w);
+        }
+    }
+
+    /// The page says " Help " on its border and names F1 in its body: what is
+    /// drawn is the help, not an empty box.
+    #[test]
+    fn the_help_shows_its_title_and_its_keys() {
+        let mut app = fixture();
+        app.on_key(key(KeyCode::F(1)));
+        // The page arrives on a spiral, and this test is about what it says
+        // rather than how it gets there: landed, so the words are readable.
+        app.help_entrance = None;
+        let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let mut text = String::new();
+        for y in 0..40 {
+            for x in 0..100 {
+                text.push_str(buf[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        assert!(text.contains(" Help "), "no title on the border");
+        assert!(text.contains("Panels"), "no section title");
+        assert!(
+            text.contains("Ctrl-R"),
+            "no key on the first screen of the body"
+        );
+    }
+
+    /// The help arrives rather than appearing, and a key lands it *and* acts.
+    ///
+    /// A key that only cancels an animation is a key that did not do what it
+    /// says: pressing Down during the arrival has to scroll down a line, on a
+    /// page that is now there to scroll.
+    #[test]
+    fn the_help_arrives_and_the_first_key_lands_it_without_being_eaten() {
+        let mut app = fixture();
+        app.on_key(key(KeyCode::F(1)));
+        assert!(
+            app.help_entrance.is_some(),
+            "the help did not arrive, it appeared"
+        );
+
+        app.on_key(key(KeyCode::Down));
+        assert!(app.help_entrance.is_none(), "the key did not land the page");
+        assert_eq!(
+            app.mode,
+            Mode::Help { scroll: 1 },
+            "the key was swallowed by the animation instead of scrolling"
+        );
+
+        // And closing it takes the arrival with it, so re-opening starts over
+        // rather than resuming an animation from last time.
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.help_entrance.is_none());
+    }
+
+    /// From a shell, Ctrl-O then F1: the chord leaves the shell and the key
+    /// opens the help, so a hosted program keeps its own F1.
+    #[test]
+    fn ctrl_o_then_f1_opens_the_help_from_a_shell() {
+        let mut app = fixture();
+        app.handle(Action::ToggleShell);
+        assert_eq!(app.ses().view, View::Shell);
+        app.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert_eq!(app.ses().view, View::Panels);
+        app.on_key(key(KeyCode::F(1)));
+        assert_eq!(app.mode, Mode::Help { scroll: 0 });
+    }
+
+    /// The wheel scrolls the help, and a click outside it closes it.
+    #[test]
+    fn the_mouse_scrolls_and_closes_the_help() {
+        let mut app = fixture();
+        app.on_key(key(KeyCode::F(1)));
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 40,
+            row: 12,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.mode, Mode::Help { scroll: 3 });
+        app.on_mouse(click(MouseButton::Left, 0, 0));
+        assert_eq!(app.mode, Mode::Normal, "a click outside must close it");
+    }
+
+    // ---- a screensaver on demand ----
+
+    /// Shift-F12 starts a screensaver at once; pressed again it moves to the
+    /// next one — as does the picker's key — and any other key dismisses it.
+    #[test]
+    fn shift_f12_starts_a_screensaver_and_then_walks_the_catalogue() {
+        let mut app = fixture();
+        let shift_f12 = KeyEvent::new(KeyCode::F(12), KeyModifiers::SHIFT);
+        app.on_key(shift_f12);
+        assert!(app.screensaver.is_active(), "Shift-F12 did not start one");
+        let first = app.screensaver.current();
+        app.on_key(shift_f12);
+        assert!(app.screensaver.is_active(), "the second press dismissed it");
+        assert_ne!(
+            app.screensaver.current(),
+            first,
+            "the second press did not move on"
+        );
+
+        let second = app.screensaver.current();
+        app.on_key(key(KeyCode::F(12)));
+        assert!(app.screensaver.is_active(), "F12 dismissed it");
+        assert_ne!(app.screensaver.current(), second, "F12 did not move on");
+
+        // On to a screensaver before asking about dismissal. `next` walks the
+        // games and the demos too — deliberately, since pressing the key is as
+        // deliberate as choosing one from the picker — and those keep their
+        // keys to steer with. "Any other key dismisses" is a promise about
+        // screensavers, and this test used to make it of whichever effect the
+        // random start happened to land on, which is what made it flaky.
+        for _ in 0..dmac_fx::catalog().len() {
+            if app
+                .screensaver
+                .current()
+                .and_then(dmac_fx::entry)
+                .is_some_and(|e| e.kind == dmac_fx::Kind::Screensaver)
+            {
+                break;
+            }
+            app.on_key(key(KeyCode::F(12)));
+        }
+        app.on_key(key(KeyCode::Char('x')));
+        assert!(
+            !app.screensaver.is_active(),
+            "any other key must dismiss it"
+        );
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    /// F12 in the picker starts the highlighted row: a screensaver in two
+    /// presses of one key, in a terminal that cannot send Shift with an F-key.
+    #[test]
+    fn f12_twice_starts_a_screensaver() {
+        let mut app = fixture();
+        app.on_key(key(KeyCode::F(12)));
+        assert_eq!(app.mode, Mode::Picker { selected: 0 });
+        app.on_key(key(KeyCode::F(12)));
+        assert_eq!(app.mode, Mode::Normal, "the picker must close");
+        assert!(app.screensaver.is_active(), "F12 F12 did not start one");
+    }
+
+    /// Shift-F12 reaches the screensaver from inside a shell, where the bare
+    /// key is the directory history.
+    #[test]
+    fn shift_f12_reaches_the_screensaver_from_a_shell() {
+        let mut app = fixture();
+        app.handle(Action::ToggleShell);
+        assert_eq!(app.ses().view, View::Shell);
+        app.on_key(KeyEvent::new(KeyCode::F(12), KeyModifiers::SHIFT));
+        assert!(
+            app.screensaver.is_active(),
+            "Shift-F12 was swallowed by the shell"
+        );
+        app.on_key(key(KeyCode::Esc));
+        assert!(!app.screensaver.is_active());
+        app.on_key(key(KeyCode::F(12)));
+        assert!(
+            matches!(app.mode, Mode::History { .. }),
+            "F12 in a shell is the history"
+        );
+    }
+
+    /// The help page is what the cannon shoots at: the engine is handed it
+    /// when the app is built, so every effect started later can have it.
+    #[test]
+    fn the_screensaver_engine_is_handed_the_help() {
+        let mut app = fixture();
+        app.screensaver
+            .start_with(dmac_fx::build("cannon").unwrap(), 80, 30);
+        // A frame is only drawn once one is due.
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let canvas = app.screensaver.update(80, 30).unwrap();
+        let mut text = String::new();
+        for row in canvas.rows() {
+            text.extend(row.iter().map(|c| c.ch));
+            text.push('\n');
+        }
+        assert!(
+            text.contains("Panels"),
+            "the cannon is not shooting at the help:\n{text}"
+        );
     }
 }

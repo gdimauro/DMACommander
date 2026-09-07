@@ -20,6 +20,11 @@ pub struct Item<'a> {
     /// teaches its own shortcuts.
     pub hint: &'a str,
     pub separator: bool,
+    /// A row to read, not to choose: the cursor steps over it and clicking it
+    /// does nothing. The session you are already in is one — it belongs in the
+    /// list, because leaving a hole where it should be reads as a missing
+    /// entry, but there is nowhere to go.
+    pub inert: bool,
 }
 
 impl<'a> Item<'a> {
@@ -28,6 +33,18 @@ impl<'a> Item<'a> {
             label,
             hint,
             separator: false,
+            inert: false,
+        }
+    }
+
+    /// A row that is shown and cannot be chosen. It carries no hint: an
+    /// accelerator printed beside something that does not answer is a lie.
+    pub const fn inert(label: &'a str) -> Self {
+        Self {
+            label,
+            hint: "",
+            separator: false,
+            inert: true,
         }
     }
 
@@ -35,11 +52,18 @@ impl<'a> Item<'a> {
         label: "",
         hint: "",
         separator: true,
+        inert: true,
     };
+
+    /// Whether the cursor can land here.
+    pub const fn selectable(&self) -> bool {
+        !self.separator && !self.inert
+    }
 }
 
 /// Index of the next selectable item in `step` direction, skipping separators
-/// and wrapping. Returns `None` if there is nothing selectable at all.
+/// and inert rows and wrapping. Returns `None` if there is nothing selectable
+/// at all.
 pub fn next_selectable(items: &[Item<'_>], from: usize, step: isize) -> Option<usize> {
     let n = items.len();
     if n == 0 {
@@ -47,7 +71,7 @@ pub fn next_selectable(items: &[Item<'_>], from: usize, step: isize) -> Option<u
     }
     for k in 1..=n {
         let i = (from as isize + step * k as isize).rem_euclid(n as isize) as usize;
-        if !items[i].separator {
+        if items[i].selectable() {
             return Some(i);
         }
     }
@@ -56,7 +80,7 @@ pub fn next_selectable(items: &[Item<'_>], from: usize, step: isize) -> Option<u
 
 /// The first selectable item, for opening a fresh menu.
 pub fn first_selectable(items: &[Item<'_>]) -> usize {
-    items.iter().position(|i| !i.separator).unwrap_or(0)
+    items.iter().position(|i| i.selectable()).unwrap_or(0)
 }
 
 /// Draw the menu near `anchor`, nudged so it always fits on screen. Returns the
@@ -115,8 +139,12 @@ pub fn draw(
                     Style::default().fg(theme.panel_border).bg(theme.panel_bg),
                 ));
             }
-            let style = if i == selected {
+            let style = if i == selected && item.selectable() {
                 theme.cursor()
+            } else if item.inert {
+                // Dimmed, like the rail's second line: the eye reads it as
+                // context rather than as something that failed to highlight.
+                Style::default().fg(theme.status_fg).bg(theme.panel_bg)
             } else {
                 Style::default().fg(theme.panel_fg).bg(theme.panel_bg)
             };
@@ -192,5 +220,20 @@ mod tests {
     fn the_first_selectable_skips_a_leading_separator() {
         let it = vec![Item::SEPARATOR, Item::new("Open", "Enter")];
         assert_eq!(first_selectable(&it), 1);
+    }
+
+    /// An inert row is shown and stepped over — it is there to be read.
+    #[test]
+    fn navigation_steps_over_an_inert_row() {
+        let it = vec![
+            Item::new("Open", "Enter"),
+            Item::inert("● you are here"),
+            Item::new("Copy", "F5"),
+        ];
+        assert_eq!(next_selectable(&it, 0, 1), Some(2));
+        assert_eq!(next_selectable(&it, 2, -1), Some(0));
+        assert_eq!(first_selectable(&[Item::inert("●"), it[0]]), 1);
+        assert!(!it[1].selectable());
+        assert_eq!(it[1].hint, "", "an inert row promises no shortcut");
     }
 }

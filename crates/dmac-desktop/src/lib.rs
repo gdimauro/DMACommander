@@ -228,6 +228,196 @@ pub fn raise_editor_for(_dir: &Path) -> Result<bool, DesktopError> {
     Ok(false)
 }
 
+/// Where a window sits, in the coordinates System Events speaks: the top-left
+/// origin of the main screen, `y` growing downward.
+///
+/// Not Cocoa's. The conversion between the two happens once, on the way into
+/// the placement script, and everything this crate hands out is already on the
+/// System Events side of it — a rectangle that is sometimes one and sometimes
+/// the other is a rectangle that is eventually read as the wrong one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Frame {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Where the editor's window for `dir` currently is, if it has one.
+///
+/// Reading, and only reading. The title match underneath is a guess — see
+/// [`window_for`] — and the cost of a wrong one here is a rectangle recorded
+/// for the wrong project, which the next read corrects. That is why the frame
+/// is *taken* by title and never *given* by title: putting a window somewhere
+/// on the strength of a guess moves something a person arranged.
+#[cfg(target_os = "macos")]
+pub fn editor_frame_for(dir: &Path) -> Option<Frame> {
+    let titles = editor_titles();
+    let title = window_for(&titles, dir)?;
+    let out = Command::new("osascript")
+        .args(["-l", "JavaScript", "-e", FRAME_SCRIPT])
+        .arg(EDITOR_PROCESS)
+        .arg(title)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    parse_frame(String::from_utf8_lossy(&out.stdout).trim())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn editor_frame_for(_dir: &Path) -> Option<Frame> {
+    None
+}
+
+/// Four numbers, or nothing.
+///
+/// Split out so the shape can be tested without a window server, and strict on
+/// purpose: a zero-sized or absurd rectangle is refused rather than stored,
+/// because it would come back tomorrow as a window collapsed to nothing on a
+/// screen the user then has to go and find.
+fn parse_frame(answer: &str) -> Option<Frame> {
+    let mut n = answer.split_whitespace();
+    let mut next = || n.next()?.parse::<f64>().ok();
+    let (x, y, w, h) = (next()?, next()?, next()?, next()?);
+    if !(w >= 120.0 && h >= 80.0) || w > 20_000.0 || h > 20_000.0 {
+        return None;
+    }
+    Some(Frame {
+        x: x.round() as i32,
+        y: y.round() as i32,
+        width: w.round() as u32,
+        height: h.round() as u32,
+    })
+}
+
+/// Open `dir` in the editor and put its window back where it was.
+///
+/// The window that is placed is the one that *just appeared*, counted rather
+/// than matched: the editor is entitled to reuse a window instead of opening
+/// one, and when it does, the folder was already on screen somewhere the user
+/// put it — so nothing is moved. That is the difference between restoring a
+/// window and rearranging somebody's desk.
+#[cfg(target_os = "macos")]
+pub fn restore_editor(dir: &Path, frame: Frame) -> Result<Opened, DesktopError> {
+    let _one_at_a_time = placing()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let before = editor_windows();
+    open_editor(dir)?;
+    let out = Command::new("osascript")
+        .arg("-l")
+        .arg("JavaScript")
+        .arg("-e")
+        .arg(RESTORE_SCRIPT)
+        .arg(EDITOR_PROCESS)
+        .arg(frame.x.to_string())
+        .arg(frame.y.to_string())
+        .arg(frame.width.to_string())
+        .arg(frame.height.to_string())
+        .arg(before.to_string())
+        .output()
+        .map_err(|e| DesktopError::Placement(format!("osascript: {e}")))?;
+    let answer = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    match placement_result(&answer, &stderr) {
+        Ok(()) => Ok(Opened::Placed),
+        // It opened, which is most of what was asked for. Where it landed is
+        // worth a line and is not a failure.
+        Err(e) => Ok(Opened::NotPlaced(e.to_string())),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn restore_editor(_dir: &Path, _frame: Frame) -> Result<Opened, DesktopError> {
+    Err(DesktopError::Unsupported)
+}
+
+#[cfg(target_os = "macos")]
+const FRAME_SCRIPT: &str = r#"
+function run(argv) {
+  var se = Application('System Events');
+  var ws;
+  try { ws = se.processes.byName(argv[0]).windows(); } catch (e) { return ''; }
+  for (var i = 0; i < ws.length; i++) {
+    var t = '';
+    try { t = String(ws[i].name()); } catch (e) { continue; }
+    if (t !== argv[1]) continue;
+    try {
+      var p = ws[i].position(), s = ws[i].size();
+      return p[0] + ' ' + p[1] + ' ' + s[0] + ' ' + s[1];
+    } catch (e) { return ''; }
+  }
+  return '';
+}
+"#;
+
+/// The same wait and the same assert-until-it-takes as the tiling script, with
+/// the rectangle given rather than worked out.
+///
+/// `existing` is how many windows the editor had before it was asked to open
+/// one. Nothing is touched until it has one more — and if it never does, the
+/// editor reused a window and there is nothing here to restore.
+#[cfg(target_os = "macos")]
+const RESTORE_SCRIPT: &str = r#"
+function run(argv) {
+  ObjC.import('AppKit');
+  var editorName = argv[0];
+  var x = parseInt(argv[1], 10), y = parseInt(argv[2], 10);
+  var w = parseInt(argv[3], 10), h = parseInt(argv[4], 10);
+  var existing = parseInt(argv[5], 10);
+  if (isNaN(existing)) existing = -1;
+  var se = Application('System Events');
+
+  function win() { return se.processes.byName(editorName).windows[0]; }
+  function windows() {
+    try { return se.processes.byName(editorName).windows().length; } catch (e) { return 0; }
+  }
+
+  var wanted = existing < 0 ? 1 : existing + 1;
+  for (var i = 0; i < 60 && windows() < wanted; i++) {
+    $.NSThread.sleepForTimeInterval(0.1);
+  }
+  if (windows() === 0) return 'the editor never showed a window';
+  // It reused a window instead of opening one. The folder was already on
+  // screen where the user had put it, and moving that is not restoring it.
+  if (windows() < wanted) return 'ok';
+
+  var TOLERANCE = 40;
+  function apply(prop, want) {
+    var applied = false, err = 'no window';
+    for (var i = 0; i < 20; i++) {
+      try { win()[prop] = want; applied = true; } catch (e) { err = String(e); }
+      var got = null;
+      try { got = win()[prop](); } catch (e) { err = String(e); }
+      if (got !== null
+          && Math.abs(got[0] - want[0]) <= TOLERANCE
+          && Math.abs(got[1] - want[1]) <= TOLERANCE) {
+        return null;
+      }
+      $.NSThread.sleepForTimeInterval(0.05);
+    }
+    return applied ? null : 'could not place ' + editorName + ': ' + err;
+  }
+  function near(got, want) {
+    return got !== null
+        && Math.abs(got[0] - want[0]) <= TOLERANCE
+        && Math.abs(got[1] - want[1]) <= TOLERANCE;
+  }
+  // Position and size argue with each other, and each is only true until the
+  // other is asserted. What settles it is asking for both and checking both,
+  // together, until the pair holds at once.
+  var p = null, s = null;
+  for (var pass = 0; pass < 4; pass++) {
+    var why = apply('position', [x, y]) || apply('size', [w, h]);
+    if (why !== null) return why;
+    try { p = win().position(); s = win().size(); } catch (e) { p = null; s = null; }
+    if (near(p, [x, y]) && near(s, [w, h])) return 'ok';
+  }
+  return editorName + ' would not take ' + w + '×' + h + ' at ' + x + ',' + y;
+}
+"#;
+
 /// The titles of the editor's windows, front to back.
 #[cfg(target_os = "macos")]
 fn editor_titles() -> Vec<String> {
@@ -804,5 +994,107 @@ mod tests {
         };
         assert!(!host.contains('/'), "{host} is a path, not a process name");
         assert!(!host.is_empty());
+    }
+
+    /// Four numbers, and a rectangle that could actually hold a window.
+    ///
+    /// A zero-sized or absurd frame is refused rather than stored: stored, it
+    /// comes back tomorrow as a window collapsed to nothing, on a screen the
+    /// user then has to go and find.
+    #[test]
+    fn a_frame_is_four_numbers_or_it_is_nothing() {
+        assert_eq!(
+            parse_frame("100 50 1200 800"),
+            Some(Frame {
+                x: 100,
+                y: 50,
+                width: 1200,
+                height: 800
+            })
+        );
+        // Negative x is ordinary: a screen to the left of the main one.
+        assert_eq!(
+            parse_frame("-1512 0 900 600"),
+            Some(Frame {
+                x: -1512,
+                y: 0,
+                width: 900,
+                height: 600
+            })
+        );
+        // The window server answers in reals.
+        assert_eq!(
+            parse_frame("100.0 50.4 1200.6 800.0").map(|f| (f.y, f.width)),
+            Some((50, 1201))
+        );
+        for bad in [
+            "",
+            "no window",
+            "1 2 3",
+            "0 0 0 0",
+            "0 0 10 10",
+            "0 0 99999 99999",
+        ] {
+            assert_eq!(parse_frame(bad), None, "{bad:?}");
+        }
+    }
+
+    /// The restore script must never touch a window the editor merely reused:
+    /// that folder was already on screen where the user put it, and moving it
+    /// is rearranging their desk rather than restoring anything.
+    #[test]
+    fn a_reused_window_is_left_exactly_where_it_is() {
+        assert!(
+            RESTORE_SCRIPT.contains("if (windows() < wanted) return 'ok'"),
+            "the script would place a window it did not open"
+        );
+        // And it waits the way the tiling script does, with the one timer that
+        // is always there — `delay` belongs to Standard Additions, which
+        // `osascript -l JavaScript -e` does not always have.
+        assert!(RESTORE_SCRIPT.contains("NSThread.sleepForTimeInterval"));
+        for forbidden in [
+            "std.delay",
+            "includeStandardAdditions",
+            "currentApplication",
+        ] {
+            assert!(!RESTORE_SCRIPT.contains(forbidden), "{forbidden}");
+        }
+    }
+
+    /// Nothing that comes from another program's output may be pasted into a
+    /// script. Both of these take a window title, and a title is whatever the
+    /// user happened to call a folder.
+    #[test]
+    fn the_scripts_take_arguments_and_never_interpolation() {
+        for script in [FRAME_SCRIPT, RESTORE_SCRIPT] {
+            assert!(script.contains("argv["), "a script that reads no arguments");
+            assert!(!script.contains("${"), "a script that pastes something in");
+        }
+    }
+
+    /// What this machine says about the editor's windows, for a human to read.
+    ///
+    /// **This one only looks.** It reads positions and sizes and prints them;
+    /// nothing is opened, nothing is moved. Ignored by default because it needs
+    /// a running editor and the Accessibility permission, and because its
+    /// output is evidence rather than an assertion:
+    ///
+    /// ```text
+    /// cargo test -p dmac-desktop -- --ignored --nocapture what_this_machine
+    /// ```
+    #[test]
+    #[ignore = "needs a running editor and Accessibility; prints, asserts nothing"]
+    fn what_this_machine_says_about_editor_windows() {
+        let titles = editor_titles();
+        println!("{} editor window(s)", titles.len());
+        for t in &titles {
+            println!("  {t}");
+        }
+        // Every directory up to the root, because the editor is open on the
+        // *project*, and the test runs in a crate below it.
+        let here = std::env::current_dir().expect("cwd");
+        for dir in here.ancestors() {
+            println!("  {:>50}: {:?}", dir.display(), editor_frame_for(dir));
+        }
     }
 }

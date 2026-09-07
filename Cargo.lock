@@ -716,6 +716,7 @@ dependencies = [
  "jiff",
  "ratatui",
  "serde_json",
+ "tempfile",
  "tokio",
  "unicode-segmentation",
  "unicode-width",

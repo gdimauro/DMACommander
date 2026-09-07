@@ -98,12 +98,40 @@ pub struct Session {
     /// on every visit — re-entering a directory you are already in still costs
     /// a line of scrollback and a wasted prompt.
     pub shell_cwd: Option<VfsPath>,
+    /// A move the panels made while the shell was busy, still owed to it.
+    ///
+    /// A `cd` cannot be typed at a running program — a line handed to `vim` is
+    /// text in somebody's document, not a command — so the move is remembered
+    /// rather than dropped, and written the moment the prompt comes back. That
+    /// is as close as anything gets to the *program* following the panels:
+    /// nothing can move a process that is already running, on any operating
+    /// system. What can be moved is the shell it came from, in time for the
+    /// next one.
+    pub cwd_owed: bool,
     /// The conversation a hosted agent in this session belongs to.
     ///
     /// Generated once and then kept for the life of the session, because that
     /// is the whole point: come back tomorrow and `claude` rejoins the
     /// conversation you left, instead of starting a new one next to it.
     pub conversation: Option<String>,
+    /// The editor window this session had open, and where it was.
+    ///
+    /// Four numbers and a directory, rather than a handle: the window belongs
+    /// to another application and will not survive us, so what is kept is what
+    /// it takes to make an equivalent one — which is the only sense in which a
+    /// window can be "restored" across a restart at all.
+    pub editor: Option<EditorWindow>,
+    /// The session this one was opened beside, if it was.
+    ///
+    /// Two levels and no more. A session either stands on its own or hangs off
+    /// one that does, and a sibling made from a nested session joins it rather
+    /// than nesting under it — see [`SessionManager::create_sibling`]. A tree of
+    /// arbitrary depth is a tree you have to navigate; two levels is a group,
+    /// which is what a handful of agents working on one thing actually is.
+    pub parent: Option<SessionId>,
+    /// Whether this session's children are folded away in the rail and the
+    /// menu. Meaningless on a session that has none.
+    pub collapsed: bool,
     /// Whether this session's panels have been listed yet.
     ///
     /// Restored sessions start `false`: listing every panel of every session at
@@ -122,6 +150,23 @@ pub struct Session {
     pub last_used: std::time::Instant,
 }
 
+/// An editor window belonging to a session: which folder it had open, and the
+/// rectangle it occupied.
+///
+/// The rectangle is in the coordinates the window server answers in — top-left
+/// origin of the main screen — which is also what puts it back. Storing it in
+/// any other frame of reference would mean converting on the way in and out,
+/// and a rectangle that is sometimes one and sometimes the other is one that is
+/// eventually read as the wrong one.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EditorWindow {
+    pub dir: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
 impl Session {
     pub fn new(id: SessionId, name: impl Into<String>, left: VfsPath, right: VfsPath) -> Self {
         Self {
@@ -138,7 +183,11 @@ impl Session {
             view: View::Panels,
             shell: None,
             shell_cwd: None,
+            cwd_owed: false,
             conversation: None,
+            editor: None,
+            parent: None,
+            collapsed: false,
             // A session made now is listed by whoever made it.
             loaded: true,
             reattach: None,
@@ -254,17 +303,48 @@ impl Session {
     /// Silent when it cannot be done — a remote or in-archive directory has no
     /// meaning to a shell, and a shell running something must not be typed
     /// into. Neither is an error worth interrupting anyone about.
+    ///
+    /// A shell that was busy leaves the move [owed](Self::cwd_owed) rather than
+    /// losing it: [`catch_up_cwd`](Self::catch_up_cwd) writes it as soon as the
+    /// prompt is back.
     pub fn follow_panel_cwd(&mut self) {
         let cwd = self.cwd[Self::index_of(self.active)].clone();
         if !cwd.is_local() || self.shell_cwd.as_ref() == Some(&cwd) {
+            // Nothing a shell could be sent to, or it is already there. Either
+            // way nothing is outstanding — an owed `cd` from before is not owed
+            // to a directory nobody is in any more.
+            self.cwd_owed = false;
             return;
         }
         let Some(shell) = self.shell.as_mut() else {
+            self.cwd_owed = false;
             return;
         };
         if matches!(shell.cd(cwd.as_path()), Ok(true)) {
             self.shell_cwd = Some(cwd);
+            self.cwd_owed = false;
+        } else {
+            // Something is running in there. Remembered, not dropped: the panel
+            // moved for a reason, and the reason is usually the next command.
+            self.cwd_owed = true;
         }
+    }
+
+    /// Write a `cd` the shell was too busy to take, if it is idle now.
+    ///
+    /// Called on every frame, and free unless something is actually owed: the
+    /// check behind it is one `tcgetpgrp` on the shell's own tty. There is no
+    /// timer — a program exiting makes its shell print a prompt, and the bytes
+    /// of that prompt are themselves the wake-up.
+    pub fn catch_up_cwd(&mut self) {
+        if !self.cwd_owed {
+            return;
+        }
+        if self.shell.as_ref().is_none_or(|s| s.finished()) {
+            self.cwd_owed = false;
+            return;
+        }
+        self.follow_panel_cwd();
     }
 
     pub fn shell_running(&self) -> bool {
@@ -513,6 +593,114 @@ impl SessionManager {
         self.current
     }
 
+    /// Open a session beside `anchor`, in its group.
+    ///
+    /// The parent is `anchor` when `anchor` stands on its own, and *`anchor`'s*
+    /// parent when it does not. That is the whole of the two-level rule: a
+    /// sibling made from a nested session joins it at its level instead of
+    /// nesting under it, so a group can grow as wide as the work needs without
+    /// ever growing deeper than a glance can follow.
+    ///
+    /// Placed at the end of its parent's group, so the list stays in the order
+    /// the tree is drawn in. Everything here indexes by position — the rail,
+    /// the menu, the click that picks a row — and a subtree that is contiguous
+    /// is one that needs no second ordering to draw.
+    pub fn create_sibling(
+        &mut self,
+        anchor: usize,
+        name: impl Into<String>,
+        left: VfsPath,
+        right: VfsPath,
+    ) -> usize {
+        let Some(a) = self.sessions.get(anchor) else {
+            return self.create(name, left, right);
+        };
+        let parent = a.parent.unwrap_or(a.id);
+        let Some(pos) = self.sessions.iter().position(|s| s.id == parent) else {
+            return self.create(name, left, right);
+        };
+        // Past the parent and everything already hanging off it.
+        let mut at = pos + 1;
+        while self
+            .sessions
+            .get(at)
+            .is_some_and(|s| s.parent == Some(parent))
+        {
+            at += 1;
+        }
+        let id = SessionId(self.next_id);
+        self.next_id += 1;
+        let mut session = Session::new(id, name, left, right);
+        session.parent = Some(parent);
+        self.sessions.insert(at, session);
+        // A group you have just added to is a group you want to see.
+        if let Some(p) = self.sessions.get_mut(pos) {
+            p.collapsed = false;
+        }
+        self.current = at;
+        at
+    }
+
+    /// How deep a session sits: 0 on its own, 1 inside a group.
+    pub fn depth(&self, index: usize) -> usize {
+        usize::from(self.sessions.get(index).is_some_and(|s| s.parent.is_some()))
+    }
+
+    /// Whether this session has any hanging off it.
+    pub fn has_children(&self, index: usize) -> bool {
+        let Some(id) = self.sessions.get(index).map(|s| s.id) else {
+            return false;
+        };
+        self.sessions.iter().any(|s| s.parent == Some(id))
+    }
+
+    /// Fold a group away, or open it. Answers whether anything happened —
+    /// a session with nothing under it has nothing to fold.
+    pub fn toggle_collapsed(&mut self, index: usize) -> bool {
+        if !self.has_children(index) {
+            return false;
+        }
+        let folding = match self.sessions.get_mut(index) {
+            Some(s) => {
+                s.collapsed = !s.collapsed;
+                s.collapsed
+            }
+            None => return false,
+        };
+        // Folding a group you are inside would hide the session you are looking
+        // at, and there is nothing to draw in its place. Come out to the parent
+        // first, which is where the fold happened.
+        if folding && self.depth(self.current) == 1 && self.parent_of(self.current) == Some(index) {
+            self.switch_to(index);
+        }
+        true
+    }
+
+    /// Where a session's parent sits, by position.
+    pub fn parent_of(&self, index: usize) -> Option<usize> {
+        let parent = self.sessions.get(index)?.parent?;
+        self.sessions.iter().position(|s| s.id == parent)
+    }
+
+    /// The positions to draw, in order, with folded groups left out.
+    ///
+    /// One list, used by the rail and by the menu, because two of them would
+    /// eventually disagree about what a click at row *n* selects.
+    pub fn visible(&self) -> Vec<usize> {
+        let folded: Vec<SessionId> = self
+            .sessions
+            .iter()
+            .filter(|s| s.collapsed)
+            .map(|s| s.id)
+            .collect();
+        (0..self.sessions.len())
+            .filter(|&i| match self.sessions[i].parent {
+                Some(p) => !folded.contains(&p),
+                None => true,
+            })
+            .collect()
+    }
+
     /// Close a session. Refuses to close the last one — an application with no
     /// session has nothing to draw, and "quit" is a different action with a
     /// different confirmation.
@@ -523,13 +711,48 @@ impl SessionManager {
         if index >= self.sessions.len() {
             return Err(CloseError::NoSuchSession);
         }
-        self.sessions.remove(index);
+        // A group goes together. Closing the session a group hangs off and
+        // leaving its children behind would orphan them into the top level,
+        // where they are no longer the thing the user grouped — and refusing
+        // instead would make a group something you cannot get rid of. How many
+        // that is can be asked first, with [`group_size`](Self::group_size), so
+        // the confirmation can say it.
+        let going = self.group_size(index);
+        if going >= self.sessions.len() {
+            return Err(CloseError::LastSession);
+        }
+        self.sessions.drain(index..index + going);
         // Keep looking at the same session where possible; otherwise step back
         // so closing the last one in the list does not wrap to the first.
         if self.current > index || self.current >= self.sessions.len() {
-            self.current = self.current.saturating_sub(1);
+            self.current = self
+                .current
+                .saturating_sub(going)
+                .min(self.sessions.len() - 1);
         }
         Ok(())
+    }
+
+    /// How many sessions closing this one takes with it: itself, plus anything
+    /// hanging off it.
+    ///
+    /// Asked before closing rather than reported after, because it is what the
+    /// confirmation has to say. "Close 4 sessions?" is a question; "closed 4
+    /// sessions" is a thing that already happened to you.
+    pub fn group_size(&self, index: usize) -> usize {
+        let Some(s) = self.sessions.get(index) else {
+            return 0;
+        };
+        if s.parent.is_some() {
+            return 1;
+        }
+        let id = s.id;
+        1 + self
+            .sessions
+            .iter()
+            .skip(index + 1)
+            .take_while(|c| c.parent == Some(id))
+            .count()
     }
 
     /// Rename a session. An empty or duplicate name is refused rather than
@@ -953,6 +1176,83 @@ mod tests {
         assert_ne!(m.all()[0].color, m.all()[1].color);
     }
 
+    /// A `cd` cannot be typed at a running program, so the move is owed and
+    /// paid the moment the prompt comes back — which is the whole of what
+    /// "the shell follows the panels" can mean while something is running in
+    /// it. Nothing can move a process that has already started.
+    #[cfg(unix)]
+    #[test]
+    fn a_move_made_while_the_shell_was_busy_is_paid_at_the_next_prompt() {
+        use dmac_pty::{Hosted, Spawn};
+        use std::time::{Duration, Instant};
+
+        fn settle(s: &Session, want: bool) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if s.shell.as_ref().is_some_and(|h| h.at_prompt()) == want {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        let here = std::env::temp_dir().canonicalize().expect("temp dir");
+        let mut s = Session::new(SessionId(1), "t", VfsPath::local("/"), VfsPath::local("/"));
+        // A shell of our own rather than the user's: `/bin/sh` starts the same
+        // way on every machine, and this test is about what happens after.
+        s.shell = Some(
+            Hosted::spawn(Spawn {
+                program: "/bin/sh",
+                args: &[],
+                cols: 80,
+                rows: 10,
+                ..Spawn::new("", &[], 0, 0)
+            })
+            .expect("spawn"),
+        );
+        s.shell_cwd = Some(VfsPath::local("/"));
+        settle(&s, true);
+
+        // Something running in the foreground: the shell is no longer listening
+        // for commands, it is feeding whatever is.
+        s.shell.as_mut().expect("shell").run("cat > /dev/null").ok();
+        settle(&s, false);
+
+        s.cwd[0] = VfsPath::local(here.clone());
+        s.follow_panel_cwd();
+        assert!(s.cwd_owed, "the move was dropped instead of remembered");
+        assert_eq!(
+            s.shell_cwd,
+            Some(VfsPath::local("/")),
+            "a cd was typed into a running program"
+        );
+        s.catch_up_cwd();
+        assert!(s.cwd_owed, "still busy, still owed");
+
+        // The program exits; the prompt comes back.
+        s.shell.as_mut().expect("shell").write(&[0x04]).ok();
+        settle(&s, true);
+
+        s.catch_up_cwd();
+        assert!(!s.cwd_owed, "the prompt came back and nothing was paid");
+        assert_eq!(
+            s.shell_cwd.as_ref().map(|p| p.display()),
+            Some(here.to_string_lossy().to_string()),
+            "the shell was not sent after the panels"
+        );
+        s.shell.as_mut().expect("shell").kill();
+    }
+
+    /// Nothing to pay it to, nothing owed: an owed move must not outlive the
+    /// shell it was owed to, or it lands in the next one.
+    #[test]
+    fn an_owed_move_dies_with_the_shell_it_was_owed_to() {
+        let mut s = Session::new(SessionId(1), "t", VfsPath::local("/"), VfsPath::local("/"));
+        s.cwd_owed = true;
+        s.catch_up_cwd();
+        assert!(!s.cwd_owed);
+    }
+
     #[test]
     fn the_home_prefix_is_abbreviated_in_the_rail() {
         // Only meaningful when HOME is set, which it is everywhere we run.
@@ -961,5 +1261,85 @@ mod tests {
             assert_eq!(abbreviate_home(&p), "~/prj/dmac");
         }
         assert_eq!(abbreviate_home("/etc/hosts"), "/etc/hosts");
+    }
+
+    /// Two levels, and the rule that keeps it at two: a sibling made from a
+    /// nested session joins it rather than nesting under it. Otherwise a group
+    /// of agents working on one thing turns into a tree you have to navigate.
+    #[test]
+    fn a_sibling_of_a_nested_session_joins_it_instead_of_nesting_under_it() {
+        let mut m = SessionManager::new("work", VfsPath::local("/a"), VfsPath::local("/b"));
+        let first = m.create_sibling(0, "one", VfsPath::local("/a"), VfsPath::local("/b"));
+        assert_eq!(
+            first, 1,
+            "a group is contiguous, so a child sits after its parent"
+        );
+        assert_eq!(m.depth(first), 1);
+
+        // Made *from the child*, and still at the child's level.
+        let second = m.create_sibling(first, "two", VfsPath::local("/a"), VfsPath::local("/b"));
+        assert_eq!(m.depth(second), 1, "the tree grew a third level");
+        assert_eq!(m.parent_of(second), Some(0), "it joined the wrong group");
+        assert_eq!(second, 2, "siblings go at the end of their group");
+
+        // And a third, from the parent this time: same group, same level.
+        let third = m.create_sibling(0, "three", VfsPath::local("/a"), VfsPath::local("/b"));
+        assert_eq!(third, 3);
+        assert_eq!(m.parent_of(third), Some(0));
+        assert_eq!(m.group_size(0), 4);
+    }
+
+    /// A folded group is not drawn, and folding one you are inside would hide
+    /// the session on screen with nothing to put in its place.
+    #[test]
+    fn folding_a_group_takes_you_out_of_it_first() {
+        let mut m = SessionManager::new("work", VfsPath::local("/a"), VfsPath::local("/b"));
+        let child = m.create_sibling(0, "one", VfsPath::local("/a"), VfsPath::local("/b"));
+        m.switch_to(child);
+
+        assert!(m.toggle_collapsed(0));
+        assert_eq!(
+            m.visible(),
+            vec![0],
+            "a folded group still draws its own row"
+        );
+        assert_eq!(
+            m.current_index(),
+            0,
+            "the session on screen was folded away"
+        );
+
+        assert!(m.toggle_collapsed(0));
+        assert_eq!(m.visible(), vec![0, 1]);
+        // Nothing hangs off a child, so there is nothing there to fold.
+        assert!(!m.toggle_collapsed(1));
+    }
+
+    /// A group goes together. Leaving the children behind would orphan them
+    /// into the top level, where they are no longer what the user grouped.
+    #[test]
+    fn closing_a_group_closes_what_hangs_off_it() {
+        let mut m = SessionManager::new("work", VfsPath::local("/a"), VfsPath::local("/b"));
+        m.create("other", VfsPath::local("/c"), VfsPath::local("/d"));
+        m.create_sibling(0, "one", VfsPath::local("/a"), VfsPath::local("/b"));
+        m.create_sibling(0, "two", VfsPath::local("/a"), VfsPath::local("/b"));
+        assert_eq!(m.len(), 4);
+        assert_eq!(m.group_size(0), 3, "itself and the two hanging off it");
+        assert_eq!(m.group_size(1), 1, "a child takes nothing with it");
+
+        m.switch_to(0);
+        m.close(0).expect("close");
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.all()[0].name, "other");
+        assert_eq!(
+            m.current_index(),
+            0,
+            "the cursor has to land somewhere real"
+        );
+
+        // And the last group standing may not be closed, however many it holds.
+        let mut m = SessionManager::new("work", VfsPath::local("/a"), VfsPath::local("/b"));
+        m.create_sibling(0, "one", VfsPath::local("/a"), VfsPath::local("/b"));
+        assert!(m.close(0).is_err(), "that would leave nothing to draw");
     }
 }

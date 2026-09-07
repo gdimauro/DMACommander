@@ -27,6 +27,7 @@ pub enum Utility {
     QuoteLine,
     EditorHere,
     AgentHere,
+    AgentBeside,
 }
 
 /// Something for the application to do. The utilities name it; performing it —
@@ -38,6 +39,13 @@ pub enum Deed {
     OpenEditorHere,
     /// Start this session's agent in its shell, and show the shell.
     StartAgentHere,
+    /// Open a session beside this one, in its group, and start an agent in it.
+    ///
+    /// The way to put a second agent on the same work without losing the first:
+    /// a new session of its own — its own shell, its own conversation, its own
+    /// panels — drawn nested under the one it came from, so a group of them
+    /// reads as a group rather than as five entries that happen to be adjacent.
+    StartAgentBeside,
 }
 
 /// What choosing an entry does to the command line.
@@ -76,6 +84,7 @@ impl Utility {
         None,
         Some(Self::EditorHere),
         Some(Self::AgentHere),
+        Some(Self::AgentBeside),
     ];
 
     pub fn label(self) -> &'static str {
@@ -95,6 +104,7 @@ impl Utility {
             Self::QuoteLine => "Shell-quote the line",
             Self::EditorHere => "Open this panel in the editor",
             Self::AgentHere => "Start claude in this session",
+            Self::AgentBeside => "New claude beside this one",
         }
     }
 
@@ -117,6 +127,7 @@ impl Utility {
             Self::QuoteLine => 'q',
             Self::EditorHere => 'o',
             Self::AgentHere => 'c',
+            Self::AgentBeside => 'a',
         }
     }
 
@@ -135,16 +146,67 @@ impl Utility {
     }
 }
 
-/// One of the other live sessions, as the menu needs it: where to jump, and
-/// what to call it.
+/// One of the live sessions, as the menu needs it: where to jump, what to call
+/// it, and whether it is the one we are standing in.
 #[derive(Debug, Clone)]
-pub struct Elsewhere {
+pub struct SessionRow {
     /// Position in the session list — the number the rail shows, and the one
     /// `Alt`+digit already jumps to. Kept as the real index rather than the row
     /// number, so the digit in this menu and the digit everywhere else are the
     /// same digit.
     pub index: usize,
-    pub name: String,
+    /// The row as it is drawn: the rail's dot — filled for the session we are
+    /// in, hollow for the rest — and then the name. Two lists of the same
+    /// sessions that do not look alike are two lists nobody trusts.
+    pub label: String,
+    /// The session we are in. It is listed rather than filtered out: dropping
+    /// it left a hole in the digits — 1, 2, 4, 5 — which reads as a forgotten
+    /// session rather than as "you are the 3". Listed, it still cannot be
+    /// chosen: there is nowhere to go.
+    pub current: bool,
+}
+
+impl SessionRow {
+    /// `depth` is 0 for a session on its own and 1 for one inside a group;
+    /// `folded` says whether this one has a group under it that is closed.
+    ///
+    /// The menu draws the same shape as the rail, from the same numbers. Two
+    /// lists of the same sessions that do not look alike are two lists nobody
+    /// trusts — and here it matters more than looks, because the digit beside a
+    /// row is the `Alt`+digit that jumps to it.
+    pub fn new(
+        index: usize,
+        name: &str,
+        current: bool,
+        depth: usize,
+        folded: Option<bool>,
+        tree: bool,
+    ) -> Self {
+        // The rail's own marks, so the two lists read as one list.
+        let dot = if current { '\u{25CF}' } else { '\u{25CB}' };
+        // `tree` is a property of the list, not of this row: with no groups
+        // open there is nothing to indent *from*, and two columns of blank left
+        // margin on every row is a cost paid by everyone who never made one.
+        // The moment a group exists the columns appear, for every row at once,
+        // because a list where only some rows are indented is unreadable.
+        let lead = match tree {
+            false => String::new(),
+            true => {
+                let marker = match folded {
+                    Some(true) => '\u{25B8}',
+                    Some(false) => '\u{25BE}',
+                    None => ' ',
+                };
+                let indent = if depth > 0 { '\u{2514}' } else { ' ' };
+                format!("{marker}{indent} ")
+            }
+        };
+        Self {
+            index,
+            label: format!("{lead}{dot} {name}"),
+            current,
+        }
+    }
 }
 
 /// What a row of this menu means.
@@ -155,13 +217,15 @@ pub enum Choice {
     GoTo(usize),
 }
 
-/// The menu as the widget wants it: the fixed entries, then the sessions you
-/// are not in.
+/// The menu as the widget wants it: the fixed entries, then every session —
+/// the one you are in among them, shown and not selectable.
 ///
 /// The sessions are here because this is the menu people reach for. The rail
 /// has had them all along, on a key that is one more thing to know — and a list
 /// that exists in one place and not in the obvious one is a list nobody finds.
-pub fn items(elsewhere: &[Elsewhere]) -> Vec<Item<'_>> {
+/// Which is also why the list is the whole list: the rail shows five and a menu
+/// showing four of them is read as a bug, not as a filter.
+pub fn items(sessions: &[SessionRow]) -> Vec<Item<'_>> {
     let mut items: Vec<Item<'_>> = Utility::MENU
         .iter()
         .map(|slot| match slot {
@@ -169,9 +233,16 @@ pub fn items(elsewhere: &[Elsewhere]) -> Vec<Item<'_>> {
             Some(u) => Item::new(u.label(), hint_of(*u)),
         })
         .collect();
-    if !elsewhere.is_empty() {
+    // Alone, the block would be one row saying where you already are.
+    if sessions.iter().any(|s| !s.current) {
         items.push(Item::SEPARATOR);
-        items.extend(elsewhere.iter().map(|s| Item::new(&s.name, digit(s.index))));
+        items.extend(sessions.iter().map(|s| {
+            if s.current {
+                Item::inert(&s.label)
+            } else {
+                Item::new(&s.label, digit(s.index))
+            }
+        }));
     }
     items
 }
@@ -183,25 +254,29 @@ fn digit(index: usize) -> &'static str {
     DIGITS.get(index).copied().unwrap_or("")
 }
 
-/// What the row at `row` does, if it does anything.
-pub fn at(row: usize, elsewhere: &[Elsewhere]) -> Option<Choice> {
+/// What the row at `row` does, if it does anything. The session you are in is a
+/// row and does nothing.
+pub fn at(row: usize, sessions: &[SessionRow]) -> Option<Choice> {
     if row < Utility::MENU.len() {
         return Utility::at(row).map(Choice::Do);
     }
     // One separator between the two halves.
     let below = row.checked_sub(Utility::MENU.len() + 1)?;
-    elsewhere.get(below).map(|s| Choice::GoTo(s.index))
+    sessions
+        .get(below)
+        .filter(|s| !s.current)
+        .map(|s| Choice::GoTo(s.index))
 }
 
 /// The same, by the accelerator shown in the hint column. Letters are the
 /// utilities; digits are the sessions, and they are the digits `Alt` already
-/// answers to.
-pub fn from_key(c: char, elsewhere: &[Elsewhere]) -> Option<Choice> {
+/// answers to. The current session shows no digit and answers to none.
+pub fn from_key(c: char, sessions: &[SessionRow]) -> Option<Choice> {
     if let Some(d) = c.to_digit(10).filter(|d| *d > 0) {
         let index = d as usize - 1;
-        return elsewhere
+        return sessions
             .iter()
-            .any(|s| s.index == index)
+            .any(|s| s.index == index && !s.current)
             .then_some(Choice::GoTo(index));
     }
     Utility::from_key(c).map(Choice::Do)
@@ -227,6 +302,7 @@ fn hint_of(u: Utility) -> &'static str {
         'q' => "q",
         'o' => "o",
         'c' => "c",
+        'a' => "a",
         _ => "",
     }
 }
@@ -283,6 +359,7 @@ pub fn run(u: Utility, cx: &Context<'_>) -> Outcome {
         Utility::SelectedPaths => join_quoted(&cx.selected_paths, "nothing is selected"),
         Utility::EditorHere => Outcome::Do(Deed::OpenEditorHere),
         Utility::AgentHere => Outcome::Do(Deed::StartAgentHere),
+        Utility::AgentBeside => Outcome::Do(Deed::StartAgentBeside),
         Utility::Base64Encode => {
             let (text, from_sel) = cx.subject();
             if text.is_empty() {
@@ -402,16 +479,13 @@ mod tests {
         }
     }
 
-    fn elsewhere() -> Vec<Elsewhere> {
+    /// Three live sessions, standing in the middle one — the arrangement that
+    /// used to print 1, 2, 4 and look like a session had been forgotten.
+    fn sessions() -> Vec<SessionRow> {
         vec![
-            Elsewhere {
-                index: 0,
-                name: "MAIN".into(),
-            },
-            Elsewhere {
-                index: 3,
-                name: "TIMEPULSE".into(),
-            },
+            SessionRow::new(0, "MAIN", false, 0, None, false),
+            SessionRow::new(1, "DMAC", true, 0, None, false),
+            SessionRow::new(3, "TIMEPULSE", false, 0, None, false),
         ]
     }
 
@@ -419,17 +493,35 @@ mod tests {
     /// the widget highlights has to mean the session it shows.
     #[test]
     fn the_sessions_are_the_rows_below() {
-        let e = elsewhere();
-        let items = items(&e);
-        assert_eq!(items.len(), Utility::MENU.len() + 1 + e.len());
+        let s = sessions();
+        let items = items(&s);
+        assert_eq!(items.len(), Utility::MENU.len() + 1 + s.len());
         assert!(
             items[Utility::MENU.len()].separator,
             "a separator between them"
         );
-        assert_eq!(items[Utility::MENU.len() + 1].label, "MAIN");
-        assert_eq!(at(Utility::MENU.len() + 1, &e), Some(Choice::GoTo(0)));
-        assert_eq!(at(Utility::MENU.len() + 2, &e), Some(Choice::GoTo(3)));
-        assert_eq!(at(items.len(), &e), None, "past the end is nothing");
+        assert_eq!(items[Utility::MENU.len() + 1].label, "○ MAIN");
+        assert_eq!(at(Utility::MENU.len() + 1, &s), Some(Choice::GoTo(0)));
+        assert_eq!(at(Utility::MENU.len() + 3, &s), Some(Choice::GoTo(3)));
+        assert_eq!(at(items.len(), &s), None, "past the end is nothing");
+    }
+
+    /// The list is the whole list. The rail shows every session; a menu that
+    /// quietly dropped one — the one you happen to be in — was read as a bug,
+    /// and the gap it left in the digits was the tell.
+    #[test]
+    fn the_session_you_are_in_is_shown_and_cannot_be_chosen() {
+        let s = sessions();
+        let items = items(&s);
+        let row = Utility::MENU.len() + 2;
+
+        assert_eq!(items[row].label, "● DMAC", "the rail's own mark");
+        assert!(items[row].inert, "there is nowhere to go");
+        assert!(!items[row].selectable(), "and the cursor steps over it");
+        assert_eq!(items[row].hint, "", "no digit: it answers to none");
+
+        assert_eq!(at(row, &s), None, "choosing it does nothing");
+        assert_eq!(from_key('2', &s), None, "and neither does its digit");
     }
 
     /// The digit shown is the digit `Alt` already answers to: the session's own
@@ -437,23 +529,29 @@ mod tests {
     /// same list is how people learn to distrust both.
     #[test]
     fn a_session_answers_to_the_number_the_rail_gives_it() {
-        let e = elsewhere();
-        assert_eq!(items(&e)[Utility::MENU.len() + 2].hint, "4");
-        assert_eq!(from_key('4', &e), Some(Choice::GoTo(3)));
-        assert_eq!(from_key('1', &e), Some(Choice::GoTo(0)));
+        let s = sessions();
+        assert_eq!(items(&s)[Utility::MENU.len() + 3].hint, "4");
+        assert_eq!(from_key('4', &s), Some(Choice::GoTo(3)));
+        assert_eq!(from_key('1', &s), Some(Choice::GoTo(0)));
         // Not a session anyone is offering: the row is not there.
-        assert_eq!(from_key('2', &e), None);
+        assert_eq!(from_key('3', &s), None);
         // And the letters still reach the utilities.
-        assert_eq!(from_key('u', &e), Some(Choice::Do(Utility::Uuid)));
+        assert_eq!(from_key('u', &s), Some(Choice::Do(Utility::Uuid)));
     }
 
     /// Alone, there is nothing to jump to and no separator dangling under the
-    /// last utility.
+    /// last utility. Not even the row saying where you already are: on your own
+    /// there is nothing that row could tell you.
     #[test]
     fn one_session_adds_nothing_to_the_menu() {
-        let items = items(&[]);
-        assert!(!items.last().expect("rows").separator);
-        assert_eq!(at(items.len(), &[]), None);
+        let alone = [SessionRow::new(0, "MAIN", true, 0, None, false)];
+        for s in [&[][..], &alone[..]] {
+            let items = items(s);
+            assert_eq!(items.len(), Utility::MENU.len());
+            assert!(!items.last().expect("rows").separator);
+            assert_eq!(at(items.len(), s), None);
+            assert_eq!(from_key('1', s), None);
+        }
     }
 
     /// A path with a space in it is the normal case, not the exotic one.

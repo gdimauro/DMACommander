@@ -101,6 +101,16 @@ pub trait Effect: Send {
     fn on_input(&mut self, _key: EffectKey) -> EffectControl {
         EffectControl::Exit
     }
+
+    /// Text the frontend has to offer — the help page, as it happens. Most
+    /// effects have no use for words and keep the default, which ignores them;
+    /// one that shows text takes it from here rather than knowing where it
+    /// came from, because `dmac-fx` sits below the crate that owns the help
+    /// and must not read it.
+    ///
+    /// Called before [`Effect::resize`], so an effect may lay the text out in
+    /// the resize it already does.
+    fn set_text(&mut self, _lines: &[String]) {}
 }
 
 /// Everything in the picker: screensavers first, then games.
@@ -136,6 +146,16 @@ pub fn catalog() -> &'static [CatalogEntry] {
             name: "spectrum",
             kind: Screensaver,
             blurb: "listens to the room and draws it",
+        },
+        CatalogEntry {
+            name: "cannon",
+            kind: Screensaver,
+            blurb: "the help page, shot down a letter at a time",
+        },
+        CatalogEntry {
+            name: "helix",
+            kind: Screensaver,
+            blurb: "the help page, arriving on a spiral",
         },
         CatalogEntry {
             name: "asteroids",
@@ -182,6 +202,8 @@ pub fn build(name: &str) -> Option<Box<dyn Effect>> {
         "life" => Some(Box::new(effects::life::Life::new())),
         "pipes" => Some(Box::new(effects::pipes::Pipes::new())),
         "spectrum" => Some(Box::new(effects::spectrum::Spectrum::new())),
+        "cannon" => Some(Box::new(effects::cannon::Cannon::new())),
+        "helix" => Some(Box::new(effects::helix::Helix::new())),
         "asteroids" => Some(Box::new(effects::asteroids::Asteroids::new())),
         "snake" => Some(Box::new(effects::snake::Snake::new())),
         _ => None,

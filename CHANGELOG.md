@@ -6,6 +6,41 @@ Notable changes, newest first. Versions follow the policy in
 ## Unreleased
 
 ### Added
+- **F1 is the help.** A page over the panels with every key and what it does,
+  section by section — panels, marking, sorting, the command line, the F-keys,
+  sessions, the shell, screensavers, the mouse, and which of it your terminal
+  can send. It scrolls with the arrows, the page keys and the wheel; `Esc`,
+  `F1` or a click outside closes it. From inside a shell `F1` still belongs to
+  the hosted program, so it is `Ctrl-O` `F1` from there — the same chord that
+  reaches the history and the utilities.
+
+  The page is data, and the data is checked: every key it names is pressed by
+  a test and must resolve to the action the page says. A help that lies is
+  worse than no help, and a keymap drifts the moment nobody is checking it.
+
+- **A screensaver that shoots the help down.** `cannon` puts the help page in
+  the top three quarters of the screen and a small cannon on the ground under
+  it. The cannon rolls about, lines up on a letter and fires; the letter comes
+  loose, tumbles down under gravity, bounces if it was going fast enough, and
+  lands in a heap that grows along the ground. A page shot empty is followed
+  by the next, so the whole help goes by a page at a time — whether or not
+  anyone is reading it.
+
+  The text reaches the effect through the engine, not the other way round:
+  `dmac-fx` sits below the crate that owns the help and cannot read it, so the
+  application hands the page to the screensaver engine once, and any effect
+  that shows text takes it from there. Without one there is a short built-in
+  page, so the effect is never a blank screen.
+
+- **`Shift-F12` starts a screensaver now; again, and it is the next one.** One
+  key walks the whole catalogue, games included, since pressing it is as
+  deliberate as choosing from the picker. While one is showing the picker's
+  own `F12` does the same, for a terminal that cannot send Shift with an
+  F-key — and in the picker `F12` starts the highlighted row, so `F12` `F12` is
+  a screensaver in two presses anywhere at all. Every other key still
+  dismisses, and is still not passed on. Inside a shell `Shift-F12` reaches
+  the screensaver too; the bare `F12` stays the directory history there.
+
 - **Switching session brings that session's editor forward.** If a window is
   open on the directory the session is showing, it comes to the front of the
   editor's windows — the per-window Alt-Tab macOS does not have. Raised, never
@@ -19,11 +54,17 @@ Notable changes, newest first. Versions follow the policy in
   rather than merely contain it: a session in some `src` must not raise whatever
   project happens to have a file from one open. A guess, and deliberately one
   that only ever decides what to raise — never what to move.
-- **F9 lists the other sessions, and goes to them.** Under the utilities, behind
-  a separator, one row per session you are not in — answering to the same digit
-  the rail gives it, which is the digit `Alt` already jumps on. The rail has had
-  this list all along, on a key that is one more thing to know; a list that
-  exists somewhere other than the menu people reach for is a list nobody finds.
+- **F9 lists the sessions, and goes to them.** Under the utilities, behind a
+  separator, one row per session — answering to the same digit the rail gives
+  it, which is the digit `Alt` already jumps on. The rail has had this list all
+  along, on a key that is one more thing to know; a list that exists somewhere
+  other than the menu people reach for is a list nobody finds.
+
+  Every session, the one you are in included: it carries the rail's filled dot,
+  shows no digit, and the cursor steps over it. Leaving it out was tidier and
+  read worse — the rail showed five, the menu four, and the digits skipped the
+  one missing, so `1 2 4 5` looked like a forgotten session rather than like the
+  place you already are.
 - **F9 starts the agent, too.** `c` in the utilities runs `claude` in this
   session's shell and shows it. Typed at the shell rather than spawned beside
   it, because the shim on `PATH` is what hands the agent this session's
@@ -94,12 +135,28 @@ Notable changes, newest first. Versions follow the policy in
   Ctrl-H is now the history.
 
 ### Changed
+- **`Shift-Tab` belongs to the hosted program.** In the panels it still opens
+  the rail; inside a shell it now goes to the child, where it is how `claude`
+  cycles its permission modes and how a dozen other programs move backwards
+  through their own fields. A file manager that swallowed it was pressing a key
+  inside somebody else's program. The rail is `Ctrl-T` from in there — a key no
+  terminal has an opinion about — and `Ctrl-Shift-Tab` still switches sessions
+  wherever the terminal reports modifiers. Where it does not, the two are the
+  same three bytes and nothing on this side can tell them apart.
 - **The shell goes where the panels go.** It used to follow only on the way in
   through `Ctrl-O`; now any move of the current session's active panel — the
   history, a jump, an agent — sends it after them. What is typed is still the
   shell's own call: a `cd` sent to something that is running is not a command,
   it is a line handed to whatever has the keyboard, so a busy shell is left
-  alone and catches up at the next `Ctrl-O`.
+  alone.
+
+  Left alone, not forgotten: the move is **owed**, and written the first frame
+  after the prompt comes back — no `Ctrl-O` needed, and no timer either, since a
+  program exiting makes its shell print a prompt and those bytes are the
+  wake-up. This is the whole of what "the hosted program follows the panels" can
+  mean: no operating system lets one process move another's current directory,
+  parent or not. A running `claude` stays where it started; the shell under it
+  is already somewhere else, and so is the next thing started from it.
 - **The shell's border says which session you are in.** The name first, in the
   colour the rail gives that session's dot. This is the view where the rail is
   three columns of dots, so until now the name was nowhere on the screen at all

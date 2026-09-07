@@ -272,17 +272,26 @@ pub fn draw(frame: &mut Frame, area: Rect, shell: &Hosted, c: &Chrome<'_>, theme
             // documentation of the keys that still reach the commander from
             // inside a hosted program. It has to name all of them.
             .title_bottom(Span::styled(
+                // Ctrl-O is in every one of them. The other hints belong to a
+                // state you are in for a moment — selecting, reading back — and
+                // they used to replace this line wholesale, so the one key that
+                // gets you out of a hosted program went missing exactly when
+                // someone lost in one would go looking for it.
                 match (selection.is_some(), back) {
-                    (true, 0) => {
-                        " selecting \u{b7} Ctrl-Shift-C copy \u{b7} Esc clear ".to_string()
-                    }
-                    (true, n) => {
-                        format!(" \u{2191} {n} back \u{b7} Ctrl-Shift-C copy \u{b7} Esc clear ")
-                    }
+                    (true, 0) => " selecting \u{b7} Ctrl-Shift-C copy \u{b7} Esc clear \
+                                  \u{b7} Ctrl-O commander "
+                        .to_string(),
+                    (true, n) => format!(
+                        " \u{2191} {n} back \u{b7} Ctrl-Shift-C copy \u{b7} Esc clear \
+                         \u{b7} Ctrl-O commander "
+                    ),
                     (false, 0) => {
                         " Ctrl-O DMAC commander \u{b7} F9 utilities \u{b7} F12 history ".to_string()
                     }
-                    (false, n) => format!(" \u{2191} {n} lines back \u{b7} Esc back to live "),
+                    (false, n) => format!(
+                        " \u{2191} {n} lines back \u{b7} Esc back to live \
+                         \u{b7} Ctrl-O commander "
+                    ),
                 },
                 theme.border(back > 0 || selection.is_some()),
             ))
@@ -406,6 +415,7 @@ fn convert(c: vt100::Color, default: Color) -> Color {
 pub fn encode(key: KeyEvent) -> Option<Vec<u8>> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
     let bytes: Vec<u8> = match key.code {
         KeyCode::Char(c) if ctrl => {
@@ -435,6 +445,12 @@ pub fn encode(key: KeyEvent) -> Option<Vec<u8>> {
         }
 
         KeyCode::Enter => vec![b'\r'],
+        // Terminals disagree about which of the two a shifted Tab arrives as —
+        // a bare `BackTab` where modifiers are not reported, `Tab` plus Shift
+        // where they are. Both are the same keypress and the child expects the
+        // same three bytes for it; sending a plain tab for one of them is how a
+        // key works in one terminal and not the next.
+        KeyCode::Tab if shift => b"\x1b[Z".to_vec(),
         KeyCode::Tab => vec![b'\t'],
         KeyCode::BackTab => b"\x1b[Z".to_vec(),
         // DEL, not BS: this is what a modern terminal sends, and what shells
@@ -554,6 +570,19 @@ mod tests {
     fn arrows_are_csi_sequences_so_history_works() {
         assert_eq!(encode(key(KeyCode::Up)), Some(b"\x1b[A".to_vec()));
         assert_eq!(encode(key(KeyCode::Left)), Some(b"\x1b[D".to_vec()));
+    }
+
+    /// Both spellings of Shift-Tab reach the child as the same key. It is how
+    /// `claude` cycles its permission modes and how everything else moves
+    /// backwards through its own fields, and a plain tab is not that key.
+    #[test]
+    fn shift_tab_is_the_same_three_bytes_in_either_spelling() {
+        assert_eq!(encode(key(KeyCode::BackTab)), Some(b"\x1b[Z".to_vec()));
+        assert_eq!(
+            encode(with(KeyCode::Tab, KeyModifiers::SHIFT)),
+            Some(b"\x1b[Z".to_vec())
+        );
+        assert_eq!(encode(key(KeyCode::Tab)), Some(vec![b'\t']), "plain Tab");
     }
 
     #[test]

@@ -28,9 +28,11 @@ pub fn resolve(key: KeyEvent, focus: Focus) -> Option<Action> {
         // Screensaver picker. Ctrl+Shift+F1 is what was asked for; F12 is kept
         // as a plain-key equivalent because a good many terminals do not encode
         // Ctrl+Shift with an F-key at all, and a binding you cannot press is
-        // not a binding.
+        // not a binding. Shift+F12 skips the picker: a screensaver now, and
+        // the next one while one is showing.
         (F(10), _, _) if shift => Action::ContextMenu,
         (F(1), true, _) if shift => Action::ScreensaverMenu,
+        (F(12), _, _) if shift => Action::ScreensaverNext,
         (F(12), _, _) => Action::ScreensaverMenu,
 
         // Sorting on Shift+F3..F6.

@@ -3,6 +3,7 @@
 //! same frame from the exact same state.
 
 mod fkeybar;
+pub(crate) mod help;
 pub(crate) mod history;
 pub(crate) mod menu;
 mod panel;
@@ -245,6 +246,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         crate::app::Mode::Picker { selected } => {
             app.layout.picker = picker::draw(frame, area, dmac_fx::catalog(), selected, theme);
         }
+        crate::app::Mode::Help { scroll } => {
+            // The page arrives before it is a page. While the characters are
+            // still flying in, what is drawn is the effect; the moment they
+            // land, the real one takes over — scrollable, and exactly where the
+            // animation left it.
+            app.layout.help = help::draw(frame, area, scroll, theme);
+            if let Some(canvas) = app.help_canvas(area.width, area.height) {
+                screen::draw_canvas(frame, area, canvas);
+            }
+        }
         crate::app::Mode::Context { selected, anchor } => {
             let items = app.context_items();
             app.layout.menu = menu::draw(frame, area, anchor, &items, selected, theme);
@@ -260,7 +271,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 frame,
                 area,
                 anchor,
-                &crate::utilities::items(&app.elsewhere()),
+                &crate::utilities::items(&app.session_menu_rows()),
                 selected,
                 theme,
             );
@@ -286,6 +297,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         crate::app::Mode::Rail { .. } | crate::app::Mode::Normal => {
             app.layout.picker = ratatui::layout::Rect::default();
             app.layout.menu = ratatui::layout::Rect::default();
+            app.layout.help = ratatui::layout::Rect::default();
         }
     }
 
