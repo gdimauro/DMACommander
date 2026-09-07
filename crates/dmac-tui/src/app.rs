@@ -2639,13 +2639,17 @@ impl App {
             "Refresh" => self.handle(Action::Refresh),
             "Copy path" => {
                 let path = self.cwd_display(self.ses().active);
-                let name = self
-                    .ses()
-                    .active_panel()
-                    .current()
-                    .map(|e| e.name.clone())
-                    .unwrap_or_default();
-                self.status = format!("{path}/{name} — clipboard not wired up yet");
+                let full = match self.ses().active_panel().current() {
+                    // Never `..`: copying the path of the parent row means
+                    // copying a path with a literal `..` in it, which is not
+                    // what anybody wanted to paste.
+                    Some(e) if e.kind != dmac_core::EntryKind::Parent => format!("{path}/{}", e.name),
+                    _ => path,
+                };
+                self.status = match dmac_core::clipboard::set_text(&full) {
+                    Ok(()) => format!("copied {full}"),
+                    Err(e) => format!("{full} \u{2014} could not copy it: {e}"),
+                };
             }
             other => self.status = format!("{other} — not implemented yet"),
         }

@@ -69,8 +69,21 @@ does nothing: it is a key that promises.
   through the job engine in `dmac-core` with progress, conflict resolution and
   verification before deleting — never a shell-out.
 
-**Done when:** no user-facing key answers "not implemented yet", and every
+**Done when:** no *function* key answers "not implemented yet", and every
 destructive one is covered by a test that proves it verifies before it deletes.
+
+Three keys still do, and they are not function keys — they are three
+subsystems that do not exist yet, and they belong to their own items rather
+than to this one:
+
+| | |
+|---|---|
+| `Ctrl-Shift-P` | command palette |
+| `Ctrl-F` | fuzzy find — `dmac-search` |
+| `Ctrl-Shift-A` | AI chat window — `dmac-agent` |
+
+A key that apologises is still better than one that lies, but these are the
+last three and they should be named somewhere other than in a status line.
 
 **Where it stands.**
 
