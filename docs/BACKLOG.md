@@ -119,30 +119,59 @@ should be fixed.
 
 ## 4. Settings, with the agent, the model and the editor in them
 
-- **Agent**: which coding agent a session hosts. `claude` today; `plank` next
-  — see item 6, which is where the real work is.
-- **Model**: Claude by default, and selectable — OpenAI, and the local runners
-  people actually use (Ollama, LM Studio, llama.cpp, anything speaking an
-  OpenAI-compatible endpoint). Note that `plank` reaches most of those itself,
-  through `--provider openai --base-url`, so for a plank session this is its
-  setting to pass on rather than ours to implement.
+- **Agent**: which coding agent a session hosts. `claude` today.
+- **Model**: for DMACommander's *own* agent — the one behind `Ctrl-Shift-A`.
+  Claude by default, and selectable: OpenAI, an OpenAI-compatible endpoint
+  (Ollama, LM Studio, llama.cpp), and **a `plank serve` running locally**, which
+  is item 5 and the interesting one.
 - **Editor**: VS Code by default, and changeable. `DMAC_EDITOR` already does
   this on the command line; it needs to be a setting with a UI.
 - Written through `dmac-config`, which is where configuration belongs.
 
-## 5. Hosting `plank` beside `claude`
+## 5. `plank` as the local model, not as a second CLI
 
-"plank" is [aovestdipaperino/plank](https://github.com/aovestdipaperino/plank) —
-same author as `tokensave`, checked out at `~/prj/plank`, installed at
-`~/.cargo/bin/plank`. It is a coding **agent**, a peer of `claude`: a Rust agent
-with a Ratatui TUI, a REPL, a headless mode and its own tools. Not a provider,
-which is where it would have gone if nobody had asked.
+**Corrected after a first reading that was wrong**, and the correction is the
+whole item: plank is not another agent to host beside `claude`. plank is the
+thing that **drives ds4**, and ds4 is the LLM DMACommander should be able to
+use. plank is the engine.
 
-So it belongs in `ATTACHED` in `crates/dmac-session/src/agent.rs` — recognised
-when it is running in a hosted shell, and put back on restart. That list was
-built to take a second entry. What it was *not* built for is how differently
-plank names a conversation, and each difference breaks something that is
-currently true:
+[aovestdipaperino/plank](https://github.com/aovestdipaperino/plank) — same
+author as `tokensave`, at `~/prj/plank`, installed at `~/.cargo/bin/plank`.
+
+### The shape
+
+plank is a **binary crate**, not a library, so it cannot be linked. It does not
+need to be — it already hosts its own engine over a socket:
+
+```sh
+plank serve --shared-engine --max-sessions 8
+```
+
+`src/remote/proto.rs` is the contract: HTTP and JSON, `/info`, `/generate`,
+`/warm`, `/tokenize`, behind a `PROTOCOL_VERSION` that a client refuses to
+speak across. Its own note says it plainly — *"the client is a dumb transport,
+the server is just `Ds4Engine`"* — and that **the client works on every platform
+while the server is macOS/ds4-only**. So DMACommander stays cross-platform, and
+only the machine holding the model needs Metal.
+
+That makes this a bounded job against a versioned contract rather than an
+open-ended port: a client in `dmac-agent`, which is the crate behind
+`Ctrl-Shift-A` and is still a stub.
+
+### What not to do
+
+- **Do not link `refs/ds4`.** It is C, macOS-only, and plank has already solved
+  hosting it. Pulling it into our tree buys a submodule and a platform
+  restriction and duplicates work that exists.
+- **`src/remote/provider.rs` is not the integration point.** It is plank's
+  *outbound* provider abstraction — plank talking to OpenAI and Anthropic — and
+  it is easy to mistake for a way in because of its name.
+
+### Still worth having, separately
+
+Recognising the plank **CLI** in a hosted shell, the way `claude` is recognised.
+Much smaller, and independent of the above. Its session model breaks three
+things that are currently true:
 
 | | `claude` | `plank` |
 |---|---|---|
@@ -151,19 +180,13 @@ currently true:
 | dictating an id | `--session-id <uuid>` | **no equivalent** — resume only |
 | MCP | inline JSON | `--mcp-config FILE`, over a global `~/.plank/.mcp.json` |
 
-- `looks_like_conversation` demands 36 characters of UUID, so it will never
-  adopt a plank session. The shape has to become a property of the program.
-- The whole "mint an id up front and hand it to the agent" model does not
-  transfer: plank's id is chosen by plank. What is left is observation — and a
-  bare `/resume` takes the most recent, which is the hazard the current code
-  already refuses to walk into.
-- The global `~/.plank/.mcp.json` is the way to advertise this commander to it
-  without writing per-project files, which is the thing we deliberately stopped
-  doing for `claude`.
+`looks_like_conversation` demands 36 characters of UUID, so it will never adopt
+a plank session: the shape of an id has to become a property of the program.
+And the "mint an id up front and hand it over" model does not transfer at all,
+because plank's id is plank's to choose.
 
-**Done when:** start `plank` in a hosted shell, quit DMACommander, start it
-again — the session comes back in the same plank conversation, and picking
-between the two agents is a setting rather than a recompile.
+**Done when:** DMACommander can answer with a model running on this machine,
+through a `plank serve` it did not have to link.
 
 ## 6. Untangling the two sessions — **done**
 
