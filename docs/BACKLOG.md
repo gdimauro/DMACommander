@@ -85,7 +85,7 @@ destructive one is covered by a test that proves it verifies before it deletes.
 meant? Everything else on the list is a name I recognise; that one I do not, and
 guessing at a provider is how you end up with a menu entry nobody can use.
 
-## 5. Untangling the two sessions
+## 5. Untangling the two sessions — **done**
 
 Not a feature, but it is owed.
 
@@ -102,3 +102,7 @@ Not a feature, but it is owed.
 
 **Done when:** the working tree is committed, and the suite is green twice in a
 row on a cold build.
+
+**How it went.** They did not come apart, so they went in together as one
+commit that says which half is which. Verified on a cold build in a detached
+worktree: 508 tests, no failures, clippy clean.
