@@ -4359,6 +4359,17 @@ impl App {
 
     /// Selecting text over the hosted shell. Returns whether the event was ours.
     fn shell_mouse(&mut self, m: MouseEvent) -> bool {
+        // The border first: it is outside the shell's interior, so nothing
+        // below would ever see it. Clicking a command there is how someone
+        // reaches the commander when the hosted program has the keyboard —
+        // which, inside a shell, it always does.
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+            && let Some(label) = crate::ui::shell::command_at(self.layout.shell, m.column, m.row)
+            && let Some((_, action)) = crate::ui::shell::COMMANDS.iter().find(|(l, _)| *l == label)
+        {
+            self.handle(action.clone());
+            return true;
+        }
         let Some((row, col)) = self.shell_cell_at(m.column, m.row) else {
             return false;
         };
@@ -4459,6 +4470,77 @@ impl App {
         self.active_panel_mut().move_cursor(delta);
     }
 
+    /// Which row of an overlay the pointer is on, if it is on one at all.
+    ///
+    /// The overlays all draw one row per line inside the rectangle they
+    /// reported, so this is the same arithmetic every time — worth having once
+    /// rather than four times, because the version that drifts is the one that
+    /// makes a click run the row above the one you aimed at.
+    fn row_at(area: Rect, m: &MouseEvent) -> Option<usize> {
+        let inside = area.width > 0
+            && m.column >= area.x
+            && m.column < area.x + area.width
+            && m.row >= area.y
+            && m.row < area.y + area.height;
+        inside.then(|| (m.row - area.y) as usize)
+    }
+
+    /// The utilities menu, with the pointer.
+    ///
+    /// Every command in this program should be reachable without a keyboard
+    /// that can spell it. Inside a hosted shell the keys belong to the program
+    /// running there, and in a terminal that cannot report modifiers half of
+    /// them never arrive at all — a click is the way in that nothing can
+    /// intercept.
+    fn mouse_utilities(&mut self, m: MouseEvent) {
+        let Mode::Utilities { selected } = self.mode else {
+            return;
+        };
+        let sessions = self.session_menu_rows();
+        let area = self.layout.menu;
+        match m.kind {
+            MouseEventKind::Moved => {
+                if let Some(row) = Self::row_at(area, &m) {
+                    let items = crate::utilities::items(&sessions);
+                    if items.get(row).is_some_and(|i| i.selectable()) {
+                        self.mode = Mode::Utilities { selected: row };
+                    }
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => match Self::row_at(area, &m) {
+                Some(row) => {
+                    if let Some(c) = crate::utilities::at(row, &sessions) {
+                        self.chose(c);
+                    }
+                }
+                // Outside closes it, like every menu anyone has used.
+                None => self.mode = Mode::Normal,
+            },
+            _ => {
+                let _ = selected;
+            }
+        }
+    }
+
+    /// The same for F2's own commands.
+    fn mouse_user_menu(&mut self, m: MouseEvent) {
+        let area = self.layout.menu;
+        match m.kind {
+            MouseEventKind::Moved => {
+                if let Some(row) = Self::row_at(area, &m)
+                    && self.menu_rows.get(row).is_some_and(|r| r.from.is_some())
+                {
+                    self.mode = Mode::UserMenu { selected: row };
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => match Self::row_at(area, &m) {
+                Some(row) => self.choose_menu_row(row),
+                None => self.mode = Mode::Normal,
+            },
+            _ => {}
+        }
+    }
+
     fn mouse_context(&mut self, m: MouseEvent) {
         let Mode::Context { selected, anchor } = self.mode else {
             return;
@@ -4527,6 +4609,12 @@ impl App {
     fn mouse_overlay(&mut self, m: MouseEvent) {
         if let Mode::Context { .. } = self.mode {
             return self.mouse_context(m);
+        }
+        if let Mode::Utilities { .. } = self.mode {
+            return self.mouse_utilities(m);
+        }
+        if let Mode::UserMenu { .. } = self.mode {
+            return self.mouse_user_menu(m);
         }
         if let Mode::Help { scroll } = self.mode {
             return self.mouse_help(m, scroll);
@@ -5072,14 +5160,22 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                let inside = area.width > 0
-                    && m.column >= area.x
-                    && m.column < area.x + area.width
-                    && m.row >= area.y
-                    && m.row < area.y + area.height;
-                if !inside {
+                let Some(row) = Self::row_at(area, &m) else {
                     self.mode = Mode::Normal;
-                }
+                    return;
+                };
+                // Every row of the help already carries the action its key
+                // stands for — they are data, not prose — so the page is also
+                // a list of things you can simply press. That matters most for
+                // the keys this program cannot promise: the ones a hosted
+                // program eats and the ones a terminal cannot spell.
+                let Some(action) = crate::ui::help::action_at(area.width as usize, scroll + row)
+                else {
+                    return;
+                };
+                self.mode = Mode::Normal;
+                self.help_entrance = None;
+                self.handle(action);
             }
             _ => {}
         }
@@ -5888,6 +5984,144 @@ mod tests {
             app.ses().hosted().is_none(),
             "nothing may be running before the answer"
         );
+    }
+
+    // ---- clicking what a keyboard cannot reach ----
+
+    /// The shell's border is the only documentation visible in that view, and
+    /// inside a hosted shell the keyboard belongs to the program running there.
+    /// So each command named on it has to be pressable with the pointer.
+    #[test]
+    fn the_commands_on_the_shell_border_can_be_clicked() {
+        let mut app = fixture();
+        app.handle(Action::ToggleShell);
+        assert_eq!(app.ses().view, View::Shell);
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+
+        let area = app.layout.shell;
+        let border = area.y + area.height;
+        // Every command in the list is reachable, and lands on itself.
+        let (_, spans) = crate::ui::shell::command_line();
+        for ((label, _), (from, to)) in crate::ui::shell::COMMANDS.iter().zip(&spans) {
+            let middle = area.x + ((from + to) / 2) as u16;
+            assert_eq!(
+                crate::ui::shell::command_at(area, middle, border),
+                Some(*label),
+                "the middle of {label:?} does not hit it"
+            );
+        }
+        // And a click there actually does it: `Ctrl-O` leaves the shell.
+        app.on_mouse(click(MouseButton::Left, area.x + 4, border));
+        assert_eq!(app.ses().view, View::Panels, "clicking Ctrl-O did nothing");
+    }
+
+    /// A row of the border is not a row of the shell. A click on the text
+    /// inside must still select, not run a command.
+    #[test]
+    fn a_click_inside_the_shell_is_still_a_selection() {
+        let mut app = fixture();
+        app.handle(Action::ToggleShell);
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let area = app.layout.shell;
+        assert_eq!(
+            crate::ui::shell::command_at(area, area.x + 4, area.y + 1),
+            None,
+            "a row inside the shell answered as a border command"
+        );
+    }
+
+    /// The help's rows carry the actions their keys stand for, so the page is
+    /// also a list of things to press — which is what someone whose terminal
+    /// cannot spell `Ctrl-Shift-H` actually needs.
+    #[test]
+    fn a_row_of_the_help_can_be_clicked_instead_of_typed() {
+        let mut app = fixture();
+        app.on_key(key(KeyCode::F(1)));
+        app.help_entrance = None;
+        let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+
+        let area = app.layout.help;
+        // Find a row that promises something, and click it.
+        let width = area.width as usize;
+        let row = (0..area.height as usize)
+            .find(|&r| crate::ui::help::action_at(width, r).is_some())
+            .expect("no row of the help does anything");
+        let action = crate::ui::help::action_at(width, row).expect("an action");
+
+        app.on_mouse(click(MouseButton::Left, area.x + 2, area.y + row as u16));
+        assert_eq!(app.mode, Mode::Normal, "the help stayed open on {action:?}");
+
+        // A title or a blank promises nothing and must do nothing.
+        let inert = (0..area.height as usize)
+            .find(|&r| crate::ui::help::action_at(width, r).is_none())
+            .expect("the page is all rows");
+        app.on_key(key(KeyCode::F(1)));
+        app.help_entrance = None;
+        app.on_mouse(click(MouseButton::Left, area.x + 2, area.y + inert as u16));
+        assert!(
+            matches!(app.mode, Mode::Help { .. }),
+            "clicking a title did something"
+        );
+    }
+
+    /// F9's menu took the keyboard and ignored the pointer. Every command in
+    /// this program should be reachable without a keyboard that can spell it.
+    #[test]
+    fn the_utilities_menu_answers_the_pointer() {
+        let mut app = fixture();
+        app.handle(Action::UtilitiesMenu);
+        assert!(matches!(app.mode, Mode::Utilities { .. }));
+        let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+
+        let area = app.layout.menu;
+        assert!(area.width > 0, "the menu reported no area to click");
+        // The first row is a real utility; clicking it acts and closes.
+        app.on_mouse(click(MouseButton::Left, area.x + 1, area.y));
+        assert_ne!(
+            app.mode,
+            Mode::Utilities { selected: 0 },
+            "the click did nothing"
+        );
+
+        // And clicking outside closes it, like every menu anyone has used.
+        app.handle(Action::UtilitiesMenu);
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        app.on_mouse(click(MouseButton::Left, 99, 39));
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    /// F2's own commands, with the pointer. Same reason as the utilities: a
+    /// command you can only reach with a key is a command some terminals hide.
+    #[test]
+    fn the_user_menu_answers_the_pointer() {
+        let (mut app, path) = with_directory_menu(DIR_MENU);
+        app.trust
+            .trust(&path, DIR_MENU)
+            .expect("trust it so its rows can be chosen");
+        app.on_key(key(KeyCode::F(2)));
+        assert!(matches!(app.mode, Mode::UserMenu { .. }), "{:?}", app.mode);
+        let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+
+        let area = app.layout.menu;
+        assert!(area.width > 0, "the menu reported no area to click");
+        let row = app
+            .menu_rows
+            .iter()
+            .position(|r| r.from.is_some())
+            .expect("nothing choosable");
+        app.on_mouse(click(MouseButton::Left, area.x + 1, area.y + row as u16));
+        assert_eq!(app.mode, Mode::Normal, "the click did not run anything");
+
+        // Outside closes it.
+        app.on_key(key(KeyCode::F(2)));
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        app.on_mouse(click(MouseButton::Left, 99, 39));
+        assert_eq!(app.mode, Mode::Normal);
     }
 
     // ---- Ctrl-F in the rail ----

@@ -25,6 +25,10 @@ enum Entry {
     Row {
         keys: &'static str,
         prose: String,
+        /// What this row's key does, carried on *every* line of a wrapped
+        /// description rather than only the first: someone clicking a row aimed
+        /// at the row, not at its top line.
+        actions: &'static [crate::action::Action],
     },
 }
 
@@ -44,11 +48,29 @@ fn layout(width: usize) -> Vec<Entry> {
                 out.push(Entry::Row {
                     keys: if j == 0 { row.keys } else { "" },
                     prose,
+                    actions: row.actions,
                 });
             }
         }
     }
     out
+}
+
+/// What the row at `line` does, if it does anything.
+///
+/// The help's rows already carry the actions their keys stand for — they are
+/// data, so the page can be a list of things to press as well as a list of
+/// things to read. That is worth most for exactly the keys this program cannot
+/// promise: the ones a hosted program eats, and the ones a terminal cannot
+/// spell. A note, or a title, or a blank, answers `None`.
+///
+/// The first action when a row lists several: those are the several spellings
+/// of one key, and they mean the same thing.
+pub fn action_at(width: usize, line: usize) -> Option<crate::action::Action> {
+    match layout(width).get(line) {
+        Some(Entry::Row { actions, .. }) => actions.first().cloned(),
+        _ => None,
+    }
 }
 
 /// How many lines the page takes at this width. The caller needs it to clamp
@@ -121,7 +143,7 @@ pub fn draw(frame: &mut Frame, area: Rect, scroll: usize, theme: &Theme) -> Rect
         .map(|e| match e {
             Entry::Blank => Line::from(Span::styled("", base)),
             Entry::Title(t) => Line::from(Span::styled(format!(" {t}"), title)),
-            Entry::Row { keys, prose } => Line::from(vec![
+            Entry::Row { keys, prose, .. } => Line::from(vec![
                 Span::styled(format!("  {keys:<key_w$}  "), key),
                 Span::styled(prose.clone(), base),
             ]),

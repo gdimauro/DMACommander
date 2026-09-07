@@ -231,6 +231,58 @@ fn title_for(
 
 /// Draw the hosted screen into `area`, returning the interior rect so the caller
 /// can keep the PTY the same size as what is visible.
+/// The commands named on the shell's bottom border, in the order they are
+/// drawn, with what each one does.
+///
+/// One list, because the drawing and the click have to agree about where each
+/// word is. This border matters more than any other: inside a hosted shell the
+/// keys belong to the program running there, and in a terminal that cannot
+/// report modifiers half of them never arrive — so for some people this line is
+/// not a reminder of the keys, it *is* the way in.
+pub const COMMANDS: &[(&str, crate::action::Action)] = &[
+    ("Ctrl-O DMAC commander", crate::action::Action::ToggleShell),
+    ("Ctrl-T sessions", crate::action::Action::ToggleRail),
+    ("F9 utilities", crate::action::Action::UtilitiesMenu),
+    ("F12 history", crate::action::Action::DirectoryHistory),
+];
+
+/// The bottom border as one string, and where each command starts within it.
+///
+/// Built rather than written out so that adding a command cannot move a hit
+/// region without moving the word that goes with it.
+pub fn command_line() -> (String, Vec<(usize, usize)>) {
+    let mut text = String::from(" ");
+    let mut spans = Vec::new();
+    for (i, (label, _)) in COMMANDS.iter().enumerate() {
+        if i > 0 {
+            text.push_str(" \u{b7} ");
+        }
+        let from = text.chars().count();
+        text.push_str(label);
+        spans.push((from, text.chars().count()));
+    }
+    text.push(' ');
+    (text, spans)
+}
+
+/// Which command the pointer is on, given where the border was drawn.
+///
+/// `area` is the shell's interior; the border sits one row below it, and the
+/// title starts at its left edge plus the corner.
+pub fn command_at(area: ratatui::layout::Rect, column: u16, row: u16) -> Option<&'static str> {
+    if row != area.y + area.height {
+        return None;
+    }
+    let (_, spans) = command_line();
+    // The title is drawn from the block's left edge, inside the corner.
+    let at = column.checked_sub(area.x)? as usize;
+    COMMANDS
+        .iter()
+        .zip(spans)
+        .find(|(_, (from, to))| at >= *from && at < *to)
+        .map(|((label, _), _)| *label)
+}
+
 pub fn draw(frame: &mut Frame, area: Rect, shell: &Hosted, c: &Chrome<'_>, theme: &Theme) -> Rect {
     let Chrome {
         focused,
@@ -285,9 +337,9 @@ pub fn draw(frame: &mut Frame, area: Rect, shell: &Hosted, c: &Chrome<'_>, theme
                         " \u{2191} {n} back \u{b7} Ctrl-Shift-C copy \u{b7} Esc clear \
                          \u{b7} Ctrl-O commander "
                     ),
-                    (false, 0) => " Ctrl-O DMAC commander \u{b7} Ctrl-T sessions \
-                                   \u{b7} F9 utilities \u{b7} F12 history "
-                        .to_string(),
+                    // From the one list the click also reads, so a command
+                    // and the place you press it cannot drift apart.
+                    (false, 0) => command_line().0,
                     (false, n) => format!(
                         " \u{2191} {n} lines back \u{b7} Esc back to live \
                          \u{b7} Ctrl-O commander "

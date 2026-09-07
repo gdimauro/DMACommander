@@ -52,6 +52,29 @@ system before any terminal sees it. Where `Cmd` bindings are listed they only
 apply to terminals configured to forward the Command key, which is not the
 default anywhere.
 
+## The third way in: click it
+
+Every key this page apologises for has a place on screen you can press instead,
+and the pointer is the one input nothing intercepts — not a hosted program, not
+a terminal that cannot spell a modifier.
+
+```
+the shell's bottom border   Ctrl-O · Ctrl-T · F9 · F12, each one clickable
+the F-key bar               F1..F10
+the help page (F1)          every row that names a key runs it
+the utilities menu (F9)     hover highlights, click chooses
+your own menu (F2)          the same
+the session rail (Ctrl-T)   click a session, drag its edge to resize
+```
+
+The shell's border matters most. Inside a hosted shell the keyboard belongs to
+the program running there — that is the whole point of hosting it — so for some
+terminals that line is not a reminder of the keys, it *is* the way in.
+
+The help page is the general answer: its rows already carry the actions their
+keys stand for, so it is a list of things to press as well as a list of things
+to read. If a key will not reach this program, open `F1` and click the row.
+
 ## The two ways in
 
 ### `Ctrl-O` and one letter
