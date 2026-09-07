@@ -58,7 +58,7 @@ the real scrollable page. A key during the arrival lands the page *and* still
 does what it says, because a key that only cancels an animation is a key that
 did not do what it was pressed for.
 
-## 3. Every function key does something — *next*
+## 3. Every function key does something — *half done*
 
 Thirteen keys still answer "not implemented yet", which is worse than a key that
 does nothing: it is a key that promises.
@@ -71,6 +71,15 @@ does nothing: it is a key that promises.
 
 **Done when:** no user-facing key answers "not implemented yet", and every
 destructive one is covered by a test that proves it verifies before it deletes.
+
+**Where it stands.**
+
+- `F2` **done** — the user menu, with a trust model. See `docs/USER-MENU.md`.
+- `F3` **done** — the viewer, in `dmac-view`: text or hex, capped read, search.
+- `F4` **done** — opens the file in the editor you already have.
+- `F5`, `F6`, `F7`, `F8` — waiting on the file operations engine, which is
+  being built in `crates/dmac-core/src/fileops/`. They are four keys over one
+  engine, so none of them lands before it does.
 
 ## 4. Settings, with the agent, the model and the editor in them
 
