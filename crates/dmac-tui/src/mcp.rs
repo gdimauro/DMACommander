@@ -1,5 +1,10 @@
 //! The commander, as tools an agent can call.
 //!
+//! **Before changing how a tool decides which session it acts on, read
+//! `docs/AGENT-SESSIONS.md`.** An agent whose session has been closed used to
+//! be handed whatever was on screen, and its next `cd` moved a workspace that
+//! had nothing to do with it.
+//!
 //! [`dmac_mcp`] owns the protocol; this owns the answers. Every tool here runs
 //! on the UI thread, in between frames, with the whole application in hand — no
 //! locks, no snapshots, no chance of reporting a panel that has since moved.
@@ -897,6 +902,51 @@ mod tool_tests {
 
         app.mcp_session = None;
         assert_eq!(app.mcp_state()["session"]["name"], "elsewhere");
+    }
+
+    /// The guard, enumerated from the catalogue rather than from a list kept
+    /// here by hand.
+    ///
+    /// Every tool the catalogue marks [`Scope::Session`] acts on one session's
+    /// own state, so an agent whose session has been closed must be refused
+    /// rather than handed whatever is on screen. A tool added later as
+    /// session-scoped that forgets to ask fails *this* test, which is the whole
+    /// point of the scope being data: the list cannot drift from the guard,
+    /// because there is only one list.
+    #[tokio::test]
+    async fn every_session_scoped_tool_refuses_an_agent_whose_session_is_gone() {
+        let scoped = dmac_mcp::tools::session_scoped();
+        assert!(!scoped.is_empty(), "the catalogue says nothing is scoped");
+
+        for tool in scoped {
+            let mut app = crate::app::App::for_test();
+            app.handle(crate::action::Action::NewSession);
+            let doomed = app.sessions.at(1).id;
+            app.sessions.close(1).expect("close");
+            let before = app.sessions.current().cwd[0].display();
+            app.mcp_session = Some(doomed);
+
+            // Arguments good enough for each tool to get past its own parsing
+            // and reach the guard. A tool that rejects these for another reason
+            // still passes — what is asserted is that it does not *act*.
+            let args = serde_json::json!({
+                "path": "/tmp",
+                "panel": "left",
+                "names": ["a"],
+                "line": "echo hello",
+                "run": false,
+            });
+            let answer = app.call(tool, &args);
+            assert!(
+                answer.is_err(),
+                "{tool} acted for an agent whose session is gone: {answer:?}"
+            );
+            assert_eq!(
+                app.sessions.current().cwd[0].display(),
+                before,
+                "{tool} moved the user's panel"
+            );
+        }
     }
 
     /// The one that scattered a workspace. An agent whose session has been

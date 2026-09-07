@@ -1,3 +1,8 @@
+//! **Before changing anything here, read `docs/AGENT-SESSIONS.md`.** It lists
+//! the properties that must hold however this works, and what it looked like
+//! the afternoon one of them did not — including the regression that was argued
+//! into this very file.
+//!
 //! Recognising a hosted agent — Claude Code, in practice — and bringing it back
 //! with the session it belongs to.
 //!
@@ -1032,6 +1037,97 @@ mod tests {
             assert!(!out.contains("session-id"), "{line:?} became {out:?}");
             assert!(!out.contains("1234"), "{line:?} became {out:?}");
             assert!(!out.contains("nope"), "{line:?} became {out:?}");
+        }
+    }
+
+    /// The invariant, over the whole space of saved lines rather than over the
+    /// cases somebody thought of.
+    ///
+    /// **A resumed agent must land in a conversation that belongs to this
+    /// session — never one chosen by a default.** Every line either names the
+    /// session's own conversation, or carries a rule whose answer is local
+    /// (`-c` continues the most recent *here*; a fork makes a new one). Nothing
+    /// may come back carrying a selector with no value, because that is a
+    /// picker, and a picker's default is the most recent conversation anywhere.
+    ///
+    /// This is written as a property and not as a list of examples on purpose.
+    /// The regression it exists to stop was argued into the code: the old test
+    /// defended the *mechanism* — "a bare `--resume` opens the most recent" —
+    /// and when that description turned out to be inaccurate, the behaviour it
+    /// was protecting went with it. A test that asserts the consequence cannot
+    /// be reasoned past, because the consequence is the thing that matters and
+    /// it does not depend on how any CLI happens to word its help.
+    #[test]
+    fn a_resumed_agent_never_lands_in_a_conversation_chosen_by_a_default() {
+        let ours = "ffffffff-0000-4000-8000-000000000000";
+        let theirs = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let json = "{\"mcpServers\":{\"dmac\":{\"args\":[\"--mcp\",\"/tmp/a b.sock\"]}}}";
+
+        let lines = [
+            // Nothing at all.
+            "claude".to_string(),
+            // Ours, both ways round.
+            format!("claude --session-id {ours}"),
+            format!("claude --resume {ours}"),
+            format!("claude --resume={ours}"),
+            // Somebody else's, which the session must adopt rather than argue
+            // with — the agent is the authority on where it is.
+            format!("claude --resume {theirs} --model opus"),
+            format!("/opt/bin/claude -r {theirs}"),
+            // Pickers, in every shape they arrive in.
+            "claude --resume".to_string(),
+            "claude -r".to_string(),
+            "claude --resume auth".to_string(),
+            "claude --resume=auth".to_string(),
+            "claude --session-id".to_string(),
+            "claude --session-id notauuid".to_string(),
+            // Rules whose answer is local.
+            "claude -c".to_string(),
+            "claude --continue --model opus".to_string(),
+            format!("claude --resume {theirs} --fork-session"),
+            // As `ps` really hands them over: one argv, rejoined, quoting gone.
+            format!("/Users/x/.local/bin/claude --mcp-config {json} --resume"),
+            format!("/Users/x/.local/bin/claude --mcp-config {json} --resume {theirs}"),
+        ];
+
+        for saved in &lines {
+            // What the session would be moved onto first, exactly as the
+            // frontend does it before building the command.
+            let adopted = conversation_of(saved).unwrap_or_else(|| ours.to_string());
+            let line = resume_command("3", &adopted, saved);
+
+            // Never a selector standing on its own: that is a picker, and it is
+            // also how an id that went missing reaches the shell.
+            for (i, w) in line.split_whitespace().enumerate() {
+                if matches!(w, "--resume" | "-r" | "--session-id") {
+                    let next = line.split_whitespace().nth(i + 1);
+                    assert!(
+                        next.is_some_and(|v| !v.starts_with('-')),
+                        "{saved:?} came back with a bare {w}: {line}"
+                    );
+                }
+            }
+
+            // And exactly one answer to the question, however it is spelled.
+            let named = line.contains("\"$DMAC_CONVERSATION\"");
+            let local_rule = line
+                .split_whitespace()
+                .any(|w| matches!(w, "-c" | "--continue" | "--fork-session"));
+            assert!(
+                named || local_rule,
+                "{saved:?} came back answering to nothing this session owns: {line}"
+            );
+            assert!(
+                !(named && local_rule) || line.contains("--fork-session"),
+                "{saved:?} came back asking twice: {line}"
+            );
+
+            // Nothing of the run that ended: its socket died with it.
+            assert!(!line.contains("mcpServers"), "{saved:?} -> {line}");
+            assert!(!line.contains('{'), "{saved:?} -> {line}");
+            // And no raw id on a command line that has to survive a shell.
+            assert!(!line.contains(ours), "{saved:?} -> {line}");
+            assert!(!line.contains(theirs), "{saved:?} -> {line}");
         }
     }
 

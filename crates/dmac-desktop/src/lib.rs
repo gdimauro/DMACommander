@@ -1097,4 +1097,46 @@ mod tests {
             println!("  {:>50}: {:?}", dir.display(), editor_frame_for(dir));
         }
     }
+
+    /// The rule that keeps this from rearranging somebody's desk, enforced
+    /// rather than merely written down.
+    ///
+    /// Matching a window by its title is a guess — the editor titles a window
+    /// `file \u{2014} folder` and puts its own notes in between. A wrong guess
+    /// about which window to *raise* brings the wrong project forward, which is
+    /// visible and undone by looking away. A wrong guess about which window to
+    /// *move* takes something a person arranged and puts it somewhere else.
+    ///
+    /// So: a script that takes a title must not move anything, and a script
+    /// that moves something must not take a title — it places the window that
+    /// just appeared, counted rather than matched.
+    #[test]
+    fn a_title_decides_what_to_raise_and_never_what_to_move() {
+        // `argv[1]` is the title in both of the scripts that take one.
+        for (name, script) in [("frame", FRAME_SCRIPT), ("raise", RAISE_SCRIPT)] {
+            assert!(script.contains("argv[1]"), "{name} takes no title");
+            for moves in [".position =", ".size =", "position\"] =", "['position']"] {
+                assert!(
+                    !script.contains(moves),
+                    "{name} matches by title and then moves a window"
+                );
+            }
+        }
+        // And the two that place windows identify them by counting, never by
+        // name: neither may mention a window title at all.
+        for (name, script) in [("tile", TILE_SCRIPT), ("restore", RESTORE_SCRIPT)] {
+            assert!(
+                script.contains("existing"),
+                "{name} places without waiting for the window it asked for"
+            );
+            assert!(script.contains("windows("), "{name} does not count windows");
+        }
+        // The tiling script reads the front window's *title* only to stop
+        // waiting — never to choose one. If that ever becomes a choice, this
+        // catches it.
+        assert!(
+            TILE_SCRIPT.contains("used only to stop waiting, never to choose a window"),
+            "the note explaining why a title appears in the tiling script is gone"
+        );
+    }
 }

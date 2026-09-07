@@ -20,10 +20,32 @@ history, the sessions, and the shell it hosts — which is very likely the shell
 you are running in. Prefer `state` before acting, so you are working from where \
 the user actually is rather than from where they were when they last told you.";
 
-/// One entry: the name, what it is for, and the arguments it takes.
+/// What a tool acts on, which decides what happens when the agent calling it
+/// has no session any more.
+///
+/// Data rather than a rule in somebody's head, because it is what the guard is
+/// derived from *and* what the test that enforces the guard enumerates. A tool
+/// added without thinking about this fails that test rather than shipping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// Reads or writes one session's own state. An agent whose session has been
+    /// closed must be refused: falling back to whichever session is on screen
+    /// hands it somebody else's workspace, and its next call moves panels that
+    /// have nothing to do with it.
+    Session,
+    /// Reads only, and answering about the session on screen is a reasonable
+    /// answer for a bridge that named no session — a person running the tools
+    /// by hand means "here".
+    Reading,
+    /// Not about a session at all: the whole window, or the process.
+    Window,
+}
+
+/// One entry: the name, what it is for, what it acts on, and its arguments.
 struct Tool {
     name: &'static str,
     description: &'static str,
+    scope: Scope,
     /// `(name, type, required, description)`.
     args: &'static [(&'static str, &'static str, bool, &'static str)],
 }
@@ -34,12 +56,14 @@ const TOOLS: &[Tool] = &[
         description: "Where the commander is right now: the current session, both panels with \
                       their directory, cursor and selection, which panel is active, and whether \
                       the panels or the hosted shell are on screen. Cheap; call it first.",
+        scope: Scope::Reading,
         args: &[],
     },
     Tool {
         name: "list",
         description: "The entries of a directory, with kind and size. Defaults to the active \
                       panel's directory, which is usually what is meant by \"here\".",
+        scope: Scope::Reading,
         args: &[
             (
                 "path",
@@ -58,6 +82,7 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "navigate",
         description: "Take a panel to a directory. The user sees it move.",
+        scope: Scope::Session,
         args: &[
             (
                 "path",
@@ -77,6 +102,7 @@ const TOOLS: &[Tool] = &[
         name: "select",
         description: "Set, add to, or clear a panel's selection by name. This is the selection \
                       the user's own F5/F6/F8 keys would act on, so say what you selected.",
+        scope: Scope::Session,
         args: &[
             (
                 "names",
@@ -103,6 +129,7 @@ const TOOLS: &[Tool] = &[
         description: "Put a line on the command line, and optionally run it in the session's \
                       shell. Running it is visible and irreversible — it is the user's shell, in \
                       the user's directory. Prefer run=false and let them press Enter.",
+        scope: Scope::Session,
         args: &[
             ("line", "string", true, "The command line."),
             (
@@ -117,6 +144,7 @@ const TOOLS: &[Tool] = &[
         name: "history",
         description: "Directories the panels have visited, across every session and across \
                       restarts. Good for \"where was that project again\".",
+        scope: Scope::Reading,
         args: &[
             (
                 "order",
@@ -137,11 +165,13 @@ const TOOLS: &[Tool] = &[
         name: "sessions",
         description: "Every open session: name, directories, whether it is hosting an agent, and \
                       which one is on screen.",
+        scope: Scope::Window,
         args: &[],
     },
     Tool {
         name: "switch_session",
         description: "Bring a session to the screen, by name or by position.",
+        scope: Scope::Window,
         args: &[
             ("name", "string", false, "Session name."),
             (
@@ -156,11 +186,13 @@ const TOOLS: &[Tool] = &[
         name: "notify",
         description: "Put a line in the commander's status bar. The way to tell the user \
                       something without interrupting what they are typing.",
+        scope: Scope::Window,
         args: &[("message", "string", true, "One short line.")],
     },
     Tool {
         name: "recycle",
         description: "Rebuild the commander and restart it in place, keeping the same terminal,                       the same sessions and the same conversation. Only rebuilds when it is                       running from its own source tree; a released binary just restarts.                       Nothing is torn down unless the build succeeds — a failed build leaves                       everything exactly as it was, with the compiler's complaint in the status                       bar. Note that this restarts whatever is hosted inside it, including you:                       say what you are doing before you call it.",
+        scope: Scope::Window,
         args: &[(
             "build",
             "boolean",
@@ -173,6 +205,7 @@ const TOOLS: &[Tool] = &[
         description: "The commander's screen as text, exactly as rendered. Use it to see what \
                       the user is seeing — including the output of whatever is running in the \
                       hosted shell.",
+        scope: Scope::Window,
         args: &[],
     },
 ];
@@ -218,6 +251,19 @@ pub fn catalogue() -> Vec<Value> {
 }
 
 /// The tool names, for anyone that needs to check its dispatch is complete.
+/// The tools that act on one session, by name.
+///
+/// The frontend derives its guard from this and its test enumerates it, so a
+/// tool that is added as [`Scope::Session`] and then forgets to check gets
+/// caught rather than shipped.
+pub fn session_scoped() -> Vec<&'static str> {
+    TOOLS
+        .iter()
+        .filter(|t| t.scope == Scope::Session)
+        .map(|t| t.name)
+        .collect()
+}
+
 pub fn names() -> Vec<&'static str> {
     TOOLS.iter().map(|t| t.name).collect()
 }
