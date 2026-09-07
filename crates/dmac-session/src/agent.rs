@@ -181,40 +181,41 @@ fn forks(line: &str) -> bool {
         .any(|w| w == "--fork-session" || w.starts_with("--fork-session="))
 }
 
-/// Whether the line settles the conversation in a way only the agent can
-/// resolve.
+/// Whether the line settles the conversation in a way that still belongs to
+/// this session.
 ///
-/// `-c` continues the most recent; a bare `--resume` opens a picker, with an
-/// optional search term; `--fork-session` makes a new one. All are the user
-/// saying how they want to get back, and none can be turned into an id from out
-/// here — so the honest thing on the next run is to hand them the same choice
-/// rather than to answer it quietly with a conversation of our own.
+/// `-c` continues the most recent conversation *in this directory* and
+/// `--fork-session` makes a new one: both are rules whose answer is this
+/// session's, so replaying them is faithful.
+///
+/// A **bare `--resume` is not**, and that is a correction. It opens a picker
+/// whose default is the most recent conversation anywhere. Replaying one used
+/// to be justified as handing the user back their own choice; restarting with
+/// nine sessions puts nine pickers on screen, the obvious thing to do with each
+/// is press Enter, and nine sessions land in whichever conversation was touched
+/// last. One belongs there. The other eight are in somebody else's.
+///
+/// It is silent and it perpetuates itself: the running process still shows only
+/// `claude --resume`, so nothing out here can learn where that session went,
+/// its stored conversation stays unrelated to what is on screen, and the next
+/// restart does it again.
 fn picks_its_own(line: &str) -> bool {
     // A fork that was told which id to become has not chosen anything — we did,
-    // and we know it. Only an undirected fork is out of our reach.
+    // and we know it. Only an undirected fork is out of our reach, and a fresh
+    // fork is at worst a new conversation, never somebody else's.
     if forks(line) && dictated(line).is_none() {
         return true;
     }
     if dictated(line).is_some() {
         return false;
     }
-    let mut words = line.split_whitespace().peekable();
-    while let Some(w) = words.next() {
-        match w.split_once('=') {
-            Some(("-c" | "--continue", _)) => return true,
-            // A search term is a picker, not an id.
-            Some(("--resume" | "-r", v)) if !looks_like_conversation(v) => return true,
-            Some(_) => {}
-            None => match w {
-                "-c" | "--continue" => return true,
-                "--resume" | "-r" if !words.peek().is_some_and(|v| looks_like_conversation(v)) => {
-                    return true;
-                }
-                _ => {}
-            },
-        }
-    }
-    false
+    // `-c` continues the most recent conversation *in this directory* — a rule
+    // that produces an answer belonging to this session. A bare `--resume` is
+    // not that, and is deliberately absent here: see the note above.
+    line.split_whitespace().any(|w| {
+        let head = w.split_once('=').map_or(w, |(k, _)| k);
+        matches!(head, "-c" | "--continue")
+    })
 }
 
 /// What to run to get this conversation back, as something a shell can be
@@ -287,18 +288,14 @@ pub fn as_resume(line: &str) -> String {
                 Some(v) if looks_like_conversation(v) => {
                     words.next();
                 }
-                // `--resume` takes an optional search term and opens a picker
-                // on it. That is the user's own way of choosing, and it comes
-                // back exactly as they typed it.
+                // A picker, with or without a search term. It does *not* come
+                // back — see [`picks_its_own`] — and the session's own
+                // conversation goes on instead, which is the one this program
+                // can actually name.
                 Some(v) if w != "--session-id" && !v.starts_with('-') => {
-                    let term = (*v).to_string();
                     words.next();
-                    out.push(w.to_string());
-                    out.push(term);
                 }
-                // A bare `--resume` is that picker with no search term: kept,
-                // for the same reason.
-                _ if w != "--session-id" => out.push(w.to_string()),
+                _ if w != "--session-id" => {}
                 // `--session-id` takes a UUID and nothing else, so anything
                 // else is a line that could not have started. Both halves go.
                 Some(v) if !v.starts_with('-') => {
@@ -309,14 +306,9 @@ pub fn as_resume(line: &str) -> String {
             "--fork-session" if born => {}
             _ if w.starts_with("--fork-session=") && born => {}
             _ if w.starts_with("--mcp-config=") || w.starts_with("--session-id=") => {}
-            _ if w.starts_with("--resume=") || w.starts_with("-r=") => {
-                match w.split_once('=').map(|(_, v)| v) {
-                    // Ours to put back as the variable, as above.
-                    Some(v) if looks_like_conversation(v) => {}
-                    // A search term for the picker; theirs, kept.
-                    _ => out.push(w.to_string()),
-                }
-            }
+            // An id of ours goes back on as the variable; a picker's search
+            // term is dropped, for the reason above.
+            _ if w.starts_with("--resume=") || w.starts_with("-r=") => {}
             _ => out.push(w.to_string()),
         }
     }
@@ -1015,12 +1007,12 @@ mod tests {
             as_resume("claude --session-id 1234 --model opus"),
             "claude --model opus"
         );
-        // `--resume` is different: its value is optional and, when it is not an
-        // id, it is a search term for the picker. That is the user choosing how
-        // to get back, and it comes back as they typed it.
+        // A `--resume` whose value is not an id is a search term for the
+        // picker, and a picker does not come back — see
+        // `a_picker_never_comes_back_because_its_default_is_somebody_else`.
         assert_eq!(
             as_resume("/opt/bin/claude --resume=abc --permission-mode auto"),
-            "claude --resume=abc --permission-mode auto"
+            "claude --permission-mode auto"
         );
     }
 
@@ -1043,37 +1035,58 @@ mod tests {
         }
     }
 
-    /// `--resume` with no id is the interactive picker — `claude --help` says
-    /// so: *"Resume a conversation by session ID, or open interactive picker
-    /// with optional search term"*. It is the user's own way of choosing, and a
-    /// hosted shell is a terminal, so the picker appears there exactly as it
-    /// did the first time.
+    /// The one that got found in the field, and it was mine.
     ///
-    /// This used to be dropped and replaced with the session's own
-    /// conversation, on the belief that a bare `--resume` silently opens the
-    /// most recent. It does not, and the substitution was the harm: someone who
-    /// picked a different conversation from that list got put back into the
-    /// commander's one, silently, on every restart.
+    /// A bare `--resume` opens a picker whose default is the most recent
+    /// conversation anywhere. Replaying one used to be justified as handing the
+    /// user back their own choice. Restarting with nine sessions puts nine
+    /// pickers on screen, the obvious thing to do with each is press Enter, and
+    /// nine sessions land in whichever conversation was touched last: one of
+    /// them belongs there and the other eight are in somebody else's.
+    ///
+    /// It is also silent and self-perpetuating — the running process still
+    /// shows only `claude --resume`, so nothing out here can ever learn where
+    /// that session went.
     #[test]
-    fn a_picker_is_the_user_choosing_and_comes_back_as_a_picker() {
-        for line in ["claude --resume", "/abs/claude -r", "claude --resume auth"] {
-            let out = as_resume(line);
+    fn a_picker_never_comes_back_because_its_default_is_somebody_else() {
+        let ours = "ffffffff-0000-4000-8000-000000000000";
+        for saved in [
+            "claude --resume",
+            "/abs/claude -r",
+            "claude --resume auth",
+            "claude --resume=auth --model opus",
+            // Exactly as `ps` reported it in the field, with the commander's
+            // own configuration alongside it.
+            "claude --resume --mcp-config {\"mcpServers\":{}}",
+        ] {
+            let line = resume_command("3", ours, saved);
             assert!(
-                out.contains("--resume") || out.contains("-r"),
-                "{line:?} became {out:?}, which answers a question the user asked to be asked"
+                line.contains("\"$DMAC_CONVERSATION\""),
+                "{saved:?} came back without a conversation this session owns: {line}"
+            );
+            // Exactly one selector, whichever of the two it is: which flag
+            // depends on whether the agent's own store already holds that
+            // conversation, and that is not what this test is about.
+            assert_eq!(
+                line.matches("--resume").count() + line.matches("--session-id").count(),
+                1,
+                "{saved:?} became {line:?}, which asks twice or not at all"
             );
         }
-        // And nothing of ours is added on top of it: two ways of choosing a
-        // conversation on one line is one way too many.
-        let resumed = resume_command(
-            "3",
-            "ffffffff-0000-4000-8000-000000000000",
-            "claude --resume",
-        );
+        // What the user chose *besides* the picker is still theirs.
         assert!(
-            !resumed.contains("ffffffff-0000-4000-8000-000000000000"),
-            "the commander answered the picker for them: {resumed}"
+            resume_command("3", ours, "claude --resume=auth --model opus").contains("--model opus")
         );
+    }
+
+    /// `-c` is different and is kept: it continues the most recent conversation
+    /// *in this directory*, a rule whose answer belongs to this session rather
+    /// than to whatever was last touched anywhere.
+    #[test]
+    fn continuing_here_is_a_rule_and_survives() {
+        let line = resume_command("3", "ffffffff-0000-4000-8000-000000000000", "claude -c");
+        assert!(line.contains("-c"), "{line}");
+        assert!(!line.contains("$DMAC_CONVERSATION"), "two answers: {line}");
     }
 
     /// Everything the user chose is part of what they set up, and giving back

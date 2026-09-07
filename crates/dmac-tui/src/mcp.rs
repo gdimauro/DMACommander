@@ -52,9 +52,37 @@ impl App {
     /// This is the difference between an agent that can see its own panels and
     /// one that reports on whichever session the user last clicked.
     fn mcp_index(&self) -> usize {
-        self.mcp_session
-            .and_then(|id| self.sessions.all().iter().position(|s| s.id == id))
-            .unwrap_or_else(|| self.sessions.current_index())
+        self.mcp_target()
+            .unwrap_or_else(|_| self.sessions.current_index())
+    }
+
+    /// The same, but saying so when the session an agent named is gone.
+    ///
+    /// `mcp_index` falls back to whatever is on screen, which is right for a
+    /// bridge that named no session at all — a person running the tools by hand
+    /// means "here". It is badly wrong for an agent whose session has been
+    /// closed: the fallback hands it the user's current session, and the next
+    /// `cd` moves panels in a workspace that has nothing to do with it. That is
+    /// how a set of sessions ends up pointing at each other's directories, with
+    /// nothing on screen to say why.
+    ///
+    /// So anything that *writes* asks this instead and refuses when the answer
+    /// is gone. A tool that reports an error is recoverable; one that silently
+    /// acts on somebody else's workspace is not.
+    fn mcp_target(&self) -> Result<usize, String> {
+        let Some(id) = self.mcp_session else {
+            return Ok(self.sessions.current_index());
+        };
+        self.sessions
+            .all()
+            .iter()
+            .position(|s| s.id == id)
+            .ok_or_else(|| {
+                format!(
+                    "session {} is gone \u{2014} it was closed while you were running",
+                    id.0
+                )
+            })
     }
 
     fn mcp_state(&self) -> Value {
@@ -166,7 +194,7 @@ impl App {
     }
 
     fn mcp_navigate(&mut self, args: &Value) -> Result<Value, String> {
-        let index = self.mcp_index();
+        let index = self.mcp_target()?;
         let panel = arg_panel(args, self.sessions.at(index).active)?;
         let path = arg_str(args, "path").ok_or("navigate needs a path")?;
         let resolved = self.mcp_resolve_for(index, panel, path)?;
@@ -183,7 +211,7 @@ impl App {
     }
 
     fn mcp_select(&mut self, args: &Value) -> Result<Value, String> {
-        let index = self.mcp_index();
+        let index = self.mcp_target()?;
         let panel = arg_panel(args, self.sessions.at(index).active)?;
         let mode = arg_str(args, "mode").unwrap_or("set");
         let names: Vec<String> = args
@@ -234,7 +262,7 @@ impl App {
     }
 
     fn mcp_command(&mut self, args: &Value) -> Result<Value, String> {
-        let index = self.mcp_index();
+        let index = self.mcp_target()?;
         let line = arg_str(args, "line")
             .ok_or("command needs a line")?
             .to_string();
@@ -869,6 +897,45 @@ mod tool_tests {
 
         app.mcp_session = None;
         assert_eq!(app.mcp_state()["session"]["name"], "elsewhere");
+    }
+
+    /// The one that scattered a workspace. An agent whose session has been
+    /// closed used to fall back to whatever the user was looking at, so its
+    /// next `cd` moved panels in somebody else's workspace — with nothing on
+    /// screen to say why, and the wrong directory saved at shutdown.
+    ///
+    /// A tool that reports an error is recoverable. One that quietly acts on
+    /// the wrong workspace is not.
+    #[tokio::test]
+    async fn an_agent_whose_session_is_gone_moves_nobody_elses_panels() {
+        let mut app = crate::app::App::for_test();
+        app.handle(crate::action::Action::NewSession);
+        let doomed = app.sessions.at(1).id;
+        app.sessions.close(1).expect("close");
+        assert_eq!(app.sessions.len(), 1);
+
+        let before = app.sessions.current().cwd[0].display();
+        app.mcp_session = Some(doomed);
+
+        let answer = app.mcp_navigate(&serde_json::json!({ "path": "/tmp" }));
+        assert!(answer.is_err(), "it moved a panel it does not own");
+        assert!(
+            answer.unwrap_err().contains("gone"),
+            "and it has to say why, or the agent retries for ever"
+        );
+        assert_eq!(
+            app.sessions.current().cwd[0].display(),
+            before,
+            "the user's panel moved"
+        );
+
+        // A bridge that named no session at all still means "here": that is a
+        // person running the tools by hand, not an agent that lost its home.
+        app.mcp_session = None;
+        assert!(
+            app.mcp_navigate(&serde_json::json!({ "path": "/tmp" }))
+                .is_ok()
+        );
     }
 
     #[tokio::test]
