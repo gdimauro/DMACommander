@@ -247,6 +247,38 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         crate::app::Mode::Picker { selected } => {
             app.layout.picker = picker::draw(frame, area, dmac_fx::catalog(), selected, theme);
         }
+        crate::app::Mode::ConfirmDelete => {
+            let n = app.delete_count();
+            let what = match n {
+                1 => "Delete this item?".to_string(),
+                n => format!("Delete {n} items?"),
+            };
+            prompt::draw(
+                frame,
+                area,
+                " Delete ",
+                &format!("{what}   (to the trash)   y / n"),
+                theme,
+            );
+        }
+        crate::app::Mode::Conflict => {
+            // What is in the way, and every way out of it. A conflict dialog
+            // that does not name the file is one you answer by guessing.
+            let text = app
+                .conflict
+                .as_ref()
+                .map(|p| p.conflict().destination.path.display().to_string())
+                .unwrap_or_default();
+            prompt::draw(
+                frame,
+                area,
+                " Already there ",
+                &format!(
+                    "{text}   O overwrite · S skip · R rename · N if newer · Esc abort   (Shift = all)"
+                ),
+                theme,
+            );
+        }
         crate::app::Mode::UserMenu { selected } => {
             // The rows were built when the menu opened. Drawing from that list
             // rather than rebuilding one here is what keeps a click, a letter

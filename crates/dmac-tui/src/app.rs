@@ -64,6 +64,9 @@ pub(crate) enum Update {
     /// shutdown, so a commander that never gets to shut down still leaves
     /// behind what its agents were.
     Agents(Vec<(SessionId, Option<String>)>),
+    /// Something happened in a running file operation. Forwarded from the
+    /// engine's own channel so the loop can wait on one thing rather than two.
+    Job(Box<dmac_core::JobEvent>),
     /// Where a session's editor window is, read off the window server away from
     /// the render loop. `None` means it has none open any more.
     EditorFrame {
@@ -162,6 +165,10 @@ pub(crate) enum Mode {
     UserMenu {
         selected: usize,
     },
+    /// F8 asked, and is waiting to be told yes.
+    ConfirmDelete,
+    /// A file operation stopped on something already in the way.
+    Conflict,
     /// The directory history. Which of the three orders is showing lives on
     /// `App`, not here: it should survive closing and reopening the list.
     History {
@@ -204,6 +211,14 @@ pub(crate) enum PromptIntent {
     NewSession,
     /// What to look for in the file being viewed.
     ViewSearch,
+    /// Where F5 copies to, and where F6 moves to. Pre-filled with the other
+    /// panel's directory, which is what an orthodox file manager means by
+    /// "the other panel is the destination".
+    CopyTo,
+    MoveTo,
+    /// F7. May be several components deep — typing `a/b/c` and getting three
+    /// levels is what every one of these programs does.
+    MakeDirectory,
 }
 
 impl PromptIntent {
@@ -212,6 +227,9 @@ impl PromptIntent {
             PromptIntent::RenameSession(_) => " Rename session ",
             PromptIntent::NewSession => " New session ",
             PromptIntent::ViewSearch => " Find ",
+            PromptIntent::CopyTo => " Copy to ",
+            PromptIntent::MoveTo => " Move to ",
+            PromptIntent::MakeDirectory => " Make directory ",
         }
     }
 }
@@ -383,6 +401,16 @@ pub struct App {
     /// The rows F2 is showing, built when it opens so that drawing, clicking
     /// and pressing a letter cannot disagree about what is on screen.
     pub(crate) menu_rows: Vec<MenuRow>,
+    /// The file operation running, if one is. One at a time on purpose: two
+    /// jobs writing into the same directory is a conflict neither of them can
+    /// see, and a queue is a feature to add once anyone wants it.
+    pub(crate) job: Option<dmac_core::JobHandle>,
+    /// The last progress report, for the status line.
+    pub(crate) job_progress: Option<dmac_core::fileops::Progress>,
+    /// A question the engine is blocked on. It holds the reply channel, so
+    /// dropping it *is* an answer — the job aborts without touching the file it
+    /// asked about, which is the safe direction.
+    pub(crate) conflict: Option<dmac_core::fileops::ConflictPrompt>,
     /// Full screen: the frame stripped off, leaving only contents on black.
     pub(crate) fullscreen: bool,
     /// Agents from the last run, waiting for an answer to "resume?".
@@ -625,6 +653,9 @@ impl App {
             menu_directory: None,
             trust: dmac_config::menu::TrustStore::load(),
             menu_rows: Vec::new(),
+            job: None,
+            job_progress: None,
+            conflict: None,
             cursor_style: cursor,
             cursor_phase: std::time::Instant::now(),
             theme: Theme::default(),
@@ -937,6 +968,7 @@ impl App {
                 items,
             } => self.apply_completion(session, generation, start, items),
             Update::Editor(Ok(message) | Err(message)) => self.status = message,
+            Update::Job(event) => self.job_event(*event),
             Update::Agents(seen) => self.record_agents(&seen),
             Update::EditorFrame { session, window } => {
                 if let Some(i) = self.sessions.index_of_id(session)
@@ -1234,10 +1266,10 @@ impl App {
             UserMenu => self.open_user_menu(),
             View => self.open_viewer(),
             Edit => self.edit_here(),
-            Copy => self.status = self.pending_op("F5 copy"),
-            Move => self.status = self.pending_op("F6 move"),
-            MakeDir => self.status = "F7 mkdir — not implemented yet".into(),
-            Delete => self.status = self.pending_op("F8 delete"),
+            Copy => self.ask_destination(PromptIntent::CopyTo),
+            Move => self.ask_destination(PromptIntent::MoveTo),
+            MakeDir => self.open_prompt(PromptIntent::MakeDirectory, String::new()),
+            Delete => self.ask_delete(),
             Unimplemented(what) => self.status = format!("{what} — not implemented yet"),
         }
     }
@@ -1616,6 +1648,49 @@ impl App {
                 // From before the first, so stepping forward lands on it.
                 self.view_match = usize::MAX;
                 self.step_match(1, hex);
+            }
+            PromptIntent::CopyTo | PromptIntent::MoveTo => {
+                self.mode = Mode::Normal;
+                let sources = match self.operand_paths() {
+                    Ok(s) => s,
+                    Err(why) => {
+                        self.status = why;
+                        return;
+                    }
+                };
+                let destination = std::path::PathBuf::from(value.trim());
+                if destination.as_os_str().is_empty() {
+                    self.status = "no destination".into();
+                    return;
+                }
+                let job = match intent {
+                    PromptIntent::MoveTo => dmac_core::Job::Move {
+                        sources,
+                        destination,
+                    },
+                    _ => dmac_core::Job::Copy {
+                        sources,
+                        destination,
+                    },
+                };
+                self.start_job(job);
+            }
+            PromptIntent::MakeDirectory => {
+                self.mode = Mode::Normal;
+                let name = value.trim().to_string();
+                if name.is_empty() {
+                    self.status = "no name".into();
+                    return;
+                }
+                let cwd = self.ses().cwd[Self::idx(self.ses().active)].clone();
+                if !cwd.is_local() {
+                    self.status = "only local directories so far".into();
+                    return;
+                }
+                self.start_job(dmac_core::Job::MakeDirectory {
+                    parent: cwd.as_path().to_path_buf(),
+                    name,
+                });
             }
             PromptIntent::NewSession => {
                 let name = if value.trim().is_empty() {
@@ -2618,14 +2693,6 @@ impl App {
         }
     }
 
-    /// Report what an unimplemented operation *would* act on. Even before the
-    /// engine exists, this proves the selection model is right.
-    fn pending_op(&self, label: &str) -> String {
-        let p = self.ses().active_panel();
-        let n = p.operands().len();
-        format!("{label}: {n} item(s) selected — engine not implemented yet")
-    }
-
     /// Route one terminal event.
     ///
     /// Order matters: a running effect gets first refusal (so a game keeps its
@@ -2681,6 +2748,8 @@ impl App {
             Mode::Help { scroll } => return self.help_key(k, scroll),
             Mode::View { scroll, hex } => return self.view_key(k, scroll, hex),
             Mode::UserMenu { selected } => return self.user_menu_key(k, selected),
+            Mode::ConfirmDelete => return self.confirm_delete_key(k),
+            Mode::Conflict => return self.conflict_key(k),
             Mode::Context { selected, anchor } => return self.context_key(k, selected, anchor),
             Mode::Rail { selected } => return self.rail_key(k, selected),
             Mode::Prompt { intent } => return self.prompt_key(k, intent),
@@ -3019,6 +3088,206 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    // ---- F5, F6, F7, F8: bytes actually move ----
+
+    /// The files a file operation would act on, as full paths.
+    ///
+    /// Through `sources_from`, which treats joining a name to a location as a
+    /// security boundary rather than a formatting step: an entry's name came
+    /// from a backend listing, and a listing that names `../../.ssh/authorized_keys`
+    /// is a file manager writing wherever the server chose.
+    fn operand_paths(&self) -> std::result::Result<Vec<std::path::PathBuf>, String> {
+        let session = self.ses();
+        let i = Self::idx(session.active);
+        let here = &session.cwd[i];
+        if !here.is_local() {
+            return Err("file operations only work on local directories so far".into());
+        }
+        let entries = session.panels[i].operands();
+        if entries.is_empty() {
+            return Err("nothing selected".into());
+        }
+        dmac_core::fileops::sources_from(here.as_path(), &entries).map_err(|e| e.to_string())
+    }
+
+    /// F5 and F6: ask where, with the other panel pre-filled.
+    ///
+    /// The other panel being the destination is what an orthodox file manager
+    /// means by having two of them, and pre-filling it rather than assuming it
+    /// leaves the answer visible and editable — which matters, because the next
+    /// keypress moves files.
+    fn ask_destination(&mut self, intent: PromptIntent) {
+        if self.job.is_some() {
+            self.status = "one file operation at a time \u{2014} this one is still running".into();
+            return;
+        }
+        if let Err(why) = self.operand_paths() {
+            self.status = why;
+            return;
+        }
+        let session = self.ses();
+        let other = session.cwd[1 - Self::idx(session.active)].clone();
+        let prefilled = match other.is_local() {
+            true => other.as_path().display().to_string(),
+            false => String::new(),
+        };
+        self.open_prompt(intent, prefilled);
+    }
+
+    /// F8: ask before, not report after.
+    fn ask_delete(&mut self) {
+        if self.job.is_some() {
+            self.status = "one file operation at a time \u{2014} this one is still running".into();
+            return;
+        }
+        match self.operand_paths() {
+            Ok(_) => self.mode = Mode::ConfirmDelete,
+            Err(why) => self.status = why,
+        }
+    }
+
+    /// How many things F8 is about to take, for the question.
+    pub(crate) fn delete_count(&self) -> usize {
+        let session = self.ses();
+        session.panels[Self::idx(session.active)].operands().len()
+    }
+
+    fn confirm_delete_key(&mut self, k: KeyEvent) {
+        match k.code {
+            KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
+                self.mode = Mode::Normal;
+                let targets = match self.operand_paths() {
+                    Ok(t) => t,
+                    Err(why) => {
+                        self.status = why;
+                        return;
+                    }
+                };
+                // The trash, unless someone explicitly asks otherwise. A delete
+                // you can undo is worth the seconds it costs, and this program's
+                // third rule is that data is never lost.
+                self.start_job(dmac_core::Job::Delete {
+                    targets,
+                    mode: dmac_core::fileops::DeleteMode::Trash,
+                });
+            }
+            _ => self.mode = Mode::Normal,
+        }
+    }
+
+    /// Start a job and pipe its events into this loop.
+    ///
+    /// The engine reports on its own channel; forwarding into the one the loop
+    /// already waits on means the loop waits on one thing rather than two, and
+    /// a file operation is drawn by exactly the same frame as everything else.
+    fn start_job(&mut self, job: dmac_core::Job) {
+        let options = dmac_core::FileOpOptions::default();
+        let (handle, mut events) = match dmac_core::fileops::spawn(job, options) {
+            Ok(pair) => pair,
+            Err(e) => {
+                self.status = format!("could not start: {e}");
+                return;
+            }
+        };
+        self.job = Some(handle);
+        self.job_progress = None;
+        let tx = self.tx.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                while let Some(e) = events.recv().await {
+                    if tx.send(Update::Job(Box::new(e))).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    }
+
+    /// One report from a running job.
+    fn job_event(&mut self, event: dmac_core::JobEvent) {
+        use dmac_core::JobEvent as E;
+        match event {
+            E::Started(_) => self.status = "working\u{2026}".into(),
+            E::Progress(p) => {
+                self.status = Self::progress_line(&p);
+                self.job_progress = Some(p);
+            }
+            E::Conflict(prompt) => {
+                self.conflict = Some(prompt);
+                self.mode = Mode::Conflict;
+            }
+            E::Warning(w) => self.status = format!("{}: {}", w.path.display(), w.detail),
+            E::Failure(f) => self.status = f.to_string(),
+            E::Finished(outcome) => {
+                self.job = None;
+                self.job_progress = None;
+                self.status = Self::outcome_line(&outcome);
+                // Both panels: a copy changes the destination, a move changes
+                // both, and working out which is cheaper than being wrong.
+                self.reload(PanelId::Left);
+                self.reload(PanelId::Right);
+            }
+        }
+    }
+
+    fn progress_line(p: &dmac_core::fileops::Progress) -> String {
+        let name = p
+            .current
+            .as_ref()
+            .and_then(|c| c.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        // Totals are `None` until the scan finishes, and showing a zero there
+        // is what produces a bar that jumps backwards.
+        match p.files_total {
+            Some(total) => format!("{:?} {}/{total} \u{b7} {name}", p.phase, p.files_done),
+            None => format!("{:?} {} \u{b7} {name}", p.phase, p.files_done),
+        }
+    }
+
+    fn outcome_line(o: &dmac_core::fileops::Outcome) -> String {
+        let mut line = format!("{:?}: {} file(s)", o.status, o.files_done);
+        if o.skipped > 0 {
+            line.push_str(&format!(", {} skipped", o.skipped));
+        }
+        // Said out loud and with the first one named. "3 failures" with no
+        // indication of which is a message that sends someone hunting.
+        if let Some(first) = o.failures.first() {
+            line.push_str(&format!(
+                ", {} failed \u{2014} {first}",
+                o.failures.len() + o.failures_omitted as usize
+            ));
+        }
+        line
+    }
+
+    /// Answering the engine's question.
+    ///
+    /// Shift on any of them means "and every one after it". `Esc` aborts, which
+    /// is also what dropping the prompt does — the job stops without touching
+    /// the file it asked about.
+    fn conflict_key(&mut self, k: KeyEvent) {
+        use dmac_core::fileops::{ConflictChoice, Resolution};
+        let all = k.modifiers.contains(KeyModifiers::SHIFT);
+        let choice = match k.code {
+            KeyCode::Char('o' | 'O') => ConflictChoice::Overwrite,
+            KeyCode::Char('s' | 'S') => ConflictChoice::Skip,
+            KeyCode::Char('r' | 'R') => ConflictChoice::AutoRename,
+            KeyCode::Char('n' | 'N') => ConflictChoice::OverwriteIfNewer,
+            KeyCode::Esc | KeyCode::Char('a' | 'A') => ConflictChoice::Abort,
+            _ => return,
+        };
+        // Worked out before the choice is moved into the answer.
+        let apply_to_all = all && choice != ConflictChoice::Abort;
+        if let Some(prompt) = self.conflict.take() {
+            prompt.answer(Resolution {
+                choice,
+                apply_to_all,
+            });
+        }
+        self.mode = Mode::Normal;
     }
 
     // ---- F2, the user's own commands ----
@@ -5341,8 +5610,22 @@ mod tests {
     #[test]
     fn clicking_the_fifth_cell_of_the_fkey_bar_is_copy() {
         let mut app = with_layout(fixture());
+        // Onto a real file: `..` is never an operand, so with the cursor on it
+        // F5 has nothing to copy and says so instead of asking where to.
+        app.ses_mut().panels[0].move_to(1);
         app.on_mouse(click(MouseButton::Left, 36, 23)); // 36/8 = cell 4 -> F5
-        assert!(app.status.contains("F5 copy"), "got {:?}", app.status);
+        assert_eq!(
+            app.mode,
+            Mode::Prompt {
+                intent: PromptIntent::CopyTo
+            },
+            "got {:?} / {:?}",
+            app.mode,
+            app.status
+        );
+        // Pre-filled with the other panel, which is what having two of them
+        // means in an orthodox file manager.
+        assert!(!app.prompt_value.is_empty(), "no destination offered");
     }
 
     // ---- the software cursor ----

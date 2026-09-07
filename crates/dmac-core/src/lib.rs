@@ -13,12 +13,14 @@
 pub mod clipboard;
 pub mod complete;
 pub mod entry;
+pub mod fileops;
 pub mod fuzzy;
 pub mod history;
 pub mod panel;
 pub mod tools;
 
 pub use entry::{Entry, EntryKind, SortKey, SortOrder};
+pub use fileops::{Job, JobEvent, JobHandle, Options as FileOpOptions};
 pub use panel::{Panel, PanelId};
 
 /// Errors that escape the core layer.

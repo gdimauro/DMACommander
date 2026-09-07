@@ -13,8 +13,19 @@ workspace = true
 
 [dependencies]
 arboard = { version = "3.6.1", default-features = false }
+blake3 = "1.8.7"
+filetime = "0.2.29"
 getrandom = "0.3.4"
 jiff = "0.2.35"
+reflink-copy = "0.1.30"
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.20"
+tokio = { version = "1.53.1", default-features = false, features = ["sync"] }
+trash = "5.2.7"
 uuid = { version = "1.11.0", features = ["v4"] }
+
+[target."cfg(unix)".dependencies]
+xattr = "1.6.1"
+
+[dev-dependencies]
+tempfile = "3.27.0"
