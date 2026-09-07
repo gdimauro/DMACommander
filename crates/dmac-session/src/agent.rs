@@ -121,19 +121,49 @@ fn looks_like_conversation(w: &str) -> bool {
 /// where it ended up. `--fork-session` is `None` too — it resumes under a *new*
 /// id, so the one on the line is the parent and not what is running.
 pub fn conversation_of(line: &str) -> Option<String> {
+    // `--session-id` first, and on its own terms: it names the conversation the
+    // agent will *be in*, which is not always the one `--resume` names. A fork
+    // is exactly that case — `--resume <parent> --fork-session --session-id
+    // <new>` starts from the parent's history and becomes `<new>` — and it is
+    // how a session opened beside another one is started, so getting this
+    // precedence wrong would resume every sibling into its mother.
+    if let Some(id) = dictated(line) {
+        return Some(id);
+    }
+    // Nothing dictated, and it forks: the id on the line is the parent's, and
+    // what is actually running has an id nobody outside has been told.
     if forks(line) {
         return None;
     }
     let mut words = line.split_whitespace().peekable();
     while let Some(w) = words.next() {
         let named = match w.split_once('=') {
-            Some(("--session-id" | "--resume" | "-r", v)) => Some(v.to_string()),
-            _ if matches!(w, "--session-id" | "--resume" | "-r") => {
-                words.peek().map(|v| (*v).to_string())
-            }
+            Some(("--resume" | "-r", v)) => Some(v.to_string()),
+            _ if matches!(w, "--resume" | "-r") => words.peek().map(|v| (*v).to_string()),
             _ => None,
         };
         if let Some(v) = named
+            && looks_like_conversation(&v)
+        {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// The conversation id the line *dictates*, with `--session-id`.
+///
+/// Split out because it outranks everything else on the line: whatever else is
+/// there, this is the conversation the agent ends up in.
+fn dictated(line: &str) -> Option<String> {
+    let mut words = line.split_whitespace().peekable();
+    while let Some(w) = words.next() {
+        let v = match w.split_once('=') {
+            Some(("--session-id", v)) => Some(v.to_string()),
+            _ if w == "--session-id" => words.peek().map(|v| (*v).to_string()),
+            _ => None,
+        };
+        if let Some(v) = v
             && looks_like_conversation(&v)
         {
             return Some(v);
@@ -160,8 +190,13 @@ fn forks(line: &str) -> bool {
 /// here — so the honest thing on the next run is to hand them the same choice
 /// rather than to answer it quietly with a conversation of our own.
 fn picks_its_own(line: &str) -> bool {
-    if forks(line) {
+    // A fork that was told which id to become has not chosen anything — we did,
+    // and we know it. Only an undirected fork is out of our reach.
+    if forks(line) && dictated(line).is_none() {
         return true;
+    }
+    if dictated(line).is_some() {
+        return false;
     }
     let mut words = line.split_whitespace().peekable();
     while let Some(w) = words.next() {
@@ -210,6 +245,12 @@ fn picks_its_own(line: &str) -> bool {
 /// user back in a conversation they had left. What is on the line is what was
 /// running; the session follows it, not the other way round.
 pub fn as_resume(line: &str) -> String {
+    // A fork happens once, at birth. The conversation it produced exists now
+    // and has an id of its own, so coming back to it is an ordinary resume —
+    // replaying the fork would start a *new* conversation every restart, each
+    // one branching from the same mother and none of them the one the user was
+    // in yesterday.
+    let born = dictated(line).is_some();
     let mut out: Vec<String> = Vec::new();
     let mut words = line.split_whitespace().peekable();
 
@@ -265,6 +306,8 @@ pub fn as_resume(line: &str) -> String {
                 }
                 _ => {}
             },
+            "--fork-session" if born => {}
+            _ if w.starts_with("--fork-session=") && born => {}
             _ if w.starts_with("--mcp-config=") || w.starts_with("--session-id=") => {}
             _ if w.starts_with("--resume=") || w.starts_with("-r=") => {
                 match w.split_once('=').map(|(_, v)| v) {
@@ -342,6 +385,7 @@ pub fn environment(
     session_id: &str,
     session_name: &str,
     conversation: &str,
+    parent_conversation: Option<&str>,
 ) -> Vec<(String, String)> {
     let mut env = vec![
         ("DMAC_SESSION".to_string(), session_name.to_string()),
@@ -358,6 +402,9 @@ pub fn environment(
     }
     if let Some(config) = mcp_config(session_id) {
         env.push((MCP_CONFIG_VAR.to_string(), config));
+    }
+    if let Some(parent) = parent_conversation {
+        env.push((PARENT_VAR.to_string(), parent.to_string()));
     }
     env
 }
@@ -408,6 +455,46 @@ pub fn start_command(session_id: &str, conversation: &str, theirs: &str) -> Stri
         line.push(' ');
         line.push_str(theirs);
     }
+    if mcp_config(session_id).is_some() {
+        line.push_str(&format!(" --mcp-config \"${MCP_CONFIG_VAR}\""));
+    }
+    line
+}
+
+/// The variable carrying the conversation a sibling is forked *from*.
+///
+/// Set only on a session that was opened beside another one, and spent only by
+/// [`fork_command`]. Like the others it travels as a variable rather than as
+/// thirty-six characters on a line nobody can check by eye.
+const PARENT_VAR: &str = "DMAC_PARENT_CONVERSATION";
+
+/// What to type to start an agent that begins where another one is.
+///
+/// `claude --resume <mother> --fork-session --session-id <ours>`: it reads the
+/// mother's whole history, then becomes a conversation of its own and diverges.
+/// That is what "beside this one" has to mean — a second agent that starts by
+/// knowing everything the first one knows, rather than an empty one sitting
+/// next to it that has to be told the problem again.
+///
+/// The `--session-id` is not optional and is the difference between a good idea
+/// and a working one. Without it the fork picks an id nobody outside is told,
+/// and the sibling is unresumable: tomorrow there is a session in the rail whose
+/// conversation cannot be named. With it we choose the id up front, so the
+/// sibling comes back exactly like any other session. The combination is
+/// accepted — checked against the real CLI, which parses all three and then
+/// complains only about a mother that does not exist.
+pub fn fork_command(session_id: &str, theirs: &str) -> String {
+    let mut line = format!(
+        "{} --resume \"${PARENT_VAR}\" --fork-session --session-id \"${CONVERSATION_VAR}\"",
+        attached_program()
+    );
+    let theirs = theirs.trim();
+    if !theirs.is_empty() {
+        line.push(' ');
+        line.push_str(theirs);
+    }
+    // Last, as always: it takes several values and swallows every following
+    // word that does not begin with a dash.
     if mcp_config(session_id).is_some() {
         line.push_str(&format!(" --mcp-config \"${MCP_CONFIG_VAR}\""));
     }
@@ -570,7 +657,7 @@ mod tests {
             if rest.contains("--mcp-config") {
                 let named = format!("${MCP_CONFIG_VAR}");
                 assert!(rest.contains(&named), "{line} does not use {named}");
-                let env = environment("3", "work", "11111111-2222-3333-4444-555555555555");
+                let env = environment("3", "work", "11111111-2222-3333-4444-555555555555", None);
                 assert!(
                     env.iter().any(|(k, _)| k == MCP_CONFIG_VAR),
                     "the line spends {MCP_CONFIG_VAR}, which nothing sets"
@@ -580,7 +667,7 @@ mod tests {
             panic!("the line must start with the program: {line}");
         }
         // The same coupling for the conversation, which is always spent.
-        let env = environment("3", "work", "11111111-2222-3333-4444-555555555555");
+        let env = environment("3", "work", "11111111-2222-3333-4444-555555555555", None);
         assert!(line.contains(&format!("${CONVERSATION_VAR}")), "{line}");
         assert!(
             env.iter().any(|(k, _)| k == CONVERSATION_VAR),
@@ -701,6 +788,81 @@ mod tests {
         );
     }
 
+    /// A session opened beside another starts *in* its history: that is what
+    /// "beside" means, and an empty agent sitting next to a full one has to be
+    /// told the problem all over again.
+    ///
+    /// The `--session-id` is the difference between a good idea and a working
+    /// one. Without it the fork becomes an id nobody outside is told, and the
+    /// sibling is unresumable — tomorrow there is a session in the rail whose
+    /// conversation cannot be named.
+    #[test]
+    fn a_forked_sibling_starts_in_its_mother_and_keeps_an_id_of_its_own() {
+        let line = fork_command("3", "--model opus");
+        assert!(line.starts_with(attached_program()), "{line}");
+        assert!(line.contains("--fork-session"), "{line}");
+        assert!(
+            line.contains("--resume \"$DMAC_PARENT_CONVERSATION\""),
+            "{line}"
+        );
+        assert!(
+            line.contains("--session-id \"$DMAC_CONVERSATION\""),
+            "{line}"
+        );
+        assert!(line.contains("--model opus"), "{line}");
+        // Both ids travel as variables: neither has to survive being quoted
+        // through a shell, and the line stays one a person can read.
+        assert!(!line.contains('{'), "{line}");
+        // The environment sets both of the variables the line spends.
+        let env = environment(
+            "3",
+            "work",
+            "11111111-2222-4333-8444-555555555555",
+            Some("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"),
+        );
+        for var in ["DMAC_CONVERSATION", "DMAC_PARENT_CONVERSATION"] {
+            assert!(
+                env.iter().any(|(k, _)| k == var),
+                "{var} is spent and unset"
+            );
+        }
+        // And a session that was not opened beside anything is not given one.
+        let plain = environment("3", "work", "11111111-2222-4333-8444-555555555555", None);
+        assert!(!plain.iter().any(|(k, _)| k == "DMAC_PARENT_CONVERSATION"));
+    }
+
+    /// The one that would have been found in a week's time. A fork happens
+    /// once, at birth; replaying it would branch a *new* conversation on every
+    /// restart, each from the same mother and none of them yesterday's.
+    #[test]
+    fn a_fork_is_resumed_and_never_forked_again() {
+        let born = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let mother = "ffffffff-0000-4000-8000-000000000000";
+        let seen = format!(
+            "/opt/bin/claude --resume {mother} --fork-session --session-id {born} --model opus"
+        );
+
+        // The conversation that is running is the one it *became*, not the one
+        // it came from. Getting this backwards resumes every sibling into its
+        // mother, which is the same conversation twice and neither of them
+        // where the user was.
+        assert_eq!(conversation_of(&seen).as_deref(), Some(born));
+
+        let line = resume_command("3", born, &seen);
+        assert!(
+            !line.contains("--fork-session"),
+            "it would branch a new conversation on every restart: {line}"
+        );
+        assert!(line.contains("--model opus"), "{line}");
+        assert!(!line.contains(mother), "the mother is on the line: {line}");
+        assert!(line.contains("\"$DMAC_CONVERSATION\""), "{line}");
+        assert_eq!(
+            line.matches("--session-id").count() + line.matches("--resume").count(),
+            1,
+            "{line}"
+        );
+    }
+
     /// `-c` continues the most recent conversation in that directory. It is a
     /// complete answer on its own, so nothing of ours goes with it: a line
     /// carrying both `-c` and a conversation id asks the agent two things at
@@ -775,7 +937,7 @@ mod tests {
     /// shim's whole trouble, and the environment is what is left of it.
     #[test]
     fn the_environment_never_touches_the_path() {
-        let env = environment("3", "work", "11111111-2222-3333-4444-555555555555");
+        let env = environment("3", "work", "11111111-2222-3333-4444-555555555555", None);
         assert!(
             !env.iter().any(|(k, _)| k == "PATH"),
             "the hosted shell's PATH is the user's, not ours"

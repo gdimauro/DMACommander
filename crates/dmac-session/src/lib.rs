@@ -121,6 +121,14 @@ pub struct Session {
     /// it takes to make an equivalent one — which is the only sense in which a
     /// window can be "restored" across a restart at all.
     pub editor: Option<EditorWindow>,
+    /// The conversation this session was forked from, when it was opened
+    /// beside another one.
+    ///
+    /// A snapshot taken at birth, and persisted: the fork happens once, and it
+    /// has to still be possible tomorrow if the commander was closed before the
+    /// agent was ever started. Once the sibling's own conversation exists this
+    /// is only history — coming back to it is an ordinary resume of its own id.
+    pub parent_conversation: Option<String>,
     /// The session this one was opened beside, if it was.
     ///
     /// Two levels and no more. A session either stands on its own or hangs off
@@ -186,6 +194,7 @@ impl Session {
             cwd_owed: false,
             conversation: None,
             editor: None,
+            parent_conversation: None,
             parent: None,
             collapsed: false,
             // A session made now is listed by whoever made it.
@@ -280,7 +289,8 @@ impl Session {
     fn agent_environment(&mut self) -> Vec<(String, String)> {
         let (id, name) = (self.id.0.to_string(), self.name.clone());
         let conversation = self.conversation_id().to_string();
-        agent::environment(&id, &name, &conversation)
+        let parent = self.parent_conversation.clone();
+        agent::environment(&id, &name, &conversation, parent.as_deref())
     }
 
     /// The attached agent running in this session's shell right now, if any.
@@ -632,6 +642,9 @@ impl SessionManager {
         self.next_id += 1;
         let mut session = Session::new(id, name, left, right);
         session.parent = Some(parent);
+        // The mother's conversation, as it is now. This is what lets the agent
+        // started here begin where hers is rather than from nothing.
+        session.parent_conversation = self.sessions.get(pos).and_then(|p| p.conversation.clone());
         self.sessions.insert(at, session);
         // A group you have just added to is a group you want to see.
         if let Some(p) = self.sessions.get_mut(pos) {

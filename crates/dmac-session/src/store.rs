@@ -112,6 +112,12 @@ struct PersistedSession {
     /// exactly right: nothing was recorded, so nothing is reopened.
     #[serde(default)]
     editor: Option<crate::EditorWindow>,
+    /// The conversation this session was forked from, if it was opened beside
+    /// another. Kept because the fork may not have happened yet: close the
+    /// commander before ever starting the agent and it still has to be possible
+    /// tomorrow.
+    #[serde(default)]
+    parent_conversation: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -315,6 +321,7 @@ fn persist(s: &Session) -> PersistedSession {
         parent: None,
         collapsed: s.collapsed,
         editor: s.editor.clone(),
+        parent_conversation: s.parent_conversation.clone(),
         command_line: s.command_line.clone(),
         agent: s.agent.clone(),
         panels: [
@@ -351,6 +358,7 @@ fn apply(session: &mut Session, saved: &PersistedSession) {
     // back on the screen it was on rather than wherever the window server feels
     // like putting a fresh one.
     session.editor = saved.editor.clone();
+    session.parent_conversation = saved.parent_conversation.clone();
     // Nothing has been listed yet; the first visit does that.
     session.loaded = false;
     session.command_line = saved.command_line.clone();
