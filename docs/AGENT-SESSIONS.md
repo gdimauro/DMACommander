@@ -128,8 +128,8 @@ nothing to do with it — with nothing on screen to say why, and the wrong
 directory written to the session file at shutdown.
 
 The visible symptom was a set of sessions whose names and directories had
-drifted apart: a session called `CAEP.Modeler` sitting in
-`SemolificioLoiudice.AI/docs`, and nine of eleven right-hand panels showing `/`.
+drifted apart — a session named after one project sitting in another project's
+directory — and nine of eleven right-hand panels showing `/`.
 
 An error is recoverable. Quietly acting on the wrong workspace is not.
 
