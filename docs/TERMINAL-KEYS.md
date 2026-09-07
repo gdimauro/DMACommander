@@ -137,9 +137,21 @@ it is open.
 
 ```
 Ctrl-T  or  Shift-Tab    open the rail (it takes the keyboard)
+  Ctrl-F                 search it; type a name, Esc clears before it closes
+  Space                  fold a group away, or open it
+  a                      a session beside this one, with an agent that
+                         starts knowing what this one knows
+  Enter / n / r / d      switch · new · rename · close
   Left / Right, - / +    make it narrower or wider
 drag its right-hand edge  the same, with the pointer, open or not
 ```
+
+The search narrows and never reorders: the digit beside each session is its
+`Alt`+digit shortcut, and sorting by how well a row matched would make every one
+of those digits point somewhere else while you are reading them. The letters it
+matched are picked out inside the name, because saying only *that* a row matched
+hides *where* — which is the half you want when two sessions are called almost
+the same thing.
 
 `Shift-Tab` opens it **from the panels only**. Inside a shell that key belongs to
 whatever is hosted — it is how `claude` cycles its permission modes — so it goes

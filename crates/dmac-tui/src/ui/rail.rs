@@ -82,6 +82,7 @@ pub(crate) fn colour(c: SessionColor) -> Color {
 /// the same arithmetic that drew it.
 pub fn session_at_row(
     sessions: &SessionManager,
+    rows: &[usize],
     area: Rect,
     detail: bool,
     row: u16,
@@ -89,8 +90,7 @@ pub fn session_at_row(
     if row < area.y || row >= area.y + area.height {
         return None;
     }
-    let rows = sessions.visible();
-    let offset = scroll_offset(sessions, area.height, detail);
+    let offset = scroll_offset(sessions, rows, area.height, detail);
     let local = (row - area.y) as usize;
     let nth = if detail {
         offset + local / ROWS_PER_SESSION
@@ -104,11 +104,11 @@ pub fn session_at_row(
 }
 
 /// First visible session, chosen so the current one is always on screen.
-fn scroll_offset(sessions: &SessionManager, height: u16, detail: bool) -> usize {
+fn scroll_offset(sessions: &SessionManager, rows: &[usize], height: u16, detail: bool) -> usize {
     let per = if detail { ROWS_PER_SESSION } else { 1 };
     let visible = (height as usize / per).max(1);
-    // Counted in drawn rows, so a folded group scrolls as the one row it is.
-    let rows = sessions.visible();
+    // Counted in drawn rows, so a folded group scrolls as the one row it is —
+    // and so a search scrolls through what it found.
     let current = rows
         .iter()
         .position(|&i| i == sessions.current_index())
@@ -122,6 +122,19 @@ fn scroll_offset(sessions: &SessionManager, height: u16, detail: bool) -> usize 
     }
 }
 
+/// An open search over the sessions: what is being typed, and a way to ask
+/// which characters of a given session's name it hit.
+///
+/// A pair rather than two parameters because they are meaningless apart — a
+/// needle with no way to ask where it landed cannot highlight anything, and
+/// positions with no needle have nothing to label the box with. `None` means no
+/// search is open, and then the box is not drawn at all rather than drawn
+/// empty: an empty box in a list of sessions looks like a session with no name.
+pub struct Search<'a> {
+    pub needle: &'a str,
+    pub hit: &'a dyn Fn(usize) -> Vec<usize>,
+}
+
 /// `highlight` is the row the keyboard is on while the rail is being driven,
 /// which is not the same as the session on screen — you can move the cursor
 /// over a session without switching to it, exactly as in any list.
@@ -129,7 +142,9 @@ pub fn draw(
     frame: &mut Frame,
     area: Rect,
     sessions: &SessionManager,
+    rows: &[usize],
     highlight: Option<usize>,
+    search: Option<Search<'_>>,
     theme: &Theme,
 ) -> Rect {
     if area.width == 0 || area.height == 0 {
@@ -151,6 +166,18 @@ pub fn draw(
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(theme.panel_border).bg(theme.panel_bg))
         .style(theme.panel());
+    // On the border rather than as a row: a search box that takes a line takes
+    // it from the sessions, which is the thing being searched.
+    let block = match (detail, search.as_ref()) {
+        (true, Some(s)) => block.title_bottom(Span::styled(
+            format!(" / {}\u{2588} ", s.needle),
+            Style::default()
+                .fg(theme.selected_fg)
+                .bg(theme.panel_bg)
+                .add_modifier(Modifier::BOLD),
+        )),
+        _ => block,
+    };
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -158,11 +185,11 @@ pub fn draw(
         return inner;
     }
 
-    let offset = scroll_offset(sessions, inner.height, detail);
+    let offset = scroll_offset(sessions, rows, inner.height, detail);
     let current = sessions.current_index();
     let mut lines: Vec<Line> = Vec::with_capacity(inner.height as usize);
 
-    for i in sessions.visible().into_iter().skip(offset) {
+    for i in rows.iter().copied().skip(offset) {
         if lines.len() >= inner.height as usize {
             break;
         }
@@ -222,19 +249,26 @@ pub fn draw(
             format!("{marker} ")
         };
         let room = (inner.width as usize).saturating_sub(3 + lead.width() + number.width());
-        lines.push(Line::from(vec![
+        let mut spans = vec![
             Span::styled(
                 lead,
                 Style::default().fg(theme.status_fg).bg(theme.panel_bg),
             ),
             Span::styled(dot.to_string(), dot_style),
             Span::styled(" ", Style::default().bg(theme.panel_bg)),
-            Span::styled(fit(&session.name, room), name_style),
-            Span::styled(
-                format!(" {number} "),
-                Style::default().fg(theme.status_fg).bg(theme.panel_bg),
-            ),
-        ]));
+        ];
+        // The letters the search actually matched, picked out inside the name.
+        // Highlighting the whole row would say *that* it matched and hide
+        // *where*, which is the half you are looking for when two sessions are
+        // called almost the same thing.
+        let hits = search.as_ref().map(|s| (s.hit)(i)).unwrap_or_default();
+        let shown = fit(&session.name, room);
+        spans.extend(name_spans(&shown, &hits, name_style, theme));
+        spans.push(Span::styled(
+            format!(" {number} "),
+            Style::default().fg(theme.status_fg).bg(theme.panel_bg),
+        ));
+        lines.push(Line::from(spans));
 
         if lines.len() < inner.height as usize {
             lines.push(Line::from(Span::styled(
@@ -255,6 +289,43 @@ pub fn draw(
 
     frame.render_widget(Paragraph::new(lines).style(theme.panel()), inner);
     inner
+}
+
+/// A name, split so the characters a search matched can be picked out.
+///
+/// `hits` are character positions in the *whole* name; the name drawn here may
+/// have been clipped, so anything past its end is dropped rather than shifted —
+/// a highlight on the wrong letter is worse than none.
+///
+/// Positions are characters and the slicing is by byte, so each span is cut at
+/// a boundary the string actually has. A session called `résumé` is why.
+fn name_spans(name: &str, hits: &[usize], plain: Style, theme: &Theme) -> Vec<Span<'static>> {
+    if hits.is_empty() {
+        return vec![Span::styled(name.to_string(), plain)];
+    }
+    let lit = Style::default()
+        .fg(theme.selected_fg)
+        .bg(theme.panel_bg)
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+
+    let mut spans = Vec::new();
+    let mut run = String::new();
+    let mut run_lit = false;
+    for (i, c) in name.chars().enumerate() {
+        let on = hits.contains(&i);
+        if on != run_lit && !run.is_empty() {
+            spans.push(Span::styled(
+                std::mem::take(&mut run),
+                if run_lit { lit } else { plain },
+            ));
+        }
+        run_lit = on;
+        run.push(c);
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(run, if run_lit { lit } else { plain }));
+    }
+    spans
 }
 
 /// Clip from the end, for names.
@@ -372,7 +443,7 @@ mod tests {
         };
         for target in [0usize, 5, 12, 19] {
             m.switch_to(target);
-            let offset = scroll_offset(&m, area.height, true);
+            let offset = scroll_offset(&m, &m.visible(), area.height, true);
             let visible = area.height as usize / ROWS_PER_SESSION;
             assert!(
                 (offset..offset + visible).contains(&target),
@@ -390,9 +461,9 @@ mod tests {
             width: EXPANDED_WIDTH,
             height: 12,
         };
-        assert_eq!(session_at_row(&m, area, true, 0), Some(0));
-        assert_eq!(session_at_row(&m, area, true, 3), Some(1));
-        assert_eq!(session_at_row(&m, area, true, 6), Some(2));
+        assert_eq!(session_at_row(&m, &m.visible(), area, true, 0), Some(0));
+        assert_eq!(session_at_row(&m, &m.visible(), area, true, 3), Some(1));
+        assert_eq!(session_at_row(&m, &m.visible(), area, true, 6), Some(2));
     }
 
     #[test]
@@ -404,8 +475,8 @@ mod tests {
             width: EXPANDED_WIDTH,
             height: 30,
         };
-        assert_eq!(session_at_row(&m, area, true, 27), None);
-        assert_eq!(session_at_row(&m, area, true, 99), None);
+        assert_eq!(session_at_row(&m, &m.visible(), area, true, 27), None);
+        assert_eq!(session_at_row(&m, &m.visible(), area, true, 99), None);
     }
 
     /// The keyboard highlight is independent of which session is on screen:
@@ -426,7 +497,7 @@ mod tests {
                 width: EXPANDED_WIDTH,
                 height: 14,
             };
-            draw(f, a, &m, Some(3), &theme);
+            draw(f, a, &m, &m.visible(), Some(3), None, &theme);
         })
         .unwrap();
         assert_eq!(m.current_index(), 0, "drawing must not switch sessions");
@@ -441,8 +512,8 @@ mod tests {
             width: COLLAPSED_WIDTH,
             height: 10,
         };
-        assert_eq!(session_at_row(&m, area, false, 0), Some(0));
-        assert_eq!(session_at_row(&m, area, false, 2), Some(2));
+        assert_eq!(session_at_row(&m, &m.visible(), area, false, 0), Some(0));
+        assert_eq!(session_at_row(&m, &m.visible(), area, false, 2), Some(2));
     }
 
     #[test]
@@ -468,8 +539,8 @@ mod tests {
                     width: w,
                     height: h,
                 };
-                draw(f, a, &m, Some(2), &theme);
-                draw(f, a, &m, None, &theme);
+                draw(f, a, &m, &m.visible(), Some(2), None, &theme);
+                draw(f, a, &m, &m.visible(), None, None, &theme);
             })
             .unwrap_or_else(|e| panic!("rail failed at {w}x{h}: {e}"));
         }

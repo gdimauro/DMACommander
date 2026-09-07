@@ -79,7 +79,7 @@ than to this one:
 | | |
 |---|---|
 | `Ctrl-Shift-P` | command palette |
-| `Ctrl-F` | fuzzy find — `dmac-search` |
+| `Ctrl-F` | fuzzy find over *files* — `dmac-search`. It already searches the **sessions** in the rail; what is missing is the same over a directory tree. |
 | `Ctrl-Shift-A` | AI chat window — `dmac-agent` |
 
 A key that apologises is still better than one that lies, but these are the

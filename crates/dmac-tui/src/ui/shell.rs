@@ -285,9 +285,9 @@ pub fn draw(frame: &mut Frame, area: Rect, shell: &Hosted, c: &Chrome<'_>, theme
                         " \u{2191} {n} back \u{b7} Ctrl-Shift-C copy \u{b7} Esc clear \
                          \u{b7} Ctrl-O commander "
                     ),
-                    (false, 0) => {
-                        " Ctrl-O DMAC commander \u{b7} F9 utilities \u{b7} F12 history ".to_string()
-                    }
+                    (false, 0) => " Ctrl-O DMAC commander \u{b7} Ctrl-T sessions \
+                                   \u{b7} F9 utilities \u{b7} F12 history "
+                        .to_string(),
                     (false, n) => format!(
                         " \u{2191} {n} lines back \u{b7} Esc back to live \
                          \u{b7} Ctrl-O commander "

@@ -235,8 +235,12 @@ pub const SECTIONS: &[Section] = &[
         rows: &[
             Row::panel(
                 "Ctrl-T / Shift-Tab",
-                "the session rail: enter switch, n new, r rename, d close",
+                "the session rail: enter switch, n new, r rename, d close, a beside",
                 &[ToggleRail],
+            ),
+            Row::note(
+                "Ctrl-F, in the rail",
+                "search the sessions \u{2014} space folds a group, Esc clears then closes",
             ),
             Row::panel("Ctrl-N", "a new session on this directory", &[NewSession]),
             Row::panel("Ctrl-W", "close this session", &[CloseSession]),

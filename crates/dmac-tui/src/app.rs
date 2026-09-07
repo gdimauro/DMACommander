@@ -401,6 +401,11 @@ pub struct App {
     /// The rows F2 is showing, built when it opens so that drawing, clicking
     /// and pressing a letter cannot disagree about what is on screen.
     pub(crate) menu_rows: Vec<MenuRow>,
+    /// What is being searched for in the session rail. `Some` while the search
+    /// is open, so an empty box still shows itself and still takes the letters
+    /// you type — the rail's other keys are single letters, and `n` has to mean
+    /// "new session" until you have asked for a search.
+    pub(crate) rail_filter: Option<String>,
     /// The file operation running, if one is. One at a time on purpose: two
     /// jobs writing into the same directory is a conflict neither of them can
     /// see, and a queue is a feature to add once anyone wants it.
@@ -653,6 +658,7 @@ impl App {
             menu_directory: None,
             trust: dmac_config::menu::TrustStore::load(),
             menu_rows: Vec::new(),
+            rail_filter: None,
             job: None,
             job_progress: None,
             conflict: None,
@@ -1433,7 +1439,8 @@ impl App {
     fn pick_rail_session(&mut self, row: u16) {
         let rail = self.layout.rail;
         let detail = crate::ui::rail::detailed(self.layout.rail_outer.width);
-        if let Some(i) = crate::ui::rail::session_at_row(&self.sessions, rail, detail, row)
+        let rows = self.rail_rows();
+        if let Some(i) = crate::ui::rail::session_at_row(&self.sessions, &rows, rail, detail, row)
             && self.sessions.switch_to(i)
         {
             self.after_session_switch();
@@ -1478,6 +1485,10 @@ impl App {
     }
 
     fn close_rail(&mut self) {
+        // A search belongs to the time the rail was open. Coming back to a box
+        // still holding last week's word, over a list that is missing most of
+        // its sessions, reads as a rail that has lost them.
+        self.rail_filter = None;
         self.rail_open = false;
         if matches!(self.mode, Mode::Rail { .. }) {
             self.mode = Mode::Normal;
@@ -1486,13 +1497,67 @@ impl App {
     }
 
     /// The rail as a manager: navigate, switch, create, rename, close.
+    /// The rows the rail is showing: the visible tree, narrowed by the search
+    /// when one is open.
+    ///
+    /// One list, used by the drawing, the cursor and the click, for the same
+    /// reason [`MenuRow`] is: two lists that can disagree about what is on
+    /// screen is how a keypress acts on a row nobody can see.
+    ///
+    /// **Tree order, never score order.** A fuzzy search usually sorts by how
+    /// well each row matched, and here that would be wrong: the number beside
+    /// each session is its `Alt`+digit shortcut, and reordering the list makes
+    /// every one of those digits point somewhere else while you are looking at
+    /// it.
+    ///
+    /// A session whose *child* matches is kept as well. A nested row drawn
+    /// under nothing reads as a top-level session that has been indented for no
+    /// reason.
+    pub(crate) fn rail_rows(&self) -> Vec<usize> {
+        let visible = self.sessions.visible();
+        let Some(needle) = self.rail_filter.as_deref().filter(|n| !n.is_empty()) else {
+            return visible;
+        };
+        let hit = |i: usize| {
+            self.sessions.get(i).is_some_and(|s| {
+                dmac_core::fuzzy::score(needle, &s.name).is_some()
+                    || dmac_core::fuzzy::score(needle, &s.subtitle()).is_some()
+            })
+        };
+        visible
+            .iter()
+            .copied()
+            .filter(|&i| {
+                hit(i)
+                    || self
+                        .sessions
+                        .visible()
+                        .iter()
+                        .any(|&c| self.sessions.parent_of(c) == Some(i) && hit(c))
+            })
+            .collect()
+    }
+
+    /// Where in `rail_rows` the search matched a session's name, for the
+    /// drawing to pick out. Empty when nothing is being searched for.
+    pub(crate) fn rail_hit(&self, index: usize) -> Vec<usize> {
+        let Some(needle) = self.rail_filter.as_deref().filter(|n| !n.is_empty()) else {
+            return Vec::new();
+        };
+        self.sessions
+            .get(index)
+            .and_then(|s| dmac_core::fuzzy::score(needle, &s.name))
+            .map(|m| m.positions)
+            .unwrap_or_default()
+    }
+
     /// The next row up or down in the rail, skipping what is folded away.
     ///
     /// Wraps, as the list always has. Falls back to the row it was given when
     /// there is nothing drawn to move to, which cannot happen with a session
     /// open but is cheaper to handle than to prove impossible.
     fn rail_step(&self, selected: usize, by: isize) -> usize {
-        let rows = self.sessions.visible();
+        let rows = self.rail_rows();
         if rows.is_empty() {
             return selected;
         }
@@ -1501,9 +1566,56 @@ impl App {
         rows.get(next).copied().unwrap_or(selected)
     }
 
+    /// One keypress while the rail's search box is open.
+    ///
+    /// `Some(row)` when the search took the key; `None` to let the rail's own
+    /// keys have it — the arrows, `Enter` and the digits still mean what they
+    /// mean, because a search you cannot move around in is a list you have to
+    /// close to use.
+    fn rail_search_key(&mut self, k: KeyEvent, selected: usize) -> Option<usize> {
+        let typed = match k.code {
+            KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => Some(c),
+            _ => None,
+        };
+        let filter = self.rail_filter.as_mut()?;
+        match (typed, k.code) {
+            (Some(c), _) => filter.push(c),
+            (None, KeyCode::Backspace) => {
+                filter.pop();
+            }
+            _ => return None,
+        }
+        // Onto the first row that still matches. A cursor left on a row the
+        // search has just hidden is a cursor pointing at nothing, and `Enter`
+        // would switch to whatever slid into its place.
+        let rows = self.rail_rows();
+        Some(match rows.contains(&selected) {
+            true => selected,
+            false => rows.first().copied().unwrap_or(selected),
+        })
+    }
+
     fn rail_key(&mut self, k: KeyEvent, selected: usize) {
+        // While a search is open the rail's single-letter commands stand aside:
+        // you are typing a name, and `n` has to be an `n`.
+        if self.rail_filter.is_some()
+            && let Some(next) = self.rail_search_key(k, selected)
+        {
+            self.mode = Mode::Rail { selected: next };
+            return;
+        }
         match k.code {
+            // A search first, then the rail. Two presses of Esc to leave with
+            // one open is right: the first undoes the narrowing you did, and
+            // losing both to one keypress means retyping it to see the list
+            // again.
+            KeyCode::Esc if self.rail_filter.take().is_some() => {}
             KeyCode::Esc => self.close_rail(),
+            // Ctrl-F, which everywhere else in this program still says it is
+            // not implemented. Here it is.
+            KeyCode::Char('f') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.rail_filter = Some(String::new());
+            }
             // Through the rows that are drawn, not through the sessions: the
             // children of a folded group are not on screen, and a cursor that
             // walks onto one lands on a row nobody can see.
@@ -5776,6 +5888,159 @@ mod tests {
             app.ses().hosted().is_none(),
             "nothing may be running before the answer"
         );
+    }
+
+    // ---- Ctrl-F in the rail ----
+
+    fn rail_with(names: &[&str]) -> App {
+        let mut app = fixture();
+        app.sessions.current_mut().name = names[0].to_string();
+        for n in &names[1..] {
+            let i = app
+                .sessions
+                .create(*n, VfsPath::local("/x"), VfsPath::local("/y"));
+            let _ = i;
+        }
+        app.sessions.switch_to(0);
+        app.mode = Mode::Rail { selected: 0 };
+        app
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    /// Ctrl-F narrows the rail, and until it is pressed the rail's own
+    /// single-letter keys keep their meaning — `n` has to be "new session"
+    /// until you have asked to type a name.
+    #[test]
+    fn ctrl_f_opens_a_search_and_letters_only_type_once_it_is_open() {
+        let mut app = rail_with(&["work", "notes", "nightly"]);
+        // Before: `n` is the new-session prompt, not an `n`.
+        app.on_key(key(KeyCode::Char('n')));
+        assert!(
+            matches!(app.mode, Mode::Prompt { .. }),
+            "the rail's own key stopped working: {:?}",
+            app.mode
+        );
+        app.mode = Mode::Rail { selected: 0 };
+
+        app.on_key(ctrl('f'));
+        assert_eq!(app.rail_filter.as_deref(), Some(""), "no search box");
+        // Now the same key is a letter.
+        app.on_key(key(KeyCode::Char('n')));
+        assert_eq!(app.rail_filter.as_deref(), Some("n"));
+        assert!(matches!(app.mode, Mode::Rail { .. }), "{:?}", app.mode);
+
+        let rows = app.rail_rows();
+        let found: Vec<&str> = rows
+            .iter()
+            .filter_map(|&i| app.sessions.get(i).map(|s| s.name.as_str()))
+            .collect();
+        assert_eq!(found, ["notes", "nightly"], "the search found {found:?}");
+
+        // Backspace widens it again.
+        app.on_key(key(KeyCode::Backspace));
+        assert_eq!(app.rail_rows().len(), 3);
+    }
+
+    /// The number beside each session is its `Alt`+digit shortcut. Sorting the
+    /// list by how well each row matched would make every one of those digits
+    /// point somewhere else while the user is looking at it, so a search
+    /// narrows and never reorders.
+    #[test]
+    fn a_search_narrows_the_rail_and_never_reorders_it() {
+        let mut app = rail_with(&["alpha", "zebra", "amber"]);
+        app.on_key(ctrl('f'));
+        for c in "a".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        let rows = app.rail_rows();
+        assert!(
+            rows.windows(2).all(|w| w[0] < w[1]),
+            "the search reordered the list: {rows:?}"
+        );
+        assert!(rows.contains(&0) && rows.contains(&2));
+    }
+
+    /// A cursor left on a row the search has just hidden is a cursor pointing
+    /// at nothing, and `Enter` would switch to whatever slid into its place.
+    #[test]
+    fn the_cursor_never_rests_on_a_row_the_search_has_hidden() {
+        let mut app = rail_with(&["alpha", "zebra", "amber"]);
+        app.mode = Mode::Rail { selected: 1 }; // on "zebra"
+        app.on_key(ctrl('f'));
+        app.on_key(key(KeyCode::Char('a')));
+
+        let Mode::Rail { selected } = app.mode else {
+            panic!("left the rail");
+        };
+        assert!(
+            app.rail_rows().contains(&selected),
+            "the cursor is on row {selected}, which the search hid: {:?}",
+            app.rail_rows()
+        );
+    }
+
+    /// Two presses of Esc, and in that order: the first undoes the narrowing,
+    /// because losing both to one keypress means retyping it to see the list.
+    #[test]
+    fn esc_clears_the_search_before_it_closes_the_rail() {
+        let mut app = rail_with(&["alpha", "zebra"]);
+        app.on_key(ctrl('f'));
+        app.on_key(key(KeyCode::Char('z')));
+        assert_eq!(app.rail_rows().len(), 1);
+
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.rail_filter.is_none(), "the search survived Esc");
+        assert!(matches!(app.mode, Mode::Rail { .. }), "the rail closed too");
+        assert_eq!(app.rail_rows().len(), 2, "the list did not come back");
+
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal, "the second Esc has to close it");
+    }
+
+    /// A nested row drawn under nothing reads as a top-level session that has
+    /// been indented for no reason, so a group whose child matches keeps its
+    /// parent.
+    #[test]
+    fn a_matching_child_keeps_the_row_it_hangs_from() {
+        let mut app = fixture();
+        app.sessions.current_mut().name = "work".into();
+        app.sessions
+            .create_sibling(0, "deployment", VfsPath::local("/x"), VfsPath::local("/y"));
+        app.sessions
+            .create("unrelated", VfsPath::local("/z"), VfsPath::local("/z"));
+        app.sessions.switch_to(0);
+        app.mode = Mode::Rail { selected: 0 };
+
+        app.on_key(ctrl('f'));
+        for c in "deploy".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        let rows = app.rail_rows();
+        assert!(rows.contains(&1), "the matching child is missing: {rows:?}");
+        assert!(rows.contains(&0), "its parent went away: {rows:?}");
+        assert!(!rows.contains(&2), "something unrelated stayed: {rows:?}");
+    }
+
+    /// The characters that matched are picked out inside the name. Saying only
+    /// *that* a row matched hides *where*, which is the half you want when two
+    /// sessions are called almost the same thing.
+    #[test]
+    fn the_search_says_which_letters_it_matched() {
+        let mut app = rail_with(&["CAEP.Modeler", "other"]);
+        app.on_key(ctrl('f'));
+        for c in "cmod".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        let hits = app.rail_hit(0);
+        assert!(!hits.is_empty(), "nothing to highlight");
+        let name: Vec<char> = "CAEP.Modeler".chars().collect();
+        let picked: String = hits.iter().filter_map(|&i| name.get(i)).collect();
+        assert_eq!(picked.to_lowercase(), "cmod", "highlighted {picked:?}");
+        // And nothing is claimed for a row that did not match.
+        assert!(app.rail_hit(1).is_empty());
     }
 
     /// A group is one row while it is folded, and the cursor may not walk into

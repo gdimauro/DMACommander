@@ -115,7 +115,25 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // The outer rect as well as the interior: the last column of it is the grip
     // the pointer drags to resize, and the interior does not include it.
     app.layout.rail_outer = body[0];
-    app.layout.rail = rail::draw(frame, body[0], &app.sessions, rail_cursor, &theme);
+    // The rows the rail is showing, and the search over them, both from the
+    // app so that what is drawn, what the cursor walks and what a click picks
+    // are one list.
+    let rail_rows = app.rail_rows();
+    let needle = app.rail_filter.clone();
+    let hit = |i: usize| app.rail_hit(i);
+    let search = needle.as_deref().map(|n| rail::Search {
+        needle: n,
+        hit: &hit,
+    });
+    app.layout.rail = rail::draw(
+        frame,
+        body[0],
+        &app.sessions,
+        &rail_rows,
+        rail_cursor,
+        search,
+        &theme,
+    );
     let software_cursor = app.software_cursor();
     let shell_selection = app.shell_selection;
     let shell_caret = app.shell_caret;
