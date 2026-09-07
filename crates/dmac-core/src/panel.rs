@@ -289,6 +289,16 @@ impl Panel {
         }
     }
 
+    /// Whether anything is ticked.
+    ///
+    /// Not the same question as "are there operands": with nothing marked, the
+    /// operand is the row under the cursor, and there is always one of those.
+    /// Esc has to know the difference — clearing a selection nobody made would
+    /// mean Esc did nothing visible and then claimed it had.
+    pub fn has_marks(&self) -> bool {
+        self.entries.iter().any(|e| e.selected)
+    }
+
     pub fn clear_selection(&mut self) {
         for e in &mut self.entries {
             e.selected = false;

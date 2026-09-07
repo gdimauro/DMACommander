@@ -93,7 +93,8 @@ pub const SECTIONS: &[Section] = &[
             ),
             Row::panel(
                 "Esc",
-                "straight between this panel and the command line",
+                "undo the last thing: a search, then the command line, then back \
+                 to the shell",
                 &[FocusToggle],
             ),
             Row::panel("Alt-U", "swap the two panels", &[SwapPanels]),

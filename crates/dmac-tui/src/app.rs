@@ -1082,12 +1082,41 @@ impl App {
 
             // Esc never changes which panel is current — that is the whole point
             // of having it alongside Tab.
+            // Esc, and it is a ladder rather than one thing: it undoes the most
+            // recent bit of state, and when there is none left it does what
+            // `Ctrl-O` does. That last rung is the one people ask for — having
+            // gone to the panels to look something up, the way back is the key
+            // your hand is already on.
+            //
+            // A typed command line is deliberately *not* a rung. Esc throwing
+            // away half a command is the behaviour that teaches people not to
+            // press Esc; `Ctrl-Y` clears it, and says so in the status line.
             FocusToggle => {
-                self.clear_quick_search();
-                self.ses_mut().focus = match self.ses().focus {
-                    Focus::Panel => Focus::CommandLine,
-                    Focus::CommandLine => Focus::Panel,
-                };
+                let marked = self.ses().active_panel().has_marks();
+                match () {
+                    // Loudest first. A copy or a move running is the thing Esc
+                    // most obviously means "stop" about, and the engine leaves
+                    // a cancelled job in a state that can be described rather
+                    // than half a file with the right name.
+                    () if self.job.is_some() => {
+                        if let Some(job) = &self.job {
+                            job.cancel();
+                        }
+                        self.status = "cancelling\u{2026}".into();
+                    }
+                    () if !self.quick_search.is_empty() => self.clear_quick_search(),
+                    // Marks are state you can see and did not mean to keep.
+                    // Losing them to Esc costs a re-selection; keeping them
+                    // costs the next F8 acting on files you forgot were ticked.
+                    () if marked => {
+                        self.ses_mut().active_panel_mut().clear_selection();
+                        self.status = "selection cleared".into();
+                    }
+                    () if self.ses().focus == Focus::CommandLine => {
+                        self.ses_mut().focus = Focus::Panel;
+                    }
+                    () => self.handle(Action::ToggleShell),
+                }
             }
 
             // --- sessions ---
@@ -5880,8 +5909,9 @@ mod tests {
             "a panel needs no blink timer"
         );
 
-        app.handle(Action::FocusToggle);
-        assert_eq!(app.ses().focus, Focus::CommandLine);
+        // Esc no longer reaches the command line from a panel — it is the way
+        // back to the shell now. Tab still cycles all three stops.
+        app.ses_mut().focus = Focus::CommandLine;
         assert!(app.cursor_deadline().is_some(), "the command line does");
     }
 
@@ -5984,6 +6014,105 @@ mod tests {
             app.ses().hosted().is_none(),
             "nothing may be running before the answer"
         );
+    }
+
+    // ---- selecting, and getting out of things ----
+
+    /// Space is what hands reach for; `Ins` is the orthodox key and stays.
+    /// On the command line it has to be a space, or a file manager that hosts
+    /// a shell is unusable.
+    #[test]
+    fn space_marks_a_file_over_a_panel_and_types_one_on_the_command_line() {
+        let mut app = fixture();
+        app.ses_mut().panels[0].move_to(1);
+        assert!(!app.ses().panels[0].has_marks());
+
+        app.on_key(key(KeyCode::Char(' ')));
+        assert!(app.ses().panels[0].has_marks(), "space did not mark it");
+        // And the cursor moved on, which is what makes marking a run of files
+        // one key held down rather than a key and an arrow alternating.
+        assert_eq!(
+            app.ses().panels[0].cursor(),
+            2,
+            "the cursor did not advance"
+        );
+
+        app.ses_mut().panels[0].move_to(1);
+        app.on_key(key(KeyCode::Char(' ')));
+        assert!(!app.ses().panels[0].has_marks(), "space did not unmark it");
+
+        app.ses_mut().focus = Focus::CommandLine;
+        app.on_key(key(KeyCode::Char('a')));
+        app.on_key(key(KeyCode::Char(' ')));
+        app.on_key(key(KeyCode::Char('b')));
+        assert_eq!(app.ses().command_line, "a b", "space was swallowed");
+    }
+
+    /// Esc undoes the most recent thing, and only then goes back to the shell.
+    /// Each rung is here because skipping it would make Esc destroy something
+    /// the user could see: a running copy, a search, a set of marks.
+    #[test]
+    fn esc_climbs_down_the_ladder_before_it_leaves() {
+        let mut app = fixture();
+
+        // A search first.
+        app.on_key(key(KeyCode::Char('C')));
+        assert!(!app.quick_search.is_empty());
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.quick_search.is_empty(), "the search survived");
+        assert_eq!(app.ses().view, View::Panels, "it left too early");
+
+        // Then the marks.
+        app.ses_mut().panels[0].move_to(1);
+        app.on_key(key(KeyCode::Char(' ')));
+        assert!(app.ses().panels[0].has_marks());
+        app.on_key(key(KeyCode::Esc));
+        assert!(!app.ses().panels[0].has_marks(), "the marks survived");
+        assert_eq!(app.ses().view, View::Panels, "it left too early");
+
+        // Then the command line.
+        app.ses_mut().focus = Focus::CommandLine;
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.ses().focus, Focus::Panel);
+        assert_eq!(app.ses().view, View::Panels, "it left too early");
+
+        // And with nothing left to undo, the other side.
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.ses().view, View::Shell, "Esc did not go back");
+    }
+
+    /// A copy running is the thing Esc most obviously means "stop" about, and
+    /// it outranks every other rung — a search left behind is nothing next to
+    /// a job that keeps writing after you asked it not to.
+    #[test]
+    fn esc_cancels_a_running_operation_before_anything_else() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.txt"), b"hello").expect("write");
+        let mut app = fixture();
+        // Something on every other rung, so the order is what is being tested.
+        app.quick_search = "x".into();
+        app.ses_mut().panels[0].move_to(1);
+        app.ses_mut().panels[0].toggle_selection();
+
+        let (handle, _events) = dmac_core::fileops::spawn(
+            dmac_core::Job::Copy {
+                sources: vec![dir.path().join("a.txt")],
+                destination: dir.path().join("out"),
+            },
+            dmac_core::FileOpOptions::default(),
+        )
+        .expect("spawn");
+        app.job = Some(handle);
+
+        app.on_key(key(KeyCode::Esc));
+        assert!(
+            app.job.as_ref().is_some_and(|j| j.is_cancelled()),
+            "Esc did not cancel the job"
+        );
+        // And it stopped there: nothing else was thrown away on the way.
+        assert_eq!(app.quick_search, "x", "the search went too");
+        assert!(app.ses().panels[0].has_marks(), "the marks went too");
+        assert_eq!(app.ses().view, View::Panels);
     }
 
     // ---- clicking what a keyboard cannot reach ----

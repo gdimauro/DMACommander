@@ -113,8 +113,12 @@ pub fn resolve(key: KeyEvent, focus: Focus) -> Option<Action> {
         (PageUp, true, false) => Action::CycleSession(-1),
         (PageDown, true, false) => Action::CycleSession(1),
 
-        // --- Focus. Tab cycles all three stops; Esc jumps between the current
-        //     panel and the command line, ignoring the other panel. ---
+        // --- Focus. Tab cycles all three stops. Esc is a ladder: it undoes
+        //     the most recent bit of state — a quick search, then the command
+        //     line — and when there is nothing left to undo it goes back to
+        //     the shell, which is what the hand reaching for Esc after looking
+        //     something up in the panels actually wants. The command line is
+        //     still on Tab. ---
         (Tab, _, _) => Action::FocusNext,
         (Esc, _, _) => Action::FocusToggle,
 
@@ -170,6 +174,11 @@ pub fn resolve(key: KeyEvent, focus: Focus) -> Option<Action> {
         //     ordinary characters when you are typing a command. Binding them
         //     here would silently eat every hyphen in a command line. ---
         (Insert, _, _) => Action::ToggleSelection,
+        // Space, but only over a panel: on the command line it is a space, and
+        // a file manager that swallowed it there would be unusable. `Ins` is
+        // the orthodox key and stays; this is the one people's hands reach for,
+        // and having both costs nothing.
+        (Char(' '), false, false) if focus == Focus::Panel => Action::ToggleSelection,
 
         // Ctrl-H is the directory history, and Ctrl-Shift-H is the same thing
         // from inside a hosted shell, where a bare Ctrl-H belongs to the child.
