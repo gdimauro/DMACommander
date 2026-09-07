@@ -72,20 +72,55 @@ does nothing: it is a key that promises.
 **Done when:** no user-facing key answers "not implemented yet", and every
 destructive one is covered by a test that proves it verifies before it deletes.
 
-## 4. Settings, with the model and the editor in them
+## 4. Settings, with the agent, the model and the editor in them
 
-- **AI provider**: Claude by default, and selectable — OpenAI, and the local
-  runners people actually use (Ollama, LM Studio, llama.cpp, and anything
-  speaking an OpenAI-compatible endpoint).
+- **Agent**: which coding agent a session hosts. `claude` today; `plank` next
+  — see item 6, which is where the real work is.
+- **Model**: Claude by default, and selectable — OpenAI, and the local runners
+  people actually use (Ollama, LM Studio, llama.cpp, anything speaking an
+  OpenAI-compatible endpoint). Note that `plank` reaches most of those itself,
+  through `--provider openai --base-url`, so for a plank session this is its
+  setting to pass on rather than ours to implement.
 - **Editor**: VS Code by default, and changeable. `DMAC_EDITOR` already does
   this on the command line; it needs to be a setting with a UI.
 - Written through `dmac-config`, which is where configuration belongs.
 
-**Open question for the user:** "plank" in the request — which provider is
-meant? Everything else on the list is a name I recognise; that one I do not, and
-guessing at a provider is how you end up with a menu entry nobody can use.
+## 5. Hosting `plank` beside `claude`
 
-## 5. Untangling the two sessions — **done**
+"plank" is [aovestdipaperino/plank](https://github.com/aovestdipaperino/plank) —
+same author as `tokensave`, checked out at `~/prj/plank`, installed at
+`~/.cargo/bin/plank`. It is a coding **agent**, a peer of `claude`: a Rust agent
+with a Ratatui TUI, a REPL, a headless mode and its own tools. Not a provider,
+which is where it would have gone if nobody had asked.
+
+So it belongs in `ATTACHED` in `crates/dmac-session/src/agent.rs` — recognised
+when it is running in a hosted shell, and put back on restart. That list was
+built to take a second entry. What it was *not* built for is how differently
+plank names a conversation, and each difference breaks something that is
+currently true:
+
+| | `claude` | `plank` |
+|---|---|---|
+| resume | `--resume <uuid>` | `/resume <prefix>` — a literal leading slash |
+| id shape | a UUID | a sha prefix (`~/.plank/kvcache/<12-hex>/`) |
+| dictating an id | `--session-id <uuid>` | **no equivalent** — resume only |
+| MCP | inline JSON | `--mcp-config FILE`, over a global `~/.plank/.mcp.json` |
+
+- `looks_like_conversation` demands 36 characters of UUID, so it will never
+  adopt a plank session. The shape has to become a property of the program.
+- The whole "mint an id up front and hand it to the agent" model does not
+  transfer: plank's id is chosen by plank. What is left is observation — and a
+  bare `/resume` takes the most recent, which is the hazard the current code
+  already refuses to walk into.
+- The global `~/.plank/.mcp.json` is the way to advertise this commander to it
+  without writing per-project files, which is the thing we deliberately stopped
+  doing for `claude`.
+
+**Done when:** start `plank` in a hosted shell, quit DMACommander, start it
+again — the session comes back in the same plank conversation, and picking
+between the two agents is a setting rather than a recompile.
+
+## 6. Untangling the two sessions — **done**
 
 Not a feature, but it is owed.
 
