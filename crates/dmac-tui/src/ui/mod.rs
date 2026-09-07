@@ -14,6 +14,7 @@ pub(crate) mod reattach;
 mod screen;
 pub(crate) mod shell;
 mod splash;
+pub(crate) mod view;
 
 pub use screen::draw_canvas;
 
@@ -245,6 +246,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     match app.mode {
         crate::app::Mode::Picker { selected } => {
             app.layout.picker = picker::draw(frame, area, dmac_fx::catalog(), selected, theme);
+        }
+        crate::app::Mode::View { scroll, hex } => {
+            if let Some(doc) = app.document.as_ref() {
+                app.layout.view =
+                    view::draw(frame, area, doc, scroll, hex, &app.view_search, theme);
+            }
         }
         crate::app::Mode::Help { scroll } => {
             // The page arrives before it is a page. While the characters are

@@ -12,3 +12,4 @@ description  = "File viewer and editor: syntax highlighting, hex, images, diff."
 workspace = true
 
 [dependencies]
+thiserror = "2.0.20"

@@ -130,6 +130,16 @@ pub(crate) enum Mode {
     Help {
         scroll: usize,
     },
+    /// F3: looking at a file. The document itself lives on `App` — a `Mode` is
+    /// copied about freely and a file is not something to copy — so what is
+    /// here is only where in it we are looking.
+    View {
+        scroll: usize,
+        /// Bytes rather than lines. Forced on for a binary file, and available
+        /// for a text one because "what is actually in this file" is a question
+        /// a text view cannot answer.
+        hex: bool,
+    },
     /// Contextual commands for the entry under the cursor.
     Context {
         selected: usize,
@@ -187,6 +197,8 @@ pub(crate) struct Pending {
 pub(crate) enum PromptIntent {
     RenameSession(usize),
     NewSession,
+    /// What to look for in the file being viewed.
+    ViewSearch,
 }
 
 impl PromptIntent {
@@ -194,6 +206,7 @@ impl PromptIntent {
         match self {
             PromptIntent::RenameSession(_) => " Rename session ",
             PromptIntent::NewSession => " New session ",
+            PromptIntent::ViewSearch => " Find ",
         }
     }
 }
@@ -270,6 +283,8 @@ pub(crate) struct LayoutCache {
     pub picker: Rect,
     /// Interior of the help page while it is open.
     pub help: Rect,
+    /// Interior of the file viewer while it is open.
+    pub view: Rect,
     /// Interior of the directory history's list, while it is open.
     pub history: Rect,
     /// The whole frame. Needed to render a second, off-screen copy at the same
@@ -318,6 +333,16 @@ pub struct App {
     /// The help arriving. `Some` only while it is flying in; the page itself
     /// takes over the moment it settles.
     pub(crate) help_entrance: Option<HelpEntrance>,
+    /// The file being looked at. Held here rather than in [`Mode::View`]
+    /// because a mode is copied about freely and a file is not something to
+    /// copy — and because it has to survive the mode changing under it when a
+    /// search prompt opens over the top.
+    pub(crate) document: Option<dmac_view::Document>,
+    /// What is being looked for in it, and which of the matching rows we are
+    /// on. Kept across closing and reopening the viewer: looking for the same
+    /// string in the next file is the common case.
+    pub(crate) view_search: String,
+    pub(crate) view_match: usize,
     /// Full screen: the frame stripped off, leaving only contents on black.
     pub(crate) fullscreen: bool,
     /// Agents from the last run, waiting for an answer to "resume?".
@@ -553,6 +578,9 @@ impl App {
             agent_fg: Vec::new(),
             last_session: None,
             help_entrance: None,
+            document: None,
+            view_search: String::new(),
+            view_match: 0,
             cursor_style: cursor,
             cursor_phase: std::time::Instant::now(),
             theme: Theme::default(),
@@ -1160,8 +1188,8 @@ impl App {
             // Everything below is claimed by the keymap but owned by an agent
             // that has not built it yet. Say so out loud rather than doing nothing.
             UserMenu => self.status = "F2 user menu — not implemented yet".into(),
-            View => self.status = "F3 viewer — dmac-view, not implemented yet".into(),
-            Edit => self.status = "F4 editor — dmac-view, not implemented yet".into(),
+            View => self.open_viewer(),
+            Edit => self.edit_here(),
             Copy => self.status = self.pending_op("F5 copy"),
             Move => self.status = self.pending_op("F6 move"),
             MakeDir => self.status = "F7 mkdir — not implemented yet".into(),
@@ -1531,6 +1559,20 @@ impl App {
                     self.status = e.to_string();
                 }
             },
+            PromptIntent::ViewSearch => {
+                self.view_search = value;
+                // Back to the file, and straight to the first match rather than
+                // making the user press `n` to find out whether there was one.
+                let hex = matches!(self.mode, Mode::View { hex: true, .. })
+                    || self
+                        .document
+                        .as_ref()
+                        .is_some_and(|d| d.kind() == dmac_view::Kind::Binary);
+                self.mode = Mode::View { scroll: 0, hex };
+                // From before the first, so stepping forward lands on it.
+                self.view_match = usize::MAX;
+                self.step_match(1, hex);
+            }
             PromptIntent::NewSession => {
                 let name = if value.trim().is_empty() {
                     self.sessions.unused_name()
@@ -2593,6 +2635,7 @@ impl App {
         match self.mode {
             Mode::Picker { selected } => return self.picker_key(k, selected),
             Mode::Help { scroll } => return self.help_key(k, scroll),
+            Mode::View { scroll, hex } => return self.view_key(k, scroll, hex),
             Mode::Context { selected, anchor } => return self.context_key(k, selected, anchor),
             Mode::Rail { selected } => return self.rail_key(k, selected),
             Mode::Prompt { intent } => return self.prompt_key(k, intent),
@@ -2934,6 +2977,169 @@ impl App {
     }
 
     /// The help page has the keyboard: scroll it, or close it.
+    /// F3: show the file under the cursor.
+    ///
+    /// The whole file is read here rather than on a task, which is a deliberate
+    /// exception to "nothing blocks the render loop": the read is capped at
+    /// [`dmac_view::READ_CAP`], so the worst case is eight megabytes off a
+    /// local disk, and a viewer that opens a frame later than the keypress
+    /// feels broken in a way the budget does not describe. A remote file is a
+    /// different matter and is refused rather than blocked on — that is what
+    /// the VFS backends are for, and they are not here yet.
+    fn open_viewer(&mut self) {
+        let Some(entry) = self.ses().active_panel().current().cloned() else {
+            self.status = "nothing to view".into();
+            return;
+        };
+        if matches!(
+            entry.kind,
+            dmac_core::EntryKind::Dir | dmac_core::EntryKind::Parent
+        ) {
+            self.status = format!("{} is a directory \u{2014} Enter opens it", entry.name);
+            return;
+        }
+        let cwd = self.ses().cwd[Self::idx(self.ses().active)].clone();
+        if !cwd.is_local() {
+            self.status = "the viewer only reads local files so far".into();
+            return;
+        }
+        let path = cwd.as_path().join(&entry.name);
+        match dmac_view::Document::open(&path) {
+            Ok(doc) => {
+                // A binary file opens in hex whatever the last file did: there
+                // is nothing else it could honestly show.
+                let hex = doc.kind() == dmac_view::Kind::Binary;
+                self.status = match doc.truncated() {
+                    true => format!(
+                        "{}: showing the first {} of {} bytes",
+                        entry.name,
+                        dmac_view::READ_CAP,
+                        doc.total_bytes()
+                    ),
+                    false => String::new(),
+                };
+                self.document = Some(doc);
+                self.view_match = 0;
+                self.mode = Mode::View { scroll: 0, hex };
+            }
+            Err(e) => self.status = format!("cannot view: {e}"),
+        }
+    }
+
+    /// F4: open the file under the cursor in the editor.
+    ///
+    /// The configured one, out of process. There is no editor in this program
+    /// and writing one is a subsystem rather than a keybinding — and the
+    /// editor the user already has is better than the one this would grow into.
+    /// `DMAC_EDITOR` names it; VS Code is the default.
+    fn edit_here(&mut self) {
+        let name = self.ses().active_panel().current().map(|e| e.name.clone());
+        let Some(name) = name else {
+            self.status = "nothing to edit".into();
+            return;
+        };
+        let cwd = self.ses().cwd[Self::idx(self.ses().active)].clone();
+        if !cwd.is_local() {
+            self.status = "the editor only opens local files".into();
+            return;
+        }
+        let path = cwd.as_path().join(&name);
+        let tx = self.tx.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn_blocking(move || {
+                let message = match dmac_desktop::open_editor(&path) {
+                    Ok(()) => Ok(format!("opened {}", path.display())),
+                    Err(e) => Err(format!("could not open an editor: {e}")),
+                };
+                let _ = tx.send(Update::Editor(message));
+            });
+        }
+    }
+
+    /// Driving the viewer.
+    ///
+    /// The keys are a pager's, because that is what everyone's fingers already
+    /// know: arrows and page keys move, `/` searches, `n` and `N` walk the
+    /// matches, `Esc` leaves. `h` toggles hex — except on a binary file, where
+    /// there is nothing to toggle to.
+    fn view_key(&mut self, k: KeyEvent, scroll: usize, hex: bool) {
+        let rows = self.document.as_ref().map_or(0, |d| d.rows(hex));
+        let page = (self.layout.view.height as usize).max(1);
+        let last = rows.saturating_sub(page);
+        let at = |s: usize| Mode::View {
+            scroll: s.min(last),
+            hex,
+        };
+        match k.code {
+            KeyCode::Esc | KeyCode::F(3) | KeyCode::F(10) | KeyCode::Char('q') => {
+                // The document goes with it. Holding a file open because a mode
+                // might come back is holding a file open for ever.
+                self.document = None;
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.mode = at(scroll.saturating_sub(1)),
+            KeyCode::Down | KeyCode::Char('j') => self.mode = at(scroll + 1),
+            KeyCode::PageUp => self.mode = at(scroll.saturating_sub(page)),
+            KeyCode::PageDown | KeyCode::Char(' ') => self.mode = at(scroll + page),
+            KeyCode::Home => self.mode = at(0),
+            KeyCode::End => self.mode = at(last),
+            KeyCode::Char('h') => {
+                let binary = self
+                    .document
+                    .as_ref()
+                    .is_some_and(|d| d.kind() == dmac_view::Kind::Binary);
+                match binary {
+                    // Nothing to go back to: the text view of a binary file is
+                    // a screenful of replacement characters.
+                    true => self.status = "that file is binary \u{2014} there is only hex".into(),
+                    // Back to the top: the two views count rows differently, so
+                    // keeping the number would land somewhere unrelated.
+                    false => {
+                        self.mode = Mode::View {
+                            scroll: 0,
+                            hex: !hex,
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('/') => {
+                self.open_prompt(PromptIntent::ViewSearch, self.view_search.clone());
+            }
+            KeyCode::Char('n') => self.step_match(1, hex),
+            KeyCode::Char('N') => self.step_match(-1, hex),
+            _ => {}
+        }
+    }
+
+    /// Move to the next or previous row matching the current search.
+    ///
+    /// Wraps, and says so: a search that stops silently at the last match is a
+    /// search you press again wondering whether it is broken.
+    fn step_match(&mut self, by: isize, hex: bool) {
+        let Some(doc) = self.document.as_ref() else {
+            return;
+        };
+        if self.view_search.is_empty() {
+            self.status = "nothing to search for \u{2014} / to look for something".into();
+            return;
+        }
+        let hits = doc.search(&self.view_search, hex);
+        if hits.is_empty() {
+            self.status = format!("{}: no match", self.view_search);
+            return;
+        }
+        let n = hits.len() as isize;
+        self.view_match = (self.view_match as isize + by).rem_euclid(n) as usize;
+        let row = hits.get(self.view_match).copied().unwrap_or(0);
+        self.mode = Mode::View { scroll: row, hex };
+        self.status = format!(
+            "{}: {} of {}",
+            self.view_search,
+            self.view_match + 1,
+            hits.len()
+        );
+    }
+
     fn help_key(&mut self, k: KeyEvent, scroll: usize) {
         // Impatience is a legitimate answer to an animation, and a key that
         // only cancels one is a key that did not do what it says. So the page
@@ -4988,6 +5194,152 @@ mod tests {
         app.on_key(key(KeyCode::Char('d')));
         assert_eq!(app.sessions.len(), 1, "the children stayed behind");
         assert!(app.status.contains('3'), "how many went: {}", app.status);
+    }
+
+    // ---- F3, the viewer ----
+
+    /// A scratch file, and a session looking at the directory holding it.
+    fn viewing(name: &str, bytes: &[u8]) -> (App, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("dmac-view-app-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).expect("write");
+
+        let mut app = fixture();
+        app.ses_mut().cwd[0] = VfsPath::local(&dir);
+        app.ses_mut().panels[0].set_entries(vec![dmac_core::Entry {
+            name: name.to_string(),
+            kind: dmac_core::EntryKind::File,
+            size: Some(bytes.len() as u64),
+            modified: None,
+            mode: None,
+            selected: false,
+        }]);
+        app.ses_mut().panels[0].move_to(0);
+        (app, path)
+    }
+
+    /// F3 opens the file under the cursor, and Esc puts it down again — the
+    /// document with it, because holding a file open in case a mode comes back
+    /// is holding a file open for ever.
+    #[test]
+    fn f3_opens_the_file_and_esc_closes_it() {
+        let (mut app, _) = viewing("view.txt", b"alpha\nbeta\ngamma");
+        app.on_key(key(KeyCode::F(3)));
+        assert!(matches!(
+            app.mode,
+            Mode::View {
+                scroll: 0,
+                hex: false
+            }
+        ));
+        assert_eq!(
+            app.document.as_ref().map(|d| d.lines().len()),
+            Some(3),
+            "the file was not read"
+        );
+
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.document.is_none(), "the file is still held open");
+    }
+
+    /// A directory is not a file, and saying so is better than an IO error
+    /// about a thing the user can see is a folder.
+    #[test]
+    fn f3_on_a_directory_says_what_to_press_instead() {
+        let mut app = fixture();
+        app.ses_mut().panels[0].set_entries(vec![dmac_core::Entry {
+            name: "somewhere".into(),
+            kind: dmac_core::EntryKind::Dir,
+            size: None,
+            modified: None,
+            mode: None,
+            selected: false,
+        }]);
+        app.ses_mut().panels[0].move_to(0);
+        app.on_key(key(KeyCode::F(3)));
+        assert_eq!(app.mode, Mode::Normal, "it opened a directory as a file");
+        assert!(app.status.contains("Enter"), "{}", app.status);
+    }
+
+    /// A binary file opens in hex, and there is nothing to toggle back to: the
+    /// text view of a binary file is a screenful of replacement characters.
+    #[test]
+    fn a_binary_file_opens_in_hex_and_stays_there() {
+        let (mut app, _) = viewing("bin.dat", b"\x7fELF\x00\x01\x02rest");
+        app.on_key(key(KeyCode::F(3)));
+        assert!(
+            matches!(app.mode, Mode::View { hex: true, .. }),
+            "{:?}",
+            app.mode
+        );
+
+        app.on_key(key(KeyCode::Char('h')));
+        assert!(
+            matches!(app.mode, Mode::View { hex: true, .. }),
+            "it switched to a text view of a binary file"
+        );
+        assert!(app.status.contains("binary"), "{}", app.status);
+    }
+
+    /// Searching lands on the first match without making the user press `n` to
+    /// find out whether there was one, and `n` walks the rest and wraps.
+    #[test]
+    fn searching_lands_on_the_first_match_and_n_walks_them() {
+        let (mut app, _) = viewing("s.txt", b"one\ntarget\nthree\nTARGET\nfive");
+        app.on_key(key(KeyCode::F(3)));
+        app.on_key(key(KeyCode::Char('/')));
+        assert!(matches!(
+            app.mode,
+            Mode::Prompt {
+                intent: PromptIntent::ViewSearch
+            }
+        ));
+
+        app.prompt_value = "target".into();
+        app.submit_prompt(PromptIntent::ViewSearch);
+        assert!(
+            matches!(app.mode, Mode::View { scroll: 1, .. }),
+            "{:?}",
+            app.mode
+        );
+        assert!(app.status.contains("1 of 2"), "{}", app.status);
+
+        // Case-insensitively, so the second one counts.
+        app.on_key(key(KeyCode::Char('n')));
+        assert!(
+            matches!(app.mode, Mode::View { scroll: 3, .. }),
+            "{:?}",
+            app.mode
+        );
+        // And it wraps rather than stopping silently at the last one.
+        app.on_key(key(KeyCode::Char('n')));
+        assert!(
+            matches!(app.mode, Mode::View { scroll: 1, .. }),
+            "{:?}",
+            app.mode
+        );
+    }
+
+    /// Scrolling stops at the end rather than running off into empty rows.
+    #[test]
+    fn the_viewer_stops_at_the_bottom() {
+        let body: Vec<u8> = (0..200)
+            .flat_map(|i| format!("line {i}\n").into_bytes())
+            .collect();
+        let (mut app, _) = viewing("long.txt", &body);
+        app.on_key(key(KeyCode::F(3)));
+        // The layout is only known once something has been drawn; before that a
+        // page is one row, which is the conservative direction.
+        for _ in 0..500 {
+            app.on_key(key(KeyCode::Down));
+        }
+        let Mode::View { scroll, .. } = app.mode else {
+            panic!("left the viewer");
+        };
+        let rows = app.document.as_ref().map_or(0, |d| d.rows(false));
+        assert!(scroll < rows, "scrolled past the end: {scroll} of {rows}");
     }
 
     /// The whole reason for watching while the commander runs.

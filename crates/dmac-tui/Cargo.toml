@@ -20,6 +20,7 @@ dmac-mcp = { version = "0.1.0", path = "../dmac-mcp" }
 dmac-pty = { version = "0.1.0", path = "../dmac-pty" }
 dmac-session = { version = "0.1.0", path = "../dmac-session" }
 dmac-vfs = { version = "0.1.0", path = "../dmac-vfs" }
+dmac-view = { version = "0.1.0", path = "../dmac-view" }
 jiff = "0.2.35"
 ratatui = "0.30.2"
 futures = "0.3.31"
