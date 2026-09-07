@@ -37,6 +37,22 @@ pub fn running_agent(commands: &[String]) -> Option<String> {
     commands.iter().find(|line| is_attached(line)).cloned()
 }
 
+/// What each of these shells is hosting, from one read of the process table.
+///
+/// One `ps` for every session rather than one per session. That is what makes
+/// it affordable to ask this *while the commander runs* instead of only on the
+/// way out — and a record written only on the way out is a record that a
+/// `kill -9`, a closed terminal window or a panic erases completely, taking
+/// with it any chance of putting the agent back.
+#[cfg(unix)]
+pub fn scan<Id: Copy>(shells: &[(Id, u32)]) -> Vec<(Id, Option<String>)> {
+    let table = dmac_pty::ProcessTable::read();
+    shells
+        .iter()
+        .map(|(id, pid)| (*id, running_agent(&table.commands_under(*pid as i32))))
+        .collect()
+}
+
 /// Interpreters that run a program without being it.
 ///
 /// A native install shows up as `/path/claude`, but one installed through npm
@@ -70,6 +86,102 @@ fn is_attached(line: &str) -> bool {
     false
 }
 
+/// Whether a word is a conversation id: a UUID, which is what the agent's own
+/// store names its files by and what `--resume` takes.
+///
+/// Strict on purpose. This decides whether an id observed in someone else's
+/// command line is adopted as the session's, and adopting a word that is not an
+/// id would point the session at a conversation that does not exist — which
+/// fails at the worst moment, on the restart where the user expects their work
+/// back.
+fn looks_like_conversation(w: &str) -> bool {
+    let b = w.as_bytes();
+    b.len() == 36
+        && b.iter().enumerate().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => *c == b'-',
+            _ => c.is_ascii_hexdigit(),
+        })
+}
+
+/// The conversation a command line names, if it names one.
+///
+/// This is the only thing that knows, for certain, which conversation a running
+/// agent belongs to. The alternative — matching the newest transcript in the
+/// project directory — is a guess, and it is wrong in exactly the case this
+/// program is built for: several commanders open on the same repository, each
+/// with its own agent, all appending into the same directory. A guess that is
+/// usually right is not good enough for something whose failure mode is "you
+/// are in someone else's conversation".
+///
+/// The transcript is not held open, so the file the agent is writing cannot be
+/// read off its file descriptors either. That was checked, not assumed.
+///
+/// `None` is an honest and common answer: `claude --resume` opens a picker and
+/// `claude -c` continues the most recent, and neither says on the command line
+/// where it ended up. `--fork-session` is `None` too — it resumes under a *new*
+/// id, so the one on the line is the parent and not what is running.
+pub fn conversation_of(line: &str) -> Option<String> {
+    if forks(line) {
+        return None;
+    }
+    let mut words = line.split_whitespace().peekable();
+    while let Some(w) = words.next() {
+        let named = match w.split_once('=') {
+            Some(("--session-id" | "--resume" | "-r", v)) => Some(v.to_string()),
+            _ if matches!(w, "--session-id" | "--resume" | "-r") => {
+                words.peek().map(|v| (*v).to_string())
+            }
+            _ => None,
+        };
+        if let Some(v) = named
+            && looks_like_conversation(&v)
+        {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Whether the line asks for a new id on the way in.
+///
+/// `--fork-session` resumes a conversation and immediately becomes a different
+/// one, so nothing on the line names what is actually running.
+fn forks(line: &str) -> bool {
+    line.split_whitespace()
+        .any(|w| w == "--fork-session" || w.starts_with("--fork-session="))
+}
+
+/// Whether the line settles the conversation in a way only the agent can
+/// resolve.
+///
+/// `-c` continues the most recent; a bare `--resume` opens a picker, with an
+/// optional search term; `--fork-session` makes a new one. All are the user
+/// saying how they want to get back, and none can be turned into an id from out
+/// here — so the honest thing on the next run is to hand them the same choice
+/// rather than to answer it quietly with a conversation of our own.
+fn picks_its_own(line: &str) -> bool {
+    if forks(line) {
+        return true;
+    }
+    let mut words = line.split_whitespace().peekable();
+    while let Some(w) = words.next() {
+        match w.split_once('=') {
+            Some(("-c" | "--continue", _)) => return true,
+            // A search term is a picker, not an id.
+            Some(("--resume" | "-r", v)) if !looks_like_conversation(v) => return true,
+            Some(_) => {}
+            None => match w {
+                "-c" | "--continue" => return true,
+                "--resume" | "-r" if !words.peek().is_some_and(|v| looks_like_conversation(v)) => {
+                    return true;
+                }
+                _ => {}
+            },
+        }
+    }
+    false
+}
+
 /// What to run to get this conversation back, as something a shell can be
 /// handed safely.
 ///
@@ -90,9 +202,13 @@ fn is_attached(line: &str) -> bool {
 /// - everything the *user* chose, untouched: a model, a permission mode, a
 ///   directory. That is what they set up, and it is not ours to drop.
 ///
-/// Above all, never a bare `--resume`. A resume flag whose id went missing does
-/// not fail — it silently opens whichever conversation was most recent, which
-/// is how you end up somewhere you have never been with no idea why.
+/// The conversation the line named is *kept*, and that is a correction. It used
+/// to be stripped and replaced with the session's own, on the reasoning that
+/// the two are always the same — which holds only while the commander is the
+/// one that started the agent. Type `claude --resume <something-else>` in a
+/// hosted shell and they are not the same, and the restart silently put the
+/// user back in a conversation they had left. What is on the line is what was
+/// running; the session follows it, not the other way round.
 pub fn as_resume(line: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut words = line.split_whitespace().peekable();
@@ -115,18 +231,49 @@ pub fn as_resume(line: &str) -> String {
                     }
                 }
             }
-            // Ours as well, and the value with it. Dropping the flag and
-            // keeping what came after it would leave the id standing on the
-            // command line as a positional argument — which for an agent is
-            // not a stray word, it is a prompt.
-            "--session-id" | "--resume" | "-r" => {
-                if words.peek().is_some_and(|v| !v.starts_with('-')) {
+            // A named conversation is the one fact on this line worth more
+            // than anything the commander remembers — but it does not travel
+            // *here*. It is put back by [`start_command`] as the variable the
+            // hosted shell already carries, so the typed line stays something
+            // a person can read and correct before pressing Enter, and no id
+            // has to survive being quoted through a shell. What this does is
+            // take it off the line, so there is only ever one selector.
+            //
+            // Dropping the flag and keeping the value would leave the value
+            // standing on the command line as a positional argument, which for
+            // an agent is not a stray word, it is a prompt.
+            "--session-id" | "--resume" | "-r" => match words.peek() {
+                Some(v) if looks_like_conversation(v) => {
                     words.next();
                 }
+                // `--resume` takes an optional search term and opens a picker
+                // on it. That is the user's own way of choosing, and it comes
+                // back exactly as they typed it.
+                Some(v) if w != "--session-id" && !v.starts_with('-') => {
+                    let term = (*v).to_string();
+                    words.next();
+                    out.push(w.to_string());
+                    out.push(term);
+                }
+                // A bare `--resume` is that picker with no search term: kept,
+                // for the same reason.
+                _ if w != "--session-id" => out.push(w.to_string()),
+                // `--session-id` takes a UUID and nothing else, so anything
+                // else is a line that could not have started. Both halves go.
+                Some(v) if !v.starts_with('-') => {
+                    words.next();
+                }
+                _ => {}
+            },
+            _ if w.starts_with("--mcp-config=") || w.starts_with("--session-id=") => {}
+            _ if w.starts_with("--resume=") || w.starts_with("-r=") => {
+                match w.split_once('=').map(|(_, v)| v) {
+                    // Ours to put back as the variable, as above.
+                    Some(v) if looks_like_conversation(v) => {}
+                    // A search term for the picker; theirs, kept.
+                    _ => out.push(w.to_string()),
+                }
             }
-            _ if w.starts_with("--mcp-config=")
-                || w.starts_with("--session-id=")
-                || w.starts_with("--resume=") => {}
             _ => out.push(w.to_string()),
         }
     }
@@ -269,9 +416,19 @@ pub fn start_command(session_id: &str, conversation: &str, theirs: &str) -> Stri
 
 /// The same, for an agent the last run was hosting: the saved line stripped of
 /// what belonged to that run, with this run's own put back.
+///
+/// `conversation` is the session's, and it is only used when the saved line
+/// settles nothing. A line that names a conversation has already answered the
+/// question, and a line that says *how* to choose one — `-c`, or a bare
+/// `--resume` and its picker — has answered it too, in the user's own terms.
+/// Adding ours on top of either is two answers to one question, and the agent
+/// acts on the wrong one.
 pub fn resume_command(session_id: &str, conversation: &str, saved: &str) -> String {
     let stripped = as_resume(saved);
     let theirs = stripped.split_once(' ').map_or("", |(_, rest)| rest);
+    if picks_its_own(saved) {
+        return start_command(session_id, "", theirs);
+    }
     start_command(session_id, conversation, theirs)
 }
 
@@ -497,15 +654,33 @@ mod tests {
     }
 
     /// What the user chose is theirs and comes back untouched; what belonged to
-    /// the run that ended does not — its socket died with it, and its
-    /// `--session-id` names a conversation that now exists.
+    /// the run that ended does not — its socket died with it.
+    ///
+    /// The conversation is neither: it belongs to *the agent*, and it outlives
+    /// both runs. It used to be stripped and replaced with the session's own,
+    /// which is a no-op while the commander is the one that started the agent
+    /// and silently wrong the moment it is not — type `claude --resume <other>`
+    /// in a hosted shell and every restart afterwards put you back in the
+    /// commander's conversation instead of the one you were in.
     #[test]
-    fn a_resumed_line_keeps_their_arguments_and_replaces_ours() {
-        let saved = "/opt/homebrew/bin/claude --mcp-config {\"mcpServers\":{\"dmac\":{}}} \
-                     --session-id aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee --model opus \
-                     --permission-mode plan";
-        let line = resume_command("3", "ffffffff-0000-4000-8000-000000000000", saved);
+    fn a_resumed_line_keeps_the_conversation_that_was_running() {
+        let ran = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let ours = "ffffffff-0000-4000-8000-000000000000";
+        let saved = format!(
+            "/opt/homebrew/bin/claude --mcp-config {{\"mcpServers\":{{\"dmac\":{{}}}}}} \
+             --session-id {ran} --model opus --permission-mode plan"
+        );
 
+        // The conversation that was running is read off the line, and it is
+        // this — not the session's own — that the session is moved onto before
+        // the command is built. Ask for the wrong one here and every restart
+        // afterwards puts the user somewhere they left.
+        assert_eq!(conversation_of(&saved).as_deref(), Some(ran));
+
+        // Built with what was adopted, which is how the caller must use it: the
+        // line spends `$DMAC_CONVERSATION`, and the environment sets it from
+        // the same field, so the two cannot disagree.
+        let line = resume_command("3", ran, &saved);
         assert!(line.starts_with(attached_program()), "{line}");
         assert!(line.contains("--model opus"), "{line}");
         assert!(line.contains("--permission-mode plan"), "{line}");
@@ -514,10 +689,86 @@ mod tests {
             "the dead run's description came back: {line}"
         );
         assert!(
-            !line.contains("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"),
-            "the old conversation id is on the line: {line}"
+            !line.contains(ran) && !line.contains(ours),
+            "an id on the command line is an id quoted through a shell: {line}"
         );
-        assert_eq!(line.matches("--session-id").count(), 1, "{line}");
+        assert!(line.contains("\"$DMAC_CONVERSATION\""), "{line}");
+        // One selector, whichever it is. Two is one too many.
+        assert_eq!(
+            line.matches("--session-id").count() + line.matches("--resume").count(),
+            1,
+            "{line}"
+        );
+    }
+
+    /// `-c` continues the most recent conversation in that directory. It is a
+    /// complete answer on its own, so nothing of ours goes with it: a line
+    /// carrying both `-c` and a conversation id asks the agent two things at
+    /// once.
+    #[test]
+    fn continuing_is_an_answer_and_is_not_argued_with() {
+        let ours = "ffffffff-0000-4000-8000-000000000000";
+        for saved in ["claude -c", "claude --continue --model opus"] {
+            let line = resume_command("3", ours, saved);
+            assert!(
+                line.contains("-c") || line.contains("--continue"),
+                "{saved:?} became {line:?}"
+            );
+            assert!(
+                !line.contains(ours),
+                "{saved:?} came back with the commander's own conversation: {line}"
+            );
+        }
+    }
+
+    /// `--fork-session` resumes a conversation and immediately becomes a
+    /// *different* one, so the id on the line is the parent and not what is
+    /// running. Adopting it would point the session at a conversation the user
+    /// left behind on purpose.
+    #[test]
+    fn a_forked_session_names_a_parent_and_not_what_is_running() {
+        let parent = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let saved = format!("claude --resume {parent} --fork-session");
+        assert_eq!(
+            conversation_of(&saved),
+            None,
+            "the parent was mistaken for the live conversation"
+        );
+        // Replayed as the user wrote it: another fork is at worst a new
+        // conversation, which is never someone else's.
+        let line = resume_command("3", "ffffffff-0000-4000-8000-000000000000", &saved);
+        assert!(line.contains("--fork-session"), "{line}");
+        assert!(
+            !line.contains("ffffffff-0000-4000-8000-000000000000"),
+            "{line}"
+        );
+    }
+
+    /// The id is read from the line only when it is shaped like one. A word
+    /// that is not a UUID is a search term or a mistake, and adopting it would
+    /// point the session at a conversation that does not exist — which fails on
+    /// exactly the restart where the user expects their work back.
+    #[test]
+    fn only_something_shaped_like_a_conversation_is_taken_for_one() {
+        let good = "d0754a32-dd64-4d19-891b-d5bcf3de3d4b";
+        assert_eq!(
+            conversation_of(&format!("claude --resume {good}")).as_deref(),
+            Some(good)
+        );
+        assert_eq!(
+            conversation_of(&format!("claude --session-id={good} --model opus")).as_deref(),
+            Some(good)
+        );
+        for line in [
+            "claude",
+            "claude --resume",
+            "claude --resume auth",
+            "claude -c",
+            "claude --session-id 1234",
+            "claude --model d0754a32-dd64-4d19-891b-d5bcf3de3d4b",
+        ] {
+            assert_eq!(conversation_of(line), None, "{line:?}");
+        }
     }
 
     /// Nothing this sets may change what a command resolves to. That was the
@@ -577,38 +828,90 @@ mod tests {
         );
         // Not a fragment of that object survives: handed to a shell, the braces
         // are globs and the whole line is refused with "bad pattern".
-        assert_eq!(as_resume(seen), "claude");
+        let out = as_resume(seen);
+        assert!(!out.contains('{'), "the description came back: {out}");
+        assert!(!out.contains("mcp"), "something of ours came back: {out}");
+        // The id comes off the line too — it goes back on as the variable the
+        // hosted shell already carries, not as thirty-six characters nobody
+        // can check by eye.
+        assert_eq!(out, "claude");
+        // But it is not *lost*: this is what says which conversation was
+        // running, and the session is moved onto it.
+        assert_eq!(
+            conversation_of(seen).as_deref(),
+            Some("d0754a32-dd64-4d19-891b-d5bcf3de3d4b")
+        );
     }
 
     /// What the *user* chose is theirs, and is not ours to drop.
     #[test]
     fn the_arguments_the_user_chose_survive() {
+        // `--session-id` takes a UUID and nothing else, so a line carrying
+        // anything else could not have started. Both halves go, and the
+        // session's own conversation is used instead.
         assert_eq!(
             as_resume("claude --session-id 1234 --model opus"),
             "claude --model opus"
         );
+        // `--resume` is different: its value is optional and, when it is not an
+        // id, it is a search term for the picker. That is the user choosing how
+        // to get back, and it comes back as they typed it.
         assert_eq!(
             as_resume("/opt/bin/claude --resume=abc --permission-mode auto"),
-            "claude --permission-mode auto"
+            "claude --resume=abc --permission-mode auto"
         );
     }
 
-    /// The one that cost an evening. A resume flag whose id has gone missing
-    /// does not fail — it opens whichever conversation was most recent, and
-    /// lands someone in a conversation they have never seen with no clue why.
+    /// `--session-id` is not optional: it takes a UUID, so a line where the
+    /// value is missing or is not one is a line that never started. Both halves
+    /// go rather than leaving the flag to be answered by the wrong thing, or
+    /// the value to stand on the command line — where, for an agent, a stray
+    /// word is not a stray word, it is a prompt.
     #[test]
-    fn a_resume_flag_never_comes_back_without_its_id() {
+    fn a_session_id_without_a_usable_id_is_dropped_entirely() {
         for line in [
-            "claude --resume",
-            "claude --mcp-config {\"a\":1} --resume",
             "claude --session-id",
-            "/abs/claude -r",
+            "claude --session-id 1234",
+            "claude --session-id=nope --model opus",
         ] {
             let out = as_resume(line);
-            assert!(!out.contains("resume"), "{line:?} became {out:?}");
             assert!(!out.contains("session-id"), "{line:?} became {out:?}");
-            assert!(!out.contains(" -r"), "{line:?} became {out:?}");
+            assert!(!out.contains("1234"), "{line:?} became {out:?}");
+            assert!(!out.contains("nope"), "{line:?} became {out:?}");
         }
+    }
+
+    /// `--resume` with no id is the interactive picker — `claude --help` says
+    /// so: *"Resume a conversation by session ID, or open interactive picker
+    /// with optional search term"*. It is the user's own way of choosing, and a
+    /// hosted shell is a terminal, so the picker appears there exactly as it
+    /// did the first time.
+    ///
+    /// This used to be dropped and replaced with the session's own
+    /// conversation, on the belief that a bare `--resume` silently opens the
+    /// most recent. It does not, and the substitution was the harm: someone who
+    /// picked a different conversation from that list got put back into the
+    /// commander's one, silently, on every restart.
+    #[test]
+    fn a_picker_is_the_user_choosing_and_comes_back_as_a_picker() {
+        for line in ["claude --resume", "/abs/claude -r", "claude --resume auth"] {
+            let out = as_resume(line);
+            assert!(
+                out.contains("--resume") || out.contains("-r"),
+                "{line:?} became {out:?}, which answers a question the user asked to be asked"
+            );
+        }
+        // And nothing of ours is added on top of it: two ways of choosing a
+        // conversation on one line is one way too many.
+        let resumed = resume_command(
+            "3",
+            "ffffffff-0000-4000-8000-000000000000",
+            "claude --resume",
+        );
+        assert!(
+            !resumed.contains("ffffffff-0000-4000-8000-000000000000"),
+            "the commander answered the picker for them: {resumed}"
+        );
     }
 
     /// Everything the user chose is part of what they set up, and giving back

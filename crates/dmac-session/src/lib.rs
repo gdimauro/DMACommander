@@ -359,6 +359,82 @@ impl SessionManager {
         &self.sessions
     }
 
+    /// Each live shell's foreground process group, by session.
+    ///
+    /// One syscall per shell and no forks. What it is worth is not the number
+    /// but the *change* in it: it moves exactly when a program starts or ends
+    /// in that shell, which is the only moment the answer to "is an agent
+    /// running here" can have changed.
+    pub fn foreground_groups(&self) -> Vec<(SessionId, i32)> {
+        self.sessions
+            .iter()
+            .filter_map(|s| Some((s.id, s.hosted()?.foreground_group()?)))
+            .collect()
+    }
+
+    /// Each live shell's pid, by session.
+    pub fn shell_pids(&self) -> Vec<(SessionId, u32)> {
+        self.sessions
+            .iter()
+            .filter_map(|s| Some((s.id, s.hosted()?.pid()?)))
+            .collect()
+    }
+
+    /// Record what each session is hosting, reading the process table once.
+    ///
+    /// Returns whether anything changed, so the caller knows whether this is
+    /// worth a write. Two things are recorded, not one: the agent's command
+    /// line, and — when that line names a conversation — the conversation
+    /// itself, because the agent is the authority on which one it is in. A user
+    /// who types `claude --resume <other>` in a hosted shell has moved the
+    /// session to that conversation, and the session follows.
+    #[cfg(unix)]
+    pub fn observe_agents(&mut self, seen: &[(SessionId, Option<String>)]) -> bool {
+        let mut changed = false;
+        for (id, line) in seen {
+            let Some(s) = self.sessions.iter_mut().find(|s| s.id == *id) else {
+                continue;
+            };
+            if let Some(line) = line
+                && let Some(c) = agent::conversation_of(line)
+                && s.conversation.as_deref() != Some(c.as_str())
+            {
+                s.conversation = Some(c);
+                changed = true;
+            }
+            if s.agent.as_deref() != line.as_deref() {
+                s.agent = line.clone();
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Give every session a conversation id, and say whether that changed
+    /// anything.
+    ///
+    /// The id is the whole of what makes a hosted agent resumable, and it used
+    /// to be minted the first time something asked for it — inside
+    /// [`Session::shell`], on a path that marks nothing as needing saving. A
+    /// commander killed before the next unrelated write therefore had
+    /// `conversation: null` on disk, and the next run minted a *different* id.
+    /// The conversation the user spent the afternoon in was still sitting in
+    /// the agent's own store, and nothing here could name it any more.
+    ///
+    /// Minting up front costs one UUID per session and closes that window
+    /// completely: an id that exists before a shell does is an id the ordinary
+    /// save path has already written.
+    pub fn ensure_conversations(&mut self) -> bool {
+        let mut minted = false;
+        for s in &mut self.sessions {
+            if s.conversation.is_none() {
+                s.conversation = Some(dmac_core::tools::uuid_v4());
+                minted = true;
+            }
+        }
+        minted
+    }
+
     pub fn get(&self, index: usize) -> Option<&Session> {
         self.sessions.get(index)
     }

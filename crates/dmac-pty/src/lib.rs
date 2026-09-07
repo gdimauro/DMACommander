@@ -483,11 +483,7 @@ impl Hosted {
         #[cfg(unix)]
         {
             match self.child.process_id() {
-                Some(pid) => descendants_with_command(pid as libc::pid_t)
-                    .into_iter()
-                    .map(|(_, c)| c)
-                    .filter(|c| !c.is_empty())
-                    .collect(),
+                Some(pid) => ProcessTable::read().commands_under(pid as libc::pid_t),
                 None => Vec::new(),
             }
         }
@@ -495,6 +491,26 @@ impl Hosted {
         {
             Vec::new()
         }
+    }
+
+    /// The same, out of a table someone else already read.
+    ///
+    /// Asking every session separately is one `ps` per session; asking them all
+    /// out of one table is one `ps` for the lot. That is what makes it
+    /// affordable to keep asking while the commander runs, rather than only on
+    /// the way out — and a record only written on the way out is a record a
+    /// `kill -9` erases.
+    #[cfg(unix)]
+    pub fn running_commands_in(&self, table: &ProcessTable) -> Vec<String> {
+        match self.child.process_id() {
+            Some(pid) => table.commands_under(pid as libc::pid_t),
+            None => Vec::new(),
+        }
+    }
+
+    /// The shell's own pid, so a caller holding a table can ask it directly.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.process_id()
     }
 
     /// Where the child actually is, asked of the system rather than remembered.
@@ -554,6 +570,26 @@ impl Hosted {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     pub fn cwd(&self) -> Option<std::path::PathBuf> {
         None
+    }
+
+    /// The terminal's foreground process group, whatever it is.
+    ///
+    /// One `tcgetpgrp` — a syscall, no fork — and it changes exactly when a
+    /// program starts or finishes in this shell. That makes it the cheap half
+    /// of watching for a hosted agent: the expensive half, reading the whole
+    /// process table, only has to run when this number moves. Polling the table
+    /// on a timer instead would cost a `ps` every few seconds forever, which is
+    /// the idle-CPU budget spent on a question whose answer almost never
+    /// changes.
+    pub fn foreground_group(&self) -> Option<i32> {
+        #[cfg(unix)]
+        {
+            self.master.process_group_leader()
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
     }
 
     /// Whether the child has nothing running in the foreground — that is,
@@ -783,48 +819,87 @@ fn descendants(root: libc::pid_t) -> Vec<libc::pid_t> {
 /// what makes reattaching it on the way back in possible.
 #[cfg(unix)]
 fn descendants_with_command(root: libc::pid_t) -> Vec<(libc::pid_t, String)> {
-    use std::collections::HashMap;
+    ProcessTable::read().descendants_with_command(root)
+}
 
-    let Ok(output) = std::process::Command::new("ps")
-        .args(["-Ao", "pid=,ppid=,args="])
-        .output()
-    else {
-        return Vec::new();
-    };
-    let mut children: HashMap<libc::pid_t, Vec<libc::pid_t>> = HashMap::new();
-    let mut command: HashMap<libc::pid_t, String> = HashMap::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let mut it = line.split_whitespace();
-        if let (Some(pid), Some(ppid)) = (it.next(), it.next())
-            && let (Ok(pid), Ok(ppid)) = (pid.parse(), ppid.parse())
-        {
-            children.entry(ppid).or_default().push(pid);
-            // The whole command line, arguments and all. The program name alone
-            // is not enough to start something again as it was: a model, a
-            // permission mode or a working directory chosen on the command line
-            // is part of what the user set up, and dropping it silently gives
-            // them back something that only looks like what they had.
-            command.insert(pid, it.collect::<Vec<_>>().join(" "));
-        }
-    }
+/// Every process on the machine, read once.
+///
+/// Asking per shell means one `ps` per session, and the question is asked of
+/// every session at once — on the way out, and now also while running, to keep
+/// a record of what is hosted that survives a commander that never gets to shut
+/// down. One fork answering for all of them is the difference between a poll
+/// that can run every few seconds and one that cannot.
+#[cfg(unix)]
+pub struct ProcessTable {
+    children: std::collections::HashMap<libc::pid_t, Vec<libc::pid_t>>,
+    command: std::collections::HashMap<libc::pid_t, String>,
+}
 
-    // Breadth-first from the root, then reversed: killing children before their
-    // parents keeps a supervisor from noticing and restarting one.
-    let mut out: Vec<(libc::pid_t, String)> = Vec::new();
-    let mut queue = vec![root];
-    while let Some(pid) = queue.pop() {
-        for &child in children.get(&pid).into_iter().flatten() {
-            // A cycle is impossible in a process tree, but a pid that has been
-            // reused between reading and walking is not; the guard costs
-            // nothing and the alternative is an infinite loop at shutdown.
-            if child != root && !out.iter().any(|(p, _)| *p == child) {
-                out.push((child, command.get(&child).cloned().unwrap_or_default()));
-                queue.push(child);
+#[cfg(unix)]
+impl ProcessTable {
+    /// Read the table. Empty if `ps` cannot be run, which reads downstream as
+    /// "nothing is running" — the safe answer, since it only ever costs a
+    /// reattachment offer, never a wrong one.
+    pub fn read() -> Self {
+        let mut children: std::collections::HashMap<libc::pid_t, Vec<libc::pid_t>> =
+            std::collections::HashMap::new();
+        let mut command: std::collections::HashMap<libc::pid_t, String> =
+            std::collections::HashMap::new();
+        let Ok(output) = std::process::Command::new("ps")
+            .args(["-Ao", "pid=,ppid=,args="])
+            .output()
+        else {
+            return Self { children, command };
+        };
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let mut it = line.split_whitespace();
+            if let (Some(pid), Some(ppid)) = (it.next(), it.next())
+                && let (Ok(pid), Ok(ppid)) = (pid.parse(), ppid.parse())
+            {
+                children.entry(ppid).or_default().push(pid);
+                // The whole command line, arguments and all. The program name
+                // alone is not enough to start something again as it was: a
+                // model, a permission mode or a working directory chosen on the
+                // command line is part of what the user set up, and dropping it
+                // silently gives them back something that only looks like what
+                // they had.
+                command.insert(pid, it.collect::<Vec<_>>().join(" "));
             }
         }
+        Self { children, command }
     }
-    out.reverse();
-    out
+
+    /// Everything below `root`, deepest first, with each command line.
+    pub fn descendants_with_command(&self, root: libc::pid_t) -> Vec<(libc::pid_t, String)> {
+        // Breadth-first from the root, then reversed: killing children before
+        // their parents keeps a supervisor from noticing and restarting one.
+        let mut out: Vec<(libc::pid_t, String)> = Vec::new();
+        let mut queue = vec![root];
+        while let Some(pid) = queue.pop() {
+            for &child in self.children.get(&pid).into_iter().flatten() {
+                // A cycle is impossible in a process tree, but a pid that has
+                // been reused between reading and walking is not; the guard
+                // costs nothing and the alternative is an infinite loop at
+                // shutdown.
+                if child != root && !out.iter().any(|(p, _)| *p == child) {
+                    out.push((child, self.command.get(&child).cloned().unwrap_or_default()));
+                    queue.push(child);
+                }
+            }
+        }
+        out.reverse();
+        out
+    }
+
+    /// The command lines running under `root`, which is what recognising an
+    /// agent needs and all it needs.
+    pub fn commands_under(&self, root: libc::pid_t) -> Vec<String> {
+        self.descendants_with_command(root)
+            .into_iter()
+            .map(|(_, c)| c)
+            .filter(|c| !c.is_empty())
+            .collect()
+    }
 }
 
 /// The user's shell, from the environment, with a platform-appropriate default.

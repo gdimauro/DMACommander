@@ -59,6 +59,11 @@ pub(crate) enum Update {
         start: usize,
         items: Vec<String>,
     },
+    /// What each session's shell is hosting, read off the process table away
+    /// from the render loop. Recorded as it arrives rather than only at
+    /// shutdown, so a commander that never gets to shut down still leaves
+    /// behind what its agents were.
+    Agents(Vec<(SessionId, Option<String>)>),
     /// A hosted shell changed what is on its screen. Carries nothing: the
     /// message exists only to break the event loop out of its wait, and the
     /// frame that follows reads the emulator directly.
@@ -259,6 +264,13 @@ pub struct App {
     /// Set when the session set changed; the loop flushes it, debounced, so a
     /// burst of edits costs one write rather than one per keystroke.
     dirty_at: Option<std::time::Instant>,
+    /// The foreground process group of each session's shell, as last seen.
+    ///
+    /// Kept only to notice when one moves, which is the moment — and the only
+    /// moment — that what a shell is hosting can have changed. Reading it is a
+    /// syscall per shell; reading the process table is a fork, and this is what
+    /// keeps the second from happening on a timer.
+    agent_fg: Vec<(dmac_session::SessionId, i32)>,
     /// Full screen: the frame stripped off, leaving only contents on black.
     pub(crate) fullscreen: bool,
     /// Agents from the last run, waiting for an answer to "resume?".
@@ -486,6 +498,7 @@ impl App {
             prompt_value: String::new(),
             store,
             dirty_at: None,
+            agent_fg: Vec::new(),
             cursor_style: cursor,
             cursor_phase: std::time::Instant::now(),
             theme: Theme::default(),
@@ -735,6 +748,7 @@ impl App {
                 items,
             } => self.apply_completion(session, generation, start, items),
             Update::Editor(Ok(message) | Err(message)) => self.status = message,
+            Update::Agents(seen) => self.record_agents(&seen),
             Update::Rebuilt(Ok(())) => self.restart_in_place(),
             // A failed build changes nothing: the point of building first is
             // that a broken tree costs you a message, not your session.
@@ -1055,12 +1069,106 @@ impl App {
         None
     }
 
+    /// Write the sessions now, outside the debounce.
+    ///
+    /// The 600ms debounce is right for preferences — a rename typed one letter
+    /// at a time must not be one file write per letter — and wrong for the two
+    /// facts whose loss cannot be undone: the conversation id a session owns,
+    /// and the agent seen running in it. Both are what a restart needs to give
+    /// the user back what they were talking to, both change rarely, and the
+    /// window the debounce leaves open is exactly the window a `kill -9` falls
+    /// into.
+    ///
+    /// `clean_exit: false`, because this is a run still going. Only
+    /// [`save_on_exit`](Self::save_on_exit) may claim otherwise.
+    fn save_now(&mut self) {
+        self.dirty_at = None;
+        if let Some(store) = &self.store
+            && let Err(e) = store.save(&self.sessions, false)
+        {
+            self.status = format!("could not save sessions: {e}");
+        }
+    }
+
+    /// Notice when a shell's foreground process group moves, and only then go
+    /// and look at what it is running.
+    ///
+    /// The cheap half of keeping a record of hosted agents. A program starting
+    /// or finishing in a shell moves that shell's foreground group, and nothing
+    /// else does — so this one syscall per shell, on frames that were going to
+    /// happen anyway, replaces a `ps` on a timer. The timer version is what the
+    /// idle-CPU budget cannot pay for: a fork every few seconds, forever, to
+    /// answer a question whose answer changes twice a day.
+    #[cfg(unix)]
+    pub(crate) fn watch_agents(&mut self) {
+        let now = self.sessions.foreground_groups();
+        if now == self.agent_fg {
+            return;
+        }
+        self.agent_fg = now;
+        let shells = self.sessions.shell_pids();
+        if shells.is_empty() {
+            // Every shell has gone. Nothing to scan, and nothing to clear
+            // either: a shell that closed did not take its agent's conversation
+            // with it.
+            return;
+        }
+        // Off the render loop: reading the process table is a fork, and a fork
+        // in the middle of a frame is the frame budget spent on bookkeeping.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let tx = self.tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ = tx.send(Update::Agents(dmac_session::agent::scan(&shells)));
+        });
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn watch_agents(&mut self) {}
+
+    /// Write down what the sessions are hosting, if it is news.
+    ///
+    /// Immediately, not on the debounce. This is the record that makes a
+    /// restart able to put an agent back, and the window between "claude
+    /// started" and "the next unrelated save" is exactly the window in which
+    /// closing the terminal window loses it.
+    #[cfg(unix)]
+    pub(crate) fn record_agents(&mut self, seen: &[(dmac_session::SessionId, Option<String>)]) {
+        if self.sessions.observe_agents(seen) {
+            self.save_now();
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn record_agents(&mut self, _seen: &[(dmac_session::SessionId, Option<String>)]) {}
+
+    /// Make sure every session owns a conversation, and put it on disk if any
+    /// had to be made.
+    ///
+    /// Called where sessions come into existence — at startup after the
+    /// restore, and when one is created — so that by the time a shell can be
+    /// opened the id it will hand to an agent has already been written.
+    pub(crate) fn ensure_conversations(&mut self) {
+        if self.sessions.ensure_conversations() {
+            self.save_now();
+        }
+    }
+
     /// Final write, marking a clean exit so the next start knows we did not crash.
     fn save_on_exit(&mut self) {
         // What is running has to be looked at before anything is torn down:
-        // afterwards there is nothing left to ask.
-        for i in 0..self.sessions.len() {
-            self.sessions.at_mut(i).agent = self.sessions.at_mut(i).running_agent();
+        // afterwards there is nothing left to ask. One read of the process
+        // table for every session, not one per session — and through the same
+        // path the running commander uses, so a clean exit and a crash leave
+        // the same kind of record rather than two that can disagree.
+        #[cfg(unix)]
+        {
+            let shells = self.sessions.shell_pids();
+            if !shells.is_empty() {
+                let seen = dmac_session::agent::scan(&shells);
+                self.sessions.observe_agents(&seen);
+            }
         }
         if let Some(store) = &self.store
             && let Err(e) = store.save(&self.sessions, true)
@@ -1242,6 +1350,7 @@ impl App {
                 let i = self.sessions.create(name, left, right);
                 self.reload(PanelId::Left);
                 self.reload(PanelId::Right);
+                self.ensure_conversations();
                 self.touch_sessions();
                 self.mode = Mode::Rail { selected: i };
                 self.after_session_switch();
@@ -1435,11 +1544,17 @@ impl App {
             let Some(saved) = self.sessions.at_mut(i).reattach.take() else {
                 continue;
             };
-            // Never verbatim: the saved line names the conversation it
-            // *created*, and asking for that one again is refused. Ours is
-            // stripped and put back as this run's — the conversation resumed,
-            // this commander's socket, and every argument the user chose kept.
+            // Never verbatim: what belonged to the run that ended — its
+            // socket, named in a `--mcp-config` — died with it, and a
+            // `--session-id` naming a conversation that now exists is refused
+            // on the way back in. What the *user* chose is kept, and so is the
+            // conversation: the agent is the authority on which one it was in,
+            // and if that is not the one this session remembered, the session
+            // is what was out of date.
             let session = self.sessions.at_mut(i);
+            if let Some(c) = dmac_session::agent::conversation_of(&saved) {
+                session.conversation = Some(c);
+            }
             let id = session.id.0.to_string();
             let conversation = session.conversation_id().to_string();
             let command = dmac_session::agent::resume_command(&id, &conversation, &saved);
@@ -3662,6 +3777,10 @@ pub async fn run(mut start: Startup) -> anyhow::Result<()> {
         app.reload(PanelId::Left);
         app.reload(PanelId::Right);
     }
+    // Before anything can open a shell. A session restored from a file written
+    // by a version that minted these lazily has none yet, and minting it here
+    // rather than on the way into a shell is what gets it written.
+    app.ensure_conversations();
     // After the restore, never before: a width given on the command line has to
     // win over the saved one, and applying it first would have it overwritten.
     if let Some(w) = rail_override.collapsed {
@@ -3733,6 +3852,7 @@ pub async fn run(mut start: Startup) -> anyhow::Result<()> {
         app.before_frame();
         guard.terminal().draw(|f| ui::draw(f, &mut app))?;
         app.sync_shell_size();
+        app.watch_agents();
         if first_frame {
             first_frame = false;
             // After the frame, so a cold start still shows something inside its
@@ -4336,6 +4456,79 @@ mod tests {
             app.ses().hosted().is_none(),
             "nothing may be running before the answer"
         );
+    }
+
+    /// The whole reason for watching while the commander runs.
+    ///
+    /// An agent written down only at shutdown is an agent lost to a `kill -9`,
+    /// a closed terminal window or a panic — and with it the one record that
+    /// could have brought the conversation back. Observed, adopted, and on disk
+    /// before anything can go wrong.
+    #[cfg(unix)]
+    #[test]
+    fn what_is_running_is_on_disk_before_the_commander_can_die() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sessions.json");
+        let mut app = fixture();
+        app.store = Some(SessionStore::at(&path));
+        app.ensure_conversations();
+
+        let id = app.sessions.current().id;
+        let ran = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let line = format!("claude --resume {ran} --model opus");
+        assert_ne!(
+            app.sessions.current_mut().conversation_id(),
+            ran,
+            "the session has to start out believing something else, or this proves nothing"
+        );
+
+        app.record_agents(&[(id, Some(line.clone()))]);
+
+        // No clean shutdown, no debounce elapsing, nothing torn down: the file
+        // already says it.
+        let (loaded, clean) = SessionStore::at(&path)
+            .load()
+            .expect("load")
+            .expect("something was written");
+        assert!(!clean, "a run still going has not exited cleanly");
+        // On the way back in it is `reattach`, not `agent`: one is what was
+        // running last time and the other what is running now, and the whole
+        // point of this record is that it crosses between the two.
+        assert_eq!(loaded.all()[0].reattach.as_deref(), Some(line.as_str()));
+        assert_eq!(
+            loaded.all()[0].conversation.as_deref(),
+            Some(ran),
+            "the agent is the authority on which conversation this is, not the session"
+        );
+    }
+
+    /// The command spends `$DMAC_CONVERSATION` and the hosted shell's
+    /// environment sets it. They read the same field, and they have to: a line
+    /// naming one conversation while the variable holds another is a mismatch
+    /// nothing on screen would show, and the user would land somewhere else
+    /// with no way to tell why.
+    #[cfg(unix)]
+    #[test]
+    fn the_line_and_the_environment_name_the_same_conversation() {
+        let mut app = fixture();
+        app.ensure_conversations();
+        let ran = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        app.sessions.current_mut().reattach = Some(format!("claude --session-id {ran} --verbose"));
+
+        app.reattach_agents();
+
+        assert_eq!(app.pending.len(), 1);
+        assert!(
+            app.pending[0].command.contains("\"$DMAC_CONVERSATION\""),
+            "{}",
+            app.pending[0].command
+        );
+        assert_eq!(
+            app.sessions.current_mut().conversation_id(),
+            ran,
+            "the session was not moved onto the conversation that was running"
+        );
+        assert_eq!(app.pending[0].conversation, ran);
     }
 
     /// The saved line is an `argv` seen through `ps`, quoting and all already

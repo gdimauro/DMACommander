@@ -515,6 +515,48 @@ mod tests {
         );
     }
 
+    /// The conversation id is the only handle anything has on a hosted agent's
+    /// conversation, and it used to be minted lazily — inside `Session::shell`,
+    /// which marks nothing as needing saving. A commander killed before the
+    /// next unrelated write saved `conversation: null`, the next run minted a
+    /// different id, and the conversation the user had been in all afternoon
+    /// was still in the agent's own store and permanently unnameable from here.
+    ///
+    /// So: minted up front, and on disk before a shell exists to want one.
+    #[test]
+    fn a_conversation_id_exists_before_anything_can_lose_it() {
+        let (_d, s) = store();
+        let mut m = manager();
+        assert!(m.ensure_conversations(), "nothing had one yet");
+        let ids: Vec<Option<String>> = m.all().iter().map(|x| x.conversation.clone()).collect();
+        assert!(
+            ids.iter().all(|c| c.is_some()),
+            "every session, not just one"
+        );
+        assert_ne!(ids[0], ids[1], "two sessions are two conversations");
+
+        // The point of minting early: an ordinary save carries it, so the id
+        // survives a run that never gets to shut down.
+        s.save(&m, false).expect("save");
+        let (loaded, clean) = s.load().expect("load").expect("some");
+        assert!(!clean, "this is the crashed case");
+        assert_eq!(
+            loaded
+                .all()
+                .iter()
+                .map(|x| x.conversation.clone())
+                .collect::<Vec<_>>(),
+            ids,
+            "the ids come back exactly, or the conversations are orphaned"
+        );
+
+        let mut loaded = loaded;
+        assert!(
+            !loaded.ensure_conversations(),
+            "a second pass must not re-mint over conversations that exist"
+        );
+    }
+
     #[test]
     fn an_empty_session_list_is_treated_as_no_sessions() {
         let (_d, s) = store();
