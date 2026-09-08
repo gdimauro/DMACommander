@@ -1,8 +1,15 @@
 //! "Pick up where you left off?"
 //!
-//! Shown at startup when the last run was hosting agents. It is a question and
-//! not a notification: resuming a conversation reads it back, may act on it, and
-//! costs money — so it says exactly what it would start, and waits.
+//! Shown at startup when the last run left something open: agents in shells,
+//! and editor windows. It is a question and not a notification. Resuming a
+//! conversation reads it back, may act on it, and costs money; reopening five
+//! windows puts five windows on your screen. So it lists exactly what it would
+//! bring back, every row ticked, and waits — untick the one you do not want.
+//!
+//! One list for both kinds, on purpose. "Where you left off" is a single
+//! question, and the person answering it wants the TimePulse agent and the
+//! GreenPulse window and none of the rest — not two prompts that each know
+//! half of what was there.
 
 use crate::app::Pending;
 use crate::theme::Theme;
@@ -42,14 +49,30 @@ pub fn draw(
         return inner;
     }
 
-    let plural = if pending.len() == 1 {
-        "conversation was".to_string()
-    } else {
-        format!("{} conversations were", pending.len())
+    let agents = pending.iter().filter(|p| !p.is_window()).count();
+    let windows = pending.len() - agents;
+    let count = |n: usize, one: &str, many: &str| match n {
+        1 => format!("1 {one}"),
+        n => format!("{n} {many}"),
+    };
+    let headline = match (agents, windows) {
+        (a, 0) => format!(
+            " {} going when dmac last exited.",
+            count(a, "conversation was", "conversations were")
+        ),
+        (0, w) => format!(
+            " {} open when dmac last exited.",
+            count(w, "window was", "windows were")
+        ),
+        (a, w) => format!(
+            " {} and {} open when dmac last exited.",
+            count(a, "conversation", "conversations"),
+            count(w, "window", "windows")
+        ),
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            format!(" {plural} going when dmac last exited."),
+            headline,
             Style::default().fg(theme.panel_fg),
         ))),
         Rect { height: 1, ..inner },
@@ -80,15 +103,26 @@ fn row<'a>(p: &'a Pending, is_selected: bool, width: usize, theme: &Theme) -> Li
     // it is: something you can change before saying yes to the lot.
     let mark = if p.chosen { "[x]" } else { "[ ]" };
 
-    // The first eight characters of the id are enough to tell two apart and
-    // short enough to leave room for the command that will actually run.
-    let short: String = p.conversation.chars().take(8).collect();
+    // An agent row shows the command that will run and the first eight
+    // characters of its id — enough to tell two apart, short enough to leave
+    // room. A window row shows the folder, marked as a window so the two kinds
+    // read differently at a glance.
+    let (body_text, tail) = match &p.what {
+        crate::app::PendingWhat::Agent {
+            command,
+            conversation,
+            ..
+        } => {
+            let short: String = conversation.chars().take(8).collect();
+            (command.as_str(), format!("{short} "))
+        }
+        crate::app::PendingWhat::Window { dir } => (dir.as_str(), "window ".to_string()),
+    };
     let text = format!(
         " {mark} {:<10} {}",
         truncate(&p.session_name, 10),
-        p.command
+        body_text
     );
-    let tail = format!("{short} ");
 
     let room = width.saturating_sub(tail.chars().count());
     let body = truncate(&text, room);

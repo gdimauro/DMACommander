@@ -12,11 +12,11 @@ row opens wherever that session currently is.
 `code`, unless `DMAC_EDITOR` says otherwise — a name to look up on `PATH`, or an
 absolute path taken as given.
 
-It is invoked as `code -r <dir>`, which reuses the last active window rather than
-adding a fifth one. If a window already has that folder open, VS Code brings it
-forward instead of loading it again. That is deliberately the editor's decision
-and not ours: it already knows which folders it has open, and asking it is more
-reliable than matching on window titles.
+It is invoked as `code <dir>`. A folder that is already open in some window is
+brought forward rather than loaded again — that is deliberately the editor's
+decision and not ours, since it already knows which folders it has open and
+asking it is more reliable than matching on window titles. A folder that is not
+open gets a window of its own, which is what lets several be reopened at once.
 
 ## Which screen
 
@@ -68,6 +68,20 @@ edge where its title bar cannot be reached.
 The terminal window comes back only in an arrangement it has been seen in. On a
 new one it stays where you just opened it: you put it there on purpose, and
 moving it would be rearranging your desk for no reason.
+
+## Which windows come back is yours to say
+
+Nothing is reopened silently. At startup, the same dialog that offers to resume
+last time's agents also lists every editor window the last run had open — one
+row per session, every row ticked — and waits. Untick the ones you do not want
+this morning and press `y`; the rest come back, each at its place for this set
+of monitors. `n` reopens nothing.
+
+Saying no forgets nothing: the session still remembers where its window was,
+entering the session still finds it if it is open, and the next start offers it
+again. The list is only offered at all if you left the "reopen the same windows"
+box ticked on the way out — untick that at `F10` and the next start opens the
+panels and nothing else.
 
 Closing the editor at home forgets home's place and nothing else. The office's
 is still a fact about the office.

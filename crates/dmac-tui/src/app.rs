@@ -205,15 +205,65 @@ pub(crate) struct Pending {
     /// Index into the session list.
     pub session: usize,
     pub session_name: String,
-    /// `claude`, `codex`, whatever it was.
-    pub program: String,
-    /// What will actually be run: the command, not the expansion of it —
-    /// see [`dmac_session::agent::as_resume`].
-    pub command: String,
-    pub conversation: String,
-    /// Unticked rows are left alone: their conversation id is kept, so running
-    /// the agent by hand later still comes back to it.
+    /// Unticked rows are left alone. An agent's conversation id is kept, so
+    /// running it by hand later still comes back to it; a window's place is
+    /// kept, so entering the session still knows where it was.
     pub chosen: bool,
+    pub what: PendingWhat,
+}
+
+/// The two kinds of thing the last run left open, and the one dialog that
+/// offers to bring them back.
+///
+/// One list rather than two dialogs: "pick up where you left off" is a single
+/// question, and the person answering it wants to tick the TimePulse agent and
+/// the GreenPulse window and leave the rest — not answer two prompts that each
+/// know half of what was there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PendingWhat {
+    Agent {
+        /// `claude`, `codex`, whatever it was.
+        program: String,
+        /// What will actually be run: the command, not the expansion of it —
+        /// see [`dmac_session::agent::as_resume`].
+        command: String,
+        conversation: String,
+    },
+    /// An editor window the session had open, to be reopened at the place it
+    /// had in this arrangement of monitors — or fitted, if this arrangement
+    /// has never been seen.
+    Window { dir: String },
+}
+
+impl Pending {
+    pub fn is_window(&self) -> bool {
+        matches!(self.what, PendingWhat::Window { .. })
+    }
+}
+
+/// Projections of an agent row, for tests that assert on what would run. The
+/// program reads `what` directly; these exist so a test can say
+/// `p.command()` rather than destructure an enum to check one string.
+#[cfg(test)]
+impl Pending {
+    pub fn program(&self) -> &str {
+        match &self.what {
+            PendingWhat::Agent { program, .. } => program,
+            PendingWhat::Window { .. } => "",
+        }
+    }
+    pub fn command(&self) -> &str {
+        match &self.what {
+            PendingWhat::Agent { command, .. } => command,
+            PendingWhat::Window { .. } => "",
+        }
+    }
+    pub fn conversation(&self) -> &str {
+        match &self.what {
+            PendingWhat::Agent { conversation, .. } => conversation,
+            PendingWhat::Window { .. } => "",
+        }
+    }
 }
 
 /// What a prompt is collecting. The value itself lives on `App`, because a
@@ -2123,11 +2173,31 @@ impl App {
             self.pending.push(Pending {
                 session: i,
                 session_name: session.name.clone(),
-                program,
-                command,
-                conversation: session.conversation_id().to_string(),
                 chosen: true,
+                what: PendingWhat::Agent {
+                    program,
+                    command,
+                    conversation: session.conversation_id().to_string(),
+                },
             });
+        }
+        // And the windows, after the agents, if the way out said to bring them
+        // back. Every session that had one is offered — not only the one on
+        // screen — because "reopen the same windows" means all of them, at
+        // once, where they were.
+        if self.sessions.restore_windows {
+            for i in 0..self.sessions.len() {
+                let session = self.sessions.at(i);
+                let Some(w) = session.editor.as_ref() else {
+                    continue;
+                };
+                self.pending.push(Pending {
+                    session: i,
+                    session_name: session.name.clone(),
+                    chosen: true,
+                    what: PendingWhat::Window { dir: w.dir.clone() },
+                });
+            }
         }
         if !self.pending.is_empty() {
             self.mode = Mode::Reattach { selected: 0 };
@@ -2142,11 +2212,19 @@ impl App {
         let mut cleared = 0;
 
         for p in &wanted {
+            let PendingWhat::Agent {
+                program,
+                command,
+                conversation,
+            } = &p.what
+            else {
+                continue;
+            };
             // Anything still holding this conversation is an orphan from a run
             // that did not get to clean up, and it is holding exactly what we
             // are about to ask for. Left alone it produces "that session is
             // already in use" on a fresh start.
-            cleared += dmac_session::agent::clear_orphans(&p.conversation);
+            cleared += dmac_session::agent::clear_orphans(conversation);
 
             let waker = self.waker();
             let (cols, rows) = self.shell_size();
@@ -2156,34 +2234,99 @@ impl App {
             let session = self.sessions.at_mut(p.session);
             match session.shell(cols, rows, waker) {
                 Ok(shell) => {
-                    if shell.run(&p.command).is_ok() {
+                    if shell.run(command).is_ok() {
                         // Show the shell: reattaching something and leaving the
                         // user on the panels hides the very thing just started.
                         session.view = dmac_session::View::Shell;
                         started += 1;
                     }
                 }
-                Err(e) => self.status = format!("could not resume {}: {e}", p.program),
+                Err(e) => self.status = format!("could not resume {program}: {e}"),
             }
         }
 
-        if started > 0 {
-            self.status = match cleared {
-                0 => format!("resumed {started}"),
-                n => format!("resumed {started} — cleared {n} left over"),
-            };
+        let windows = self.windows_to_reopen(&wanted);
+        let reopened = windows.len();
+        self.reopen_windows(windows);
+
+        if started > 0 || reopened > 0 {
+            let mut parts = Vec::new();
+            if started > 0 {
+                parts.push(format!("resumed {started}"));
+            }
+            if reopened > 0 {
+                parts.push(format!("reopened {reopened} window(s)"));
+            }
+            if cleared > 0 {
+                parts.push(format!("cleared {cleared} left over"));
+            }
+            self.status = parts.join(" \u{2014} ");
+        }
+    }
+
+    /// The windows among the ticked rows, with what each session remembers
+    /// about where they were. Split out so the selection can be tested
+    /// without a window server.
+    fn windows_to_reopen(&self, wanted: &[Pending]) -> Vec<(String, dmac_session::EditorWindow)> {
+        wanted
+            .iter()
+            .filter_map(|p| match &p.what {
+                PendingWhat::Window { dir } => {
+                    let w = self.sessions.get(p.session)?.editor.clone()?;
+                    (w.dir == *dir).then_some((dir.clone(), w))
+                }
+                PendingWhat::Agent { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Open each window at the place it had in this arrangement — exact where
+    /// this arrangement has been seen, fitted onto the screen you are on where
+    /// it has not.
+    ///
+    /// One task, in sequence, rather than one per window: placement takes a
+    /// lock anyway, and a window that is asked for while the previous one is
+    /// still appearing is a window the placing script may count as the wrong
+    /// one.
+    fn reopen_windows(&self, windows: Vec<(String, dmac_session::EditorWindow)>) {
+        if windows.is_empty() {
+            return;
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn_blocking(move || {
+                let screens = dmac_desktop::screens();
+                let key = dmac_desktop::arrangement_key(&screens);
+                for (dir, w) in windows {
+                    let dir = std::path::PathBuf::from(dir);
+                    // Already open: bring it forward, move nothing.
+                    if matches!(dmac_desktop::raise_editor_for(&dir), Ok(true)) {
+                        continue;
+                    }
+                    let Some((placed, _)) = w.placement_for(&key) else {
+                        continue;
+                    };
+                    let frame = dmac_desktop::fit(&placement_from(placed), &screens);
+                    let _ = dmac_desktop::restore_editor(&dir, frame);
+                }
+            });
         }
     }
 
     /// Say no. The conversation ids are kept either way: running the agent by
     /// hand later still comes back to where it was.
     fn decline_pending(&mut self) {
-        let n = self.pending.len();
+        let agents = self.pending.iter().filter(|p| !p.is_window()).count();
+        let windows = self.pending.len() - agents;
         self.pending.clear();
         self.mode = Mode::Normal;
-        if n > 0 {
-            self.status = format!("left {n} conversation(s) alone — run the agent to pick one up");
-        }
+        self.status = match (agents, windows) {
+            (0, 0) => return,
+            (a, 0) => {
+                format!("left {a} conversation(s) alone \u{2014} run the agent to pick one up")
+            }
+            (0, w) => format!("left {w} window(s) closed \u{2014} F9, o opens one where you are"),
+            (a, w) => format!("left {a} conversation(s) and {w} window(s) alone"),
+        };
     }
 
     /// Bring this session's editor window forward, if it has one.
@@ -2196,27 +2339,20 @@ impl App {
         let Ok(dir) = self.editor_here_target() else {
             return;
         };
-        // What this session had open last time, and where — in every
-        // arrangement of monitors it has been seen in. Which of those applies
-        // is decided on the task, where the screens can be asked.
-        let remembered = self
-            .ses()
-            .editor
-            .clone()
-            .filter(|w| w.dir == dir.display().to_string());
         let id = self.sessions.current().id;
         let tx = self.tx.clone();
-        // Whether a window that is *not* open should be reopened at all — the
-        // quit dialog's first tick. Raising one that is open is not gated: that
-        // moves nothing and opens nothing.
-        let reopen = self.sessions.restore_windows;
+        // Raise only. Reopening a window that is not there happens in one
+        // place — the dialog at startup, where every window the last run had
+        // is offered and any can be left unticked. Reopening here as well
+        // would bring back, on the first visit to a session, exactly the
+        // window the user had just said no to.
+        //
         // Off the render thread, and only when there is one to be off: a test
         // switches sessions too, and it has no runtime to spawn onto.
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn_blocking(move || {
-                // Already open somewhere: bring it forward and leave it exactly
-                // where the user put it. Restoring a window that is on screen
-                // is not restoring anything, it is moving something.
+                // Bring it forward and leave it exactly where the user put it,
+                // and take the chance to write down where that is.
                 if matches!(dmac_desktop::raise_editor_for(&dir), Ok(true)) {
                     let (key, placed) = read_placement(&dir);
                     let _ = tx.send(Update::EditorFrame {
@@ -2225,24 +2361,7 @@ impl App {
                         key,
                         placed,
                     });
-                    return;
                 }
-                let Some(w) = remembered.filter(|_| reopen) else {
-                    return;
-                };
-                let screens = dmac_desktop::screens();
-                let key = dmac_desktop::arrangement_key(&screens);
-                let Some((placed, exact)) = w.placement_for(&key) else {
-                    return;
-                };
-                // This arrangement's own place comes back as it was — `fit`
-                // is the identity there, short of a window that had strayed
-                // off its screen. Another arrangement's place is mapped onto
-                // the screen the user is on, because `x = -3412` on a laptop
-                // alone is a window nobody can see.
-                let frame = dmac_desktop::fit(&placement_from(placed), &screens);
-                let _ = exact;
-                let _ = dmac_desktop::restore_editor(&dir, frame);
             });
         }
     }
@@ -6282,7 +6401,7 @@ mod tests {
 
         assert!(matches!(app.mode, Mode::Reattach { selected: 0 }));
         assert_eq!(app.pending.len(), 1);
-        assert_eq!(app.pending[0].program, "claude");
+        assert_eq!(app.pending[0].program(), "claude");
         assert!(
             app.ses().hosted().is_none(),
             "nothing may be running before the answer"
@@ -6319,6 +6438,77 @@ mod tests {
             matches!(app.mode, Mode::ConfirmQuit { .. }),
             "F10 in the menu did not ask"
         );
+    }
+
+    // ---- picking up where you left off, windows included ----
+
+    /// Every window the last run had is offered at startup, ticked, beside the
+    /// agents — one list, one question. And only if the way out said so.
+    #[test]
+    fn the_startup_list_offers_every_window_and_the_quit_tick_gates_it() {
+        let mut app = fixture();
+        app.merge_placement(0, "/prj/one", "office", Some(placed(10, 10)));
+        app.sessions
+            .create("two", VfsPath::local("/prj/two"), VfsPath::local("/x"));
+        app.merge_placement(1, "/prj/two", "office", Some(placed(20, 20)));
+        app.sessions
+            .create("bare", VfsPath::local("/prj/bare"), VfsPath::local("/x"));
+        app.sessions.current_mut().reattach = Some("claude --model opus".into());
+
+        app.reattach_agents();
+        assert!(matches!(app.mode, Mode::Reattach { .. }));
+        let windows: Vec<&str> = app
+            .pending
+            .iter()
+            .filter(|p| p.is_window())
+            .map(|p| p.session_name.as_str())
+            .collect();
+        assert_eq!(windows, ["test", "two"], "{:?}", app.pending);
+        assert!(app.pending.iter().all(|p| p.chosen), "ticked by default");
+        assert_eq!(
+            app.pending.iter().filter(|p| !p.is_window()).count(),
+            1,
+            "the agent is still there beside them"
+        );
+
+        // Said "do not reopen" on the way out: no window is even offered.
+        app.mode = Mode::Normal;
+        app.sessions.current_mut().reattach = Some("claude".into());
+        app.sessions.restore_windows = false;
+        app.reattach_agents();
+        assert!(
+            app.pending.iter().all(|p| !p.is_window()),
+            "windows were offered after being declined: {:?}",
+            app.pending
+        );
+    }
+
+    /// An unticked window stays closed, and what the session remembers about
+    /// it is untouched — so entering that session later still knows where it
+    /// was, and the next start offers it again.
+    #[test]
+    fn an_unticked_window_is_left_closed_and_still_remembered() {
+        let mut app = fixture();
+        app.merge_placement(0, "/prj/one", "office", Some(placed(10, 10)));
+        app.sessions
+            .create("two", VfsPath::local("/prj/two"), VfsPath::local("/x"));
+        app.merge_placement(1, "/prj/two", "office", Some(placed(20, 20)));
+        app.reattach_agents();
+
+        // Untick the first window row.
+        let first = app
+            .pending
+            .iter()
+            .position(|p| p.is_window())
+            .expect("a window row");
+        app.pending[first].chosen = false;
+        let wanted: Vec<Pending> = app.pending.iter().filter(|p| p.chosen).cloned().collect();
+        let reopen = app.windows_to_reopen(&wanted);
+        assert_eq!(reopen.len(), 1, "{reopen:?}");
+        assert_eq!(reopen[0].0, "/prj/two");
+
+        // Nothing was forgotten by saying no.
+        assert!(app.sessions.at(0).editor.is_some());
     }
 
     // ---- windows, per arrangement of monitors ----
@@ -7225,16 +7415,16 @@ run = "echo pwned"
 
         assert_eq!(app.pending.len(), 1);
         assert!(
-            app.pending[0].command.contains("\"$DMAC_CONVERSATION\""),
+            app.pending[0].command().contains("\"$DMAC_CONVERSATION\""),
             "{}",
-            app.pending[0].command
+            app.pending[0].command()
         );
         assert_eq!(
             app.sessions.current_mut().conversation_id(),
             ran,
             "the session was not moved onto the conversation that was running"
         );
-        assert_eq!(app.pending[0].conversation, ran);
+        assert_eq!(app.pending[0].conversation(), ran);
     }
 
     /// The saved line is an `argv` seen through `ps`, quoting and all already
@@ -7251,20 +7441,21 @@ run = "echo pwned"
         app.reattach_agents();
 
         let p = &app.pending[0];
-        assert!(p.command.starts_with("claude "), "{}", p.command);
-        assert!(p.command.contains("--verbose"), "{}", p.command);
+        assert!(p.command().starts_with("claude "), "{}", p.command());
+        assert!(p.command().contains("--verbose"), "{}", p.command());
         assert!(
-            p.command.contains("\"$DMAC_CONVERSATION\""),
+            p.command().contains("\"$DMAC_CONVERSATION\""),
             "the conversation has to travel as the variable: {}",
-            p.command
+            p.command()
         );
         assert!(
-            !p.command.contains(&id),
+            !p.command().contains(&id),
             "carrying the id itself means carrying it through a shell: {}",
-            p.command
+            p.command()
         );
         assert_eq!(
-            p.conversation, id,
+            p.conversation(),
+            id,
             "the conversation must still be the one being offered"
         );
     }
