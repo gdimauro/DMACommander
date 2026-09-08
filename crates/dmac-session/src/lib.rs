@@ -158,21 +158,118 @@ pub struct Session {
     pub last_used: std::time::Instant,
 }
 
-/// An editor window belonging to a session: which folder it had open, and the
-/// rectangle it occupied.
+/// A window's rectangle and the screen it was on, as a session keeps it.
 ///
-/// The rectangle is in the coordinates the window server answers in — top-left
-/// origin of the main screen — which is also what puts it back. Storing it in
-/// any other frame of reference would mean converting on the way in and out,
-/// and a rectangle that is sometimes one and sometimes the other is one that is
-/// eventually read as the wrong one.
+/// Four numbers twice, in the coordinates the window server answers in —
+/// top-left origin of the main screen. The screen is what makes the rectangle
+/// portable: without it, `x = -3412` is a place only while the display to the
+/// left is plugged in.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct EditorWindow {
-    pub dir: String,
+pub struct Placed {
     pub x: i32,
     pub y: i32,
     pub width: u32,
     pub height: u32,
+    /// `(x, y, width, height)` of the screen. Absent for a placement recorded
+    /// before screens were, which can only be put back by clamping.
+    #[serde(default)]
+    pub screen: Option<(i32, i32, u32, u32)>,
+}
+
+/// An editor window belonging to a session: which folder it had open, and
+/// where it was — **for each arrangement of monitors it has been seen in**.
+///
+/// One place is not enough. The office is an ultrawide beside the laptop; home
+/// is the laptop; the other office is two ordinary monitors. A window arranged
+/// in one of those has a rectangle that means nothing in the others, and a
+/// session that remembered only the last one would, every morning, put the
+/// window somewhere the user then has to drag back. So each arrangement keeps
+/// its own — keyed by [`dmac_desktop::arrangement_key`], a readable name for
+/// the set of screens — and coming back to the office gets the office back.
+///
+/// The old shape, a single rectangle with no screen, is still read: it becomes
+/// one entry under an empty key, and is used only when nothing better exists.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EditorWindow {
+    pub dir: String,
+    /// Arrangement key, to where the window was in that arrangement.
+    #[serde(default)]
+    pub placements: std::collections::BTreeMap<String, Placed>,
+    // The four fields below are the shape written before arrangements were
+    // remembered. Read so an old file loses nothing; never written again.
+    #[serde(default, skip_serializing)]
+    x: i32,
+    #[serde(default, skip_serializing)]
+    y: i32,
+    #[serde(default, skip_serializing)]
+    width: u32,
+    #[serde(default, skip_serializing)]
+    height: u32,
+}
+
+impl EditorWindow {
+    pub fn new(dir: impl Into<String>) -> Self {
+        Self {
+            dir: dir.into(),
+            placements: std::collections::BTreeMap::new(),
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        }
+    }
+
+    /// Fold a file written before arrangements existed into the new shape.
+    ///
+    /// Called after loading. The single rectangle such a file carried becomes
+    /// the entry under the empty key — a placement with no arrangement, which
+    /// [`placement_for`](Self::placement_for) falls back to last.
+    pub fn migrate(&mut self) {
+        if self.width > 0 && self.height > 0 && self.placements.is_empty() {
+            self.placements.insert(
+                String::new(),
+                Placed {
+                    x: self.x,
+                    y: self.y,
+                    width: self.width,
+                    height: self.height,
+                    screen: None,
+                },
+            );
+        }
+        self.x = 0;
+        self.y = 0;
+        self.width = 0;
+        self.height = 0;
+    }
+
+    /// Remember where the window is in this arrangement.
+    pub fn record(&mut self, key: &str, placed: Placed) {
+        self.placements.insert(key.to_string(), placed);
+    }
+
+    /// Where the window was in this arrangement — or, failing that, the most
+    /// recently recorded place anywhere, to be fitted onto the screens that
+    /// exist. Exact wins over fitted, always: the whole point of keeping one
+    /// per arrangement is that "where I left it" is a fact and not a guess.
+    ///
+    /// Returns whether the answer is exact, so the caller can put an exact one
+    /// back as it is and only fit the other kind.
+    pub fn placement_for(&self, key: &str) -> Option<(&Placed, bool)> {
+        if let Some(p) = self.placements.get(key) {
+            return Some((p, true));
+        }
+        // Any other arrangement's, to be fitted. The last recorded is the most
+        // likely to resemble what the user wants; a BTreeMap has no notion of
+        // that, so the choice is: a real arrangement over the migrated
+        // no-arrangement one.
+        self.placements
+            .iter()
+            .filter(|(k, _)| !k.is_empty())
+            .chain(self.placements.iter().filter(|(k, _)| k.is_empty()))
+            .map(|(_, p)| (p, false))
+            .next()
+    }
 }
 
 impl Session {
@@ -385,6 +482,10 @@ pub struct SessionManager {
     /// a width the user set by hand and lost on restart is a width they would
     /// have to set again every morning.
     pub rail: RailWidths,
+    /// Where the terminal this program runs in was, per arrangement of
+    /// monitors. Global rather than per session: there is one terminal window,
+    /// whichever session is showing in it.
+    pub terminal: std::collections::BTreeMap<String, Placed>,
 }
 
 /// The two widths of the session rail, in columns.
@@ -418,6 +519,7 @@ impl SessionManager {
             next_id: 1,
             history: dmac_core::history::History::default(),
             rail: RailWidths::default(),
+            terminal: std::collections::BTreeMap::new(),
         }
     }
 

@@ -71,7 +71,15 @@ pub(crate) enum Update {
     /// the render loop. `None` means it has none open any more.
     EditorFrame {
         session: SessionId,
-        window: Option<dmac_session::EditorWindow>,
+        /// The folder the window is about.
+        dir: String,
+        /// Which arrangement of monitors this was seen in — see
+        /// `dmac_desktop::arrangement_key`. Always known, even when there is
+        /// no window: a window that has been closed in *this* arrangement must
+        /// stop being restored in this arrangement, and only in this one.
+        key: String,
+        /// Where it is, or `None` if the editor has no window for that folder.
+        placed: Option<dmac_session::Placed>,
     },
     /// A hosted shell changed what is on its screen. Carries nothing: the
     /// message exists only to break the event loop out of its wait, and the
@@ -293,19 +301,48 @@ pub(crate) struct HelpEntrance {
     last: std::time::Instant,
 }
 
-/// The editor's window for `dir`, as something a session can keep.
+/// Where the editor's window for `dir` is, and which arrangement of monitors
+/// we are in — the two facts a session needs to put it back later.
 ///
-/// `None` when the editor has no window for it, which is the ordinary case and
-/// not a failure: most directories have no editor open on them.
-fn read_frame(dir: &std::path::Path) -> Option<dmac_session::EditorWindow> {
-    let f = dmac_desktop::editor_frame_for(dir)?;
-    Some(dmac_session::EditorWindow {
-        dir: dir.display().to_string(),
-        x: f.x,
-        y: f.y,
-        width: f.width,
-        height: f.height,
-    })
+/// The key is always returned, window or no window. A window that has been
+/// closed has to stop being restored *in this arrangement*, and saying "no
+/// window" without saying where is saying nothing a map can act on.
+///
+/// `None` for the window is the ordinary case and not a failure: most
+/// directories have no editor open on them.
+fn read_placement(dir: &std::path::Path) -> (String, Option<dmac_session::Placed>) {
+    let key = dmac_desktop::arrangement_key(&dmac_desktop::screens());
+    let placed = dmac_desktop::editor_placement_for(dir).map(placed_from);
+    (key, placed)
+}
+
+/// A desktop placement as the session store keeps it.
+fn placed_from(p: dmac_desktop::Placement) -> dmac_session::Placed {
+    dmac_session::Placed {
+        x: p.frame.x,
+        y: p.frame.y,
+        width: p.frame.width,
+        height: p.frame.height,
+        screen: p.screen.map(|s| (s.x, s.y, s.width, s.height)),
+    }
+}
+
+/// The other way round, for putting one back.
+fn placement_from(p: &dmac_session::Placed) -> dmac_desktop::Placement {
+    dmac_desktop::Placement {
+        frame: dmac_desktop::Frame {
+            x: p.x,
+            y: p.y,
+            width: p.width,
+            height: p.height,
+        },
+        screen: p.screen.map(|(x, y, width, height)| dmac_desktop::Frame {
+            x,
+            y,
+            width,
+            height,
+        }),
+    }
 }
 
 /// Where things were drawn last frame, so a click maps back to a row. Rebuilt
@@ -976,11 +1013,15 @@ impl App {
             Update::Editor(Ok(message) | Err(message)) => self.status = message,
             Update::Job(event) => self.job_event(*event),
             Update::Agents(seen) => self.record_agents(&seen),
-            Update::EditorFrame { session, window } => {
+            Update::EditorFrame {
+                session,
+                dir,
+                key,
+                placed,
+            } => {
                 if let Some(i) = self.sessions.index_of_id(session)
-                    && self.sessions.at_mut(i).editor != window
+                    && self.merge_placement(i, &dir, &key, placed)
                 {
-                    self.sessions.at_mut(i).editor = window;
                     // At once, like the agent: it is what a restart needs, and
                     // the debounce is exactly the window a `kill -9` falls into.
                     self.save_now();
@@ -1440,8 +1481,14 @@ impl App {
             .map(|s| s.cwd[Self::idx(s.active)].clone())
             .filter(dmac_vfs::VfsPath::is_local)
         {
-            let window = read_frame(cwd.as_path());
-            self.sessions.at_mut(here).editor = window;
+            let (key, placed) = read_placement(cwd.as_path());
+            let dir = cwd.as_path().display().to_string();
+            self.merge_placement(here, &dir, &key, placed);
+            // And the terminal itself, under the same key. One window for the
+            // whole program, so it lives on the manager rather than a session.
+            if let Some(p) = dmac_desktop::terminal_placement() {
+                self.sessions.terminal.insert(key, placed_from(p));
+            }
         }
         #[cfg(unix)]
         {
@@ -2135,8 +2182,9 @@ impl App {
         let Ok(dir) = self.editor_here_target() else {
             return;
         };
-        // What this session had open last time, and where. Only used when the
-        // editor turns out to have no window for that folder — see below.
+        // What this session had open last time, and where — in every
+        // arrangement of monitors it has been seen in. Which of those applies
+        // is decided on the task, where the screens can be asked.
         let remembered = self
             .ses()
             .editor
@@ -2152,20 +2200,99 @@ impl App {
                 // where the user put it. Restoring a window that is on screen
                 // is not restoring anything, it is moving something.
                 if matches!(dmac_desktop::raise_editor_for(&dir), Ok(true)) {
+                    let (key, placed) = read_placement(&dir);
                     let _ = tx.send(Update::EditorFrame {
                         session: id,
-                        window: read_frame(&dir),
+                        dir: dir.display().to_string(),
+                        key,
+                        placed,
                     });
                     return;
                 }
-                if let Some(w) = remembered {
-                    let frame = dmac_desktop::Frame {
-                        x: w.x,
-                        y: w.y,
-                        width: w.width,
-                        height: w.height,
-                    };
-                    let _ = dmac_desktop::restore_editor(&dir, frame);
+                let Some(w) = remembered else {
+                    return;
+                };
+                let screens = dmac_desktop::screens();
+                let key = dmac_desktop::arrangement_key(&screens);
+                let Some((placed, exact)) = w.placement_for(&key) else {
+                    return;
+                };
+                // This arrangement's own place comes back as it was — `fit`
+                // is the identity there, short of a window that had strayed
+                // off its screen. Another arrangement's place is mapped onto
+                // the screen the user is on, because `x = -3412` on a laptop
+                // alone is a window nobody can see.
+                let frame = dmac_desktop::fit(&placement_from(placed), &screens);
+                let _ = exact;
+                let _ = dmac_desktop::restore_editor(&dir, frame);
+            });
+        }
+    }
+
+    /// Fold one observation into a session's memory of its editor window.
+    ///
+    /// Returns whether anything changed, so the caller knows whether a write
+    /// is owed. A window seen is recorded under this arrangement; a window
+    /// *not* seen removes this arrangement's entry and no other — the office's
+    /// place is not forgotten because the window is closed at home.
+    fn merge_placement(
+        &mut self,
+        index: usize,
+        dir: &str,
+        key: &str,
+        placed: Option<dmac_session::Placed>,
+    ) -> bool {
+        let session = self.sessions.at_mut(index);
+        match placed {
+            Some(p) => {
+                let w = session
+                    .editor
+                    .get_or_insert_with(|| dmac_session::EditorWindow::new(dir));
+                if w.dir != dir {
+                    // A different folder than last time: the old window's
+                    // places are about a window that is not this one.
+                    *w = dmac_session::EditorWindow::new(dir);
+                }
+                if w.placements.get(key) == Some(&p) {
+                    return false;
+                }
+                w.record(key, p);
+                true
+            }
+            None => {
+                let Some(w) = session.editor.as_mut() else {
+                    return false;
+                };
+                if w.dir != dir || w.placements.remove(key).is_none() {
+                    return false;
+                }
+                if w.placements.is_empty() {
+                    session.editor = None;
+                }
+                true
+            }
+        }
+    }
+
+    /// Put the terminal back where it was in this arrangement of monitors, if
+    /// it has been here before.
+    ///
+    /// Only for an arrangement already seen. On one never seen there is no
+    /// "where I left it", and the user has just opened this terminal where
+    /// they wanted it — moving it would be rearranging their desk for no
+    /// reason. That is also why this is exact and never fitted.
+    pub(crate) fn restore_terminal(&mut self) {
+        let remembered = self.sessions.terminal.clone();
+        if remembered.is_empty() {
+            return;
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn_blocking(move || {
+                let screens = dmac_desktop::screens();
+                let key = dmac_desktop::arrangement_key(&screens);
+                if let Some(p) = remembered.get(&key) {
+                    let frame = dmac_desktop::fit(&placement_from(p), &screens);
+                    let _ = dmac_desktop::place_terminal(frame);
                 }
             });
         }
@@ -2191,9 +2318,12 @@ impl App {
         let tx = self.tx.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn_blocking(move || {
+                let (key, placed) = read_placement(&dir);
                 let _ = tx.send(Update::EditorFrame {
                     session: id,
-                    window: read_frame(&dir),
+                    dir: dir.display().to_string(),
+                    key,
+                    placed,
                 });
             });
         }
@@ -5400,6 +5530,10 @@ pub async fn run(mut start: Startup) -> anyhow::Result<()> {
             // entered, so it would otherwise be the one session that never got
             // its window back.
             app.raise_editor_here();
+            // And the terminal itself, in the place it had the last time the
+            // monitors were arranged like this — before the editor lands
+            // beside it, so the two come back together.
+            app.restore_terminal();
         }
         // After the frame, never during it: stdout is shared with ratatui and
         // interleaving with a half-written frame corrupts both.
@@ -6014,6 +6148,86 @@ mod tests {
             app.ses().hosted().is_none(),
             "nothing may be running before the answer"
         );
+    }
+
+    // ---- windows, per arrangement of monitors ----
+
+    fn placed(x: i32, y: i32) -> dmac_session::Placed {
+        dmac_session::Placed {
+            x,
+            y,
+            width: 800,
+            height: 600,
+            screen: Some((0, 38, 1512, 944)),
+        }
+    }
+
+    /// The office and the laptop each keep their own place, and observing one
+    /// never touches the other. A single "last position" is what puts the
+    /// window off-screen every morning.
+    #[test]
+    fn each_arrangement_keeps_its_own_place_for_a_window() {
+        let mut app = fixture();
+        assert!(app.merge_placement(0, "/prj/thing", "office", Some(placed(-1500, 40))));
+        assert!(app.merge_placement(0, "/prj/thing", "home", Some(placed(20, 60))));
+
+        let w = app.ses().editor.as_ref().expect("a window was recorded");
+        assert_eq!(w.placements.len(), 2);
+        assert_eq!(
+            w.placement_for("office").map(|(p, exact)| (p.x, exact)),
+            Some((-1500, true))
+        );
+        assert_eq!(
+            w.placement_for("home").map(|(p, exact)| (p.x, exact)),
+            Some((20, true))
+        );
+
+        // An arrangement never seen gets *a* place to fit, and says it is not
+        // the exact one — that is the caller's cue to map it onto what exists.
+        let (_, exact) = w.placement_for("train").expect("something to fit");
+        assert!(!exact);
+
+        // Seeing the same place again is not news, and must not cost a write.
+        assert!(!app.merge_placement(0, "/prj/thing", "home", Some(placed(20, 60))));
+    }
+
+    /// Closing the window at home forgets home's place and nothing else. The
+    /// office's is still a fact about the office.
+    #[test]
+    fn a_window_closed_in_one_arrangement_is_still_remembered_in_the_others() {
+        let mut app = fixture();
+        app.merge_placement(0, "/prj/thing", "office", Some(placed(-1500, 40)));
+        app.merge_placement(0, "/prj/thing", "home", Some(placed(20, 60)));
+
+        assert!(
+            app.merge_placement(0, "/prj/thing", "home", None),
+            "nothing was forgotten"
+        );
+        let w = app
+            .ses()
+            .editor
+            .as_ref()
+            .expect("the office's place went with it");
+        assert!(!w.placements.contains_key("home"));
+        assert_eq!(w.placements.get("office").map(|p| p.x), Some(-1500));
+
+        // Nothing to forget is not a change.
+        assert!(!app.merge_placement(0, "/prj/thing", "train", None));
+        // And when the last arrangement goes, so does the window.
+        assert!(app.merge_placement(0, "/prj/thing", "office", None));
+        assert!(app.ses().editor.is_none());
+    }
+
+    /// A different folder than last time is a different window: what was
+    /// remembered about the old one is not about this one.
+    #[test]
+    fn a_new_folder_starts_a_new_window_record() {
+        let mut app = fixture();
+        app.merge_placement(0, "/prj/one", "office", Some(placed(-1500, 40)));
+        app.merge_placement(0, "/prj/two", "office", Some(placed(20, 60)));
+        let w = app.ses().editor.as_ref().expect("window");
+        assert_eq!(w.dir, "/prj/two");
+        assert_eq!(w.placements.len(), 1, "the old folder's place leaked in");
     }
 
     // ---- selecting, and getting out of things ----

@@ -243,6 +243,149 @@ pub struct Frame {
     pub height: u32,
 }
 
+/// A window and the screen it was on.
+///
+/// The screen is the half that makes the frame *portable*. A frame alone is a
+/// rectangle in the coordinate space of one particular arrangement of monitors,
+/// and `x = -3412` means "the display to the left" only while there is one.
+/// Come back with the laptop alone — home, a train, the other office — and that
+/// rectangle is entirely off-screen: the window is "restored" somewhere nobody
+/// can see it, which reads as the window having been lost.
+///
+/// With the screen recorded, a restore can tell the two cases apart: the same
+/// arrangement gets the window back exactly, and a different one gets it
+/// mapped onto the screen the user is actually looking at — see [`fit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Placement {
+    pub frame: Frame,
+    /// The usable rectangle of the screen the window's centre was on, in the
+    /// same coordinates as the frame. `None` for a placement recorded before
+    /// this existed, which can only be fitted by clamping.
+    pub screen: Option<Frame>,
+}
+
+/// One display, as the two questions about it need it.
+///
+/// `visible` is where a window may go: the screen minus the menu bar and the
+/// Dock, and it moves when either of those does. `full` is the display itself,
+/// and it changes only when displays are rearranged or a resolution is set —
+/// so it is what an arrangement is *named* by, and `visible` is what a window
+/// is *fitted* to. Using one for both was tried, and a Dock that grew six
+/// pixels turned the office into a new place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Screen {
+    pub visible: Frame,
+    pub full: Frame,
+    /// Whether the terminal this program runs in is on this display — which
+    /// is to say, whether the user is looking at it.
+    pub here: bool,
+}
+
+/// Where a saved window should go now, given the screens that exist now.
+///
+/// `screens` is every display, with a flag for the one the user is on — the
+/// one holding the terminal this program runs in. That is the
+/// target when the saved screen is gone: it is where they are looking, and a
+/// window put anywhere else is a window they have to go and find.
+///
+/// Three cases, in order:
+///
+/// 1. **The saved screen still exists** (same rectangle, to a tolerance): the
+///    frame comes back exactly, clamped only if it had strayed off that screen.
+/// 2. **It does not**: the window's *relative* place and size on its old screen
+///    are mapped onto the target — the right two-thirds stays the right
+///    two-thirds. Proportion rather than pixels, because an ultrawide and a
+///    laptop share nothing else.
+/// 3. **No saved screen at all**: nothing to be proportional to, so the frame
+///    is kept if some current screen contains it and otherwise clamped onto the
+///    target, shrunk if it must be.
+///
+/// Whatever the case, what comes back is entirely inside one screen that
+/// exists. A title bar you cannot reach is a window you cannot move back.
+pub fn fit(saved: &Placement, screens: &[Screen]) -> Frame {
+    let Some(target) = screens
+        .iter()
+        .find(|s| s.here)
+        .or_else(|| screens.first())
+        .map(|s| s.visible)
+    else {
+        return saved.frame;
+    };
+
+    match saved.screen {
+        Some(old) if old.width > 0 && old.height > 0 => {
+            // Case 1: still here, to within a menu bar's worth of drift.
+            if let Some(same) = screens
+                .iter()
+                .map(|s| &s.visible)
+                .find(|r| same_screen(r, &old))
+            {
+                return clamp(saved.frame, same);
+            }
+            // Case 2: proportional onto where the user is.
+            let f = saved.frame;
+            let rx = (f.x - old.x) as f64 / old.width as f64;
+            let ry = (f.y - old.y) as f64 / old.height as f64;
+            let rw = f.width as f64 / old.width as f64;
+            let rh = f.height as f64 / old.height as f64;
+            let mapped = Frame {
+                x: target.x + (rx * target.width as f64).round() as i32,
+                y: target.y + (ry * target.height as f64).round() as i32,
+                width: (rw * target.width as f64).round().max(1.0) as u32,
+                height: (rh * target.height as f64).round().max(1.0) as u32,
+            };
+            clamp(mapped, &target)
+        }
+        _ => {
+            // Case 3: keep it if it is somewhere real, else bring it here.
+            match screens
+                .iter()
+                .map(|s| &s.visible)
+                .find(|r| contains(r, &saved.frame))
+            {
+                Some(r) => clamp(saved.frame, r),
+                None => clamp(saved.frame, &target),
+            }
+        }
+    }
+}
+
+/// A screen's rectangle survives a reboot and a dock resize with a few pixels
+/// of drift; it does not survive being a different monitor.
+fn same_screen(a: &Frame, b: &Frame) -> bool {
+    const SLACK: i32 = 48;
+    (a.x - b.x).abs() <= SLACK
+        && (a.y - b.y).abs() <= SLACK
+        && (a.width as i32 - b.width as i32).abs() <= SLACK
+        && (a.height as i32 - b.height as i32).abs() <= SLACK
+}
+
+/// Whether the window's centre is on this screen. The centre rather than the
+/// whole rectangle, because a window hanging a little off an edge is still on
+/// that screen for every purpose that matters.
+fn contains(screen: &Frame, window: &Frame) -> bool {
+    let cx = window.x + window.width as i32 / 2;
+    let cy = window.y + window.height as i32 / 2;
+    cx >= screen.x
+        && cx < screen.x + screen.width as i32
+        && cy >= screen.y
+        && cy < screen.y + screen.height as i32
+}
+
+/// Entirely inside `screen`, shrinking only when it would not fit at all.
+fn clamp(window: Frame, screen: &Frame) -> Frame {
+    let width = window.width.min(screen.width.max(1));
+    let height = window.height.min(screen.height.max(1));
+    let max_x = screen.x + screen.width as i32 - width as i32;
+    let max_y = screen.y + screen.height as i32 - height as i32;
+    Frame {
+        x: window.x.clamp(screen.x, max_x.max(screen.x)),
+        y: window.y.clamp(screen.y, max_y.max(screen.y)),
+        width,
+        height,
+    }
+}
+
 /// Where the editor's window for `dir` currently is, if it has one.
 ///
 /// Reading, and only reading. The title match underneath is a guess — see
@@ -252,22 +395,129 @@ pub struct Frame {
 /// on the strength of a guess moves something a person arranged.
 #[cfg(target_os = "macos")]
 pub fn editor_frame_for(dir: &Path) -> Option<Frame> {
+    editor_placement_for(dir).map(|p| p.frame)
+}
+
+/// The same, with the screen it is on — which is what a restore on a different
+/// arrangement of monitors needs.
+#[cfg(target_os = "macos")]
+pub fn editor_placement_for(dir: &Path) -> Option<Placement> {
     let titles = editor_titles();
     let title = window_for(&titles, dir)?;
+    placement_of(EDITOR_PROCESS, title)
+}
+
+/// Where the terminal this program runs in has its front window.
+///
+/// The front window and not one matched by title: a terminal's title is
+/// whatever the shell last printed, and the front one is the one with this
+/// program in it.
+#[cfg(target_os = "macos")]
+pub fn terminal_placement() -> Option<Placement> {
+    let terminal = host_application()?;
+    placement_of(&terminal, "")
+}
+
+#[cfg(target_os = "macos")]
+fn placement_of(process: &str, title: &str) -> Option<Placement> {
     let out = Command::new("osascript")
         .args(["-l", "JavaScript", "-e", FRAME_SCRIPT])
-        .arg(EDITOR_PROCESS)
+        .arg(process)
         .arg(title)
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
         .ok()?;
-    parse_frame(String::from_utf8_lossy(&out.stdout).trim())
+    parse_placement(String::from_utf8_lossy(&out.stdout).trim())
 }
 
 #[cfg(not(target_os = "macos"))]
 pub fn editor_frame_for(_dir: &Path) -> Option<Frame> {
     None
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn editor_placement_for(_dir: &Path) -> Option<Placement> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn terminal_placement() -> Option<Placement> {
+    None
+}
+
+/// Every display now, with the one the user is on flagged.
+#[cfg(target_os = "macos")]
+pub fn screens() -> Vec<Screen> {
+    let terminal = host_application().unwrap_or_default();
+    let Ok(out) = Command::new("osascript")
+        .args(["-l", "JavaScript", "-e", SCREENS_SCRIPT])
+        .arg(&terminal)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| parse_screen(l.trim()))
+        .collect()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn screens() -> Vec<Screen> {
+    Vec::new()
+}
+
+/// `vx vy vw vh here fx fy fw fh`, one display per line.
+fn parse_screen(line: &str) -> Option<Screen> {
+    let n: Vec<&str> = line.split_whitespace().collect();
+    if n.len() != 9 {
+        return None;
+    }
+    Some(Screen {
+        visible: parse_frame(&n[0..4].join(" "))?,
+        here: n[4] == "1",
+        full: parse_frame(&n[5..9].join(" "))?,
+    })
+}
+
+/// A name for this arrangement of monitors, stable across reboots and
+/// different from every other arrangement.
+///
+/// Built from each display's *full* frame, sorted, and written out rather than
+/// hashed so that a session file can be read by a person and the key means
+/// something: `-3440,0,3440,1440|0,0,1512,982` is recognisably "the ultrawide
+/// and the laptop". The full frame and not the usable one, because the usable
+/// one moves with the menu bar and the Dock — rounding was tried first, and a
+/// Dock that grew six pixels across a rounding boundary made the office a new
+/// place. The full frame changes only when displays are rearranged or a
+/// resolution is chosen, and both of those *are* a different arrangement.
+pub fn arrangement_key(screens: &[Screen]) -> String {
+    let mut parts: Vec<String> = screens
+        .iter()
+        .map(|s| {
+            format!(
+                "{},{},{},{}",
+                s.full.x, s.full.y, s.full.width, s.full.height
+            )
+        })
+        .collect();
+    parts.sort();
+    parts.join("|")
+}
+
+/// `x y w h`, optionally followed by ` | sx sy sw sh` for the screen.
+fn parse_placement(answer: &str) -> Option<Placement> {
+    let (frame, screen) = match answer.split_once('|') {
+        Some((f, s)) => (f.trim(), Some(s.trim())),
+        None => (answer, None),
+    };
+    Some(Placement {
+        frame: parse_frame(frame)?,
+        screen: screen.and_then(parse_frame),
+    })
 }
 
 /// Four numbers, or nothing.
@@ -328,6 +578,44 @@ pub fn restore_editor(dir: &Path, frame: Frame) -> Result<Opened, DesktopError> 
     }
 }
 
+/// Put the terminal this program runs in at `frame`.
+///
+/// The same script that places an editor window, told not to wait for a new
+/// one: the terminal's window already exists, and it is the front one. Used on
+/// startup to give the terminal back the place it had in this arrangement of
+/// monitors — which, with the editor beside it, is what "everything where I
+/// left it" has to include.
+#[cfg(target_os = "macos")]
+pub fn place_terminal(frame: Frame) -> Result<(), DesktopError> {
+    let terminal = host_application().ok_or_else(|| {
+        DesktopError::Placement("cannot tell which terminal this is running in".into())
+    })?;
+    let _one_at_a_time = placing()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let out = Command::new("osascript")
+        .arg("-l")
+        .arg("JavaScript")
+        .arg("-e")
+        .arg(RESTORE_SCRIPT)
+        .arg(&terminal)
+        .arg(frame.x.to_string())
+        .arg(frame.y.to_string())
+        .arg(frame.width.to_string())
+        .arg(frame.height.to_string())
+        .arg("-1")
+        .output()
+        .map_err(|e| DesktopError::Placement(format!("osascript: {e}")))?;
+    let answer = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    placement_result(&answer, &stderr)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn place_terminal(_frame: Frame) -> Result<(), DesktopError> {
+    Err(DesktopError::Unsupported)
+}
+
 #[cfg(not(target_os = "macos"))]
 pub fn restore_editor(_dir: &Path, _frame: Frame) -> Result<Opened, DesktopError> {
     Err(DesktopError::Unsupported)
@@ -336,19 +624,78 @@ pub fn restore_editor(_dir: &Path, _frame: Frame) -> Result<Opened, DesktopError
 #[cfg(target_os = "macos")]
 const FRAME_SCRIPT: &str = r#"
 function run(argv) {
+  ObjC.import('AppKit');
   var se = Application('System Events');
   var ws;
   try { ws = se.processes.byName(argv[0]).windows(); } catch (e) { return ''; }
+  // An empty title means the front window: that is how the terminal this
+  // program runs in is asked about, since its title is whatever the shell
+  // last printed.
+  var want = argv[1];
+  var p = null, s = null;
   for (var i = 0; i < ws.length; i++) {
     var t = '';
-    try { t = String(ws[i].name()); } catch (e) { continue; }
-    if (t !== argv[1]) continue;
-    try {
-      var p = ws[i].position(), s = ws[i].size();
-      return p[0] + ' ' + p[1] + ' ' + s[0] + ' ' + s[1];
-    } catch (e) { return ''; }
+    try { t = String(ws[i].name()); } catch (e) { if (want !== '') continue; }
+    if (want !== '' && t !== want) continue;
+    try { p = ws[i].position(); s = ws[i].size(); } catch (e) { return ''; }
+    break;
   }
-  return '';
+  if (p === null) return '';
+
+  // The screen holding the window's centre, in the same coordinates. This is
+  // what makes the frame portable: without it, `x = -3412` is a place only
+  // while the display to the left is plugged in.
+  var screens = $.NSScreen.screens;
+  var mainH = screens.objectAtIndex(0).frame.size.height;
+  var cx = p[0] + s[0] / 2, cy = p[1] + s[1] / 2;
+  var on = '';
+  for (var i = 0; i < screens.count; i++) {
+    var f = screens.objectAtIndex(i).visibleFrame;
+    var r = { x: f.origin.x, y: mainH - (f.origin.y + f.size.height),
+              w: f.size.width, h: f.size.height };
+    if (cx >= r.x && cx < r.x + r.w && cy >= r.y && cy < r.y + r.h) {
+      on = ' | ' + r.x + ' ' + r.y + ' ' + r.w + ' ' + r.h;
+      break;
+    }
+  }
+  return p[0] + ' ' + p[1] + ' ' + s[0] + ' ' + s[1] + on;
+}
+"#;
+
+/// Every display's usable rectangle, and whether the terminal is on it.
+///
+/// `argv[0]` is the terminal's process name. The flag is what turns a list of
+/// screens into an answer to "where is the user": it is the display holding
+/// the window they are typing into.
+#[cfg(target_os = "macos")]
+const SCREENS_SCRIPT: &str = r#"
+function run(argv) {
+  ObjC.import('AppKit');
+  var se = Application('System Events');
+  var cx = null, cy = null;
+  try {
+    var w = se.processes.byName(argv[0]).windows[0];
+    var p = w.position(), s = w.size();
+    cx = p[0] + s[0] / 2; cy = p[1] + s[1] / 2;
+  } catch (e) {}
+  var screens = $.NSScreen.screens;
+  var mainH = screens.objectAtIndex(0).frame.size.height;
+  var out = [];
+  for (var i = 0; i < screens.count; i++) {
+    // Two rectangles. The visible one is where a window may go, and it moves
+    // with the menu bar and the Dock. The full one is the display itself, and
+    // it moves only when the user rearranges displays — which is what makes
+    // it the right thing to name an arrangement by.
+    var v = screens.objectAtIndex(i).visibleFrame;
+    var f = screens.objectAtIndex(i).frame;
+    var vx = v.origin.x, vy = mainH - (v.origin.y + v.size.height);
+    var fx = f.origin.x, fy = mainH - (f.origin.y + f.size.height);
+    var here = (cx !== null && cx >= vx && cx < vx + v.size.width
+                && cy >= vy && cy < vy + v.size.height) ? 1 : 0;
+    out.push(vx + ' ' + vy + ' ' + v.size.width + ' ' + v.size.height + ' ' + here
+             + ' ' + fx + ' ' + fy + ' ' + f.size.width + ' ' + f.size.height);
+  }
+  return out.join('\n');
 }
 "#;
 
@@ -1138,5 +1485,237 @@ mod tests {
             TILE_SCRIPT.contains("used only to stop waiting, never to choose a window"),
             "the note explaining why a title appears in the tiling script is gone"
         );
+    }
+
+    fn f(x: i32, y: i32, width: u32, height: u32) -> Frame {
+        Frame {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    /// A display whose usable area is its whole frame less a menu bar — near
+    /// enough for arithmetic that is about proportions.
+    fn sc(visible: Frame, here: bool) -> Screen {
+        let full = Frame {
+            x: visible.x,
+            y: visible.y - 25,
+            width: visible.width,
+            height: visible.height + 25,
+        };
+        Screen {
+            visible,
+            full,
+            here,
+        }
+    }
+
+    /// The office: an ultrawide to the left of the laptop, the window on the
+    /// ultrawide. The laptop alone: the window has to come with you.
+    #[test]
+    fn a_window_from_a_screen_that_is_gone_is_mapped_onto_the_one_you_are_on() {
+        let ultrawide = f(-3440, 30, 3440, 1410);
+        let laptop = f(0, 38, 1512, 944);
+        // Right two-thirds of the ultrawide, full height.
+        let saved = Placement {
+            frame: f(-3440 + 1147, 30, 2293, 1410),
+            screen: Some(ultrawide),
+        };
+
+        // Same arrangement: back exactly.
+        let office = [sc(ultrawide, true), sc(laptop, false)];
+        assert_eq!(fit(&saved, &office), saved.frame);
+
+        // Laptop only: the same two-thirds of *that* screen, and nothing off it.
+        let home = [sc(laptop, true)];
+        let got = fit(&saved, &home);
+        assert!(
+            got.x >= laptop.x && got.x + got.width as i32 <= laptop.x + laptop.width as i32,
+            "off the screen horizontally: {got:?}"
+        );
+        assert!(
+            got.y >= laptop.y && got.y + got.height as i32 <= laptop.y + laptop.height as i32,
+            "off the screen vertically: {got:?}"
+        );
+        // Proportion, not pixels: it still takes the right two-thirds.
+        let two_thirds = (laptop.width as f64 * 2293.0 / 3440.0).round() as u32;
+        assert!(
+            (got.width as i32 - two_thirds as i32).abs() <= 2,
+            "lost its proportion: {} of {}",
+            got.width,
+            laptop.width
+        );
+        assert_eq!(got.height, laptop.height, "it was full height");
+    }
+
+    /// Where the user *is* is the target, not the main screen: the display
+    /// holding the terminal is the one they are looking at.
+    #[test]
+    fn the_target_is_the_screen_the_terminal_is_on() {
+        let left = f(-1920, 0, 1920, 1080);
+        let main = f(0, 25, 2560, 1415);
+        let saved = Placement {
+            frame: f(100, 100, 800, 600),
+            screen: Some(f(9000, 9000, 1000, 1000)), // a monitor that no longer exists
+        };
+        let got = fit(&saved, &[sc(main, false), sc(left, true)]);
+        assert!(
+            contains(&left, &got),
+            "landed on {got:?}, not on the terminal's screen"
+        );
+    }
+
+    /// A placement recorded before screens were, or on a screen we cannot
+    /// identify. Kept if it is somewhere real; otherwise brought here.
+    #[test]
+    fn a_frame_with_no_screen_is_kept_if_real_and_clamped_if_not() {
+        let laptop = f(0, 38, 1512, 944);
+        let on_it = Placement {
+            frame: f(200, 100, 800, 600),
+            screen: None,
+        };
+        assert_eq!(fit(&on_it, &[sc(laptop, true)]), on_it.frame);
+
+        let lost = Placement {
+            frame: f(-3000, 30, 2752, 1410),
+            screen: None,
+        };
+        let got = fit(&lost, &[sc(laptop, true)]);
+        assert!(contains(&laptop, &got), "{got:?}");
+        assert!(
+            got.width <= laptop.width && got.height <= laptop.height,
+            "{got:?}"
+        );
+    }
+
+    /// A window bigger than the screen it is going to is shrunk to it, never
+    /// left hanging off an edge where its title bar cannot be reached.
+    #[test]
+    fn nothing_ever_comes_back_partly_off_screen() {
+        let small = f(0, 38, 1280, 762);
+        let huge = Placement {
+            frame: f(-100, -100, 5000, 3000),
+            screen: Some(f(-5000, -3000, 6000, 4000)),
+        };
+        let got = fit(&huge, &[sc(small, true)]);
+        // Entirely inside, whatever proportion it kept: that is the invariant,
+        // and the corner it lands in is not.
+        assert!(got.x >= small.x && got.y >= small.y, "{got:?}");
+        assert!(
+            got.x + got.width as i32 <= small.x + small.width as i32
+                && got.y + got.height as i32 <= small.y + small.height as i32,
+            "hangs off the edge: {got:?}"
+        );
+    }
+
+    /// A screen survives a reboot with a few pixels of drift — the menu bar,
+    /// the Dock — and must still count as the same screen. A different monitor
+    /// must not.
+    #[test]
+    fn a_few_pixels_of_drift_is_the_same_screen_and_a_different_monitor_is_not() {
+        let a = f(0, 25, 2560, 1415);
+        assert!(same_screen(&a, &f(0, 38, 2560, 1402)), "the Dock moved");
+        assert!(
+            !same_screen(&a, &f(0, 25, 1512, 944)),
+            "a smaller monitor passed"
+        );
+        assert!(
+            !same_screen(&a, &f(-2560, 25, 2560, 1415)),
+            "the same size elsewhere passed"
+        );
+    }
+
+    /// With no screens at all — a headless run, a script — nothing can be
+    /// placed and nothing is invented.
+    #[test]
+    fn no_screens_means_the_frame_is_handed_back_untouched() {
+        let saved = Placement {
+            frame: f(1, 2, 3, 4),
+            screen: None,
+        };
+        assert_eq!(fit(&saved, &[]), saved.frame);
+    }
+
+    /// The frame alone, the frame with its screen, and nothing — the three
+    /// answers the script can give, each read correctly.
+    #[test]
+    fn a_placement_is_a_frame_and_optionally_its_screen() {
+        let p = parse_placement("100 50 1200 800 | -3440 30 3440 1410").expect("placement");
+        assert_eq!(p.frame, f(100, 50, 1200, 800));
+        assert_eq!(p.screen, Some(f(-3440, 30, 3440, 1410)));
+
+        let bare = parse_placement("100 50 1200 800").expect("placement");
+        assert_eq!(
+            bare.screen, None,
+            "no screen was reported, none was invented"
+        );
+
+        assert!(parse_placement("").is_none());
+        assert!(parse_placement("no window").is_none());
+        // A frame with a screen we cannot read is still a frame.
+        assert!(parse_placement("100 50 1200 800 | garbage").is_some());
+    }
+
+    /// The key names an arrangement, not a moment: a Dock that was resized
+    /// must not turn the office into a new place, and two different sets of
+    /// monitors must never share a name.
+    #[test]
+    fn an_arrangement_key_ignores_drift_and_distinguishes_monitors() {
+        // A display's full frame is fixed; its usable frame moves with the
+        // Dock. The fixture has to say so, or it is testing the wrong thing.
+        let ultrawide = Screen {
+            full: f(-3440, 0, 3440, 1440),
+            visible: f(-3440, 30, 3440, 1410),
+            here: true,
+        };
+        let laptop = Screen {
+            full: f(0, 0, 1512, 982),
+            visible: f(0, 38, 1512, 944),
+            here: false,
+        };
+        let laptop_dock_grew = Screen {
+            visible: f(0, 44, 1512, 900),
+            ..laptop
+        };
+        let office = [ultrawide, laptop];
+        let office_later = [ultrawide, laptop_dock_grew];
+        let home = [Screen {
+            here: true,
+            ..laptop
+        }];
+
+        assert_eq!(
+            arrangement_key(&office),
+            arrangement_key(&office_later),
+            "the Dock growing made the office a new place"
+        );
+        assert_ne!(arrangement_key(&office), arrangement_key(&home));
+        // Order of discovery is not part of the name.
+        let reversed = [office[1], office[0]];
+        assert_eq!(arrangement_key(&office), arrangement_key(&reversed));
+        // And which screen the terminal happens to be on is not either: the
+        // arrangement is the same office whichever window you are typing in.
+        let elsewhere = [
+            Screen {
+                here: false,
+                ..office[0]
+            },
+            Screen {
+                here: true,
+                ..office[1]
+            },
+        ];
+        assert_eq!(arrangement_key(&office), arrangement_key(&elsewhere));
+        // Readable, so a session file means something to a person.
+        assert!(arrangement_key(&home).contains("1512"));
+        // A resolution change *is* a different arrangement — the full frame
+        // changed, and every saved window on it is in the wrong place now.
+        let scaled = [Screen {
+            full: f(0, 0, 1728, 1117),
+            ..home[0]
+        }];
+        assert_ne!(arrangement_key(&home), arrangement_key(&scaled));
     }
 }

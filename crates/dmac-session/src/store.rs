@@ -64,6 +64,9 @@ struct Persisted {
     /// could be resized, which reads as the default pair.
     #[serde(default)]
     rail: crate::RailWidths,
+    /// Where the terminal window was, per arrangement of monitors.
+    #[serde(default)]
+    terminal: std::collections::BTreeMap<String, crate::Placed>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,6 +244,15 @@ impl SessionStore {
 
         manager.history = dmac_core::history::History::from_visits(saved.history);
         manager.rail = saved.rail;
+        manager.terminal = saved.terminal;
+        // A file written before arrangements were remembered carries one
+        // rectangle per editor window. Folded into the new shape here, once,
+        // so nothing above has to know there were ever two shapes.
+        for i in 0..manager.len() {
+            if let Some(w) = manager.at_mut(i).editor.as_mut() {
+                w.migrate();
+            }
+        }
         manager.switch_to(saved.current.min(manager.len() - 1));
         Ok(Some((manager, saved.clean_exit)))
     }
@@ -269,6 +281,7 @@ impl SessionStore {
             },
             history: manager.history.visits().to_vec(),
             rail: manager.rail,
+            terminal: manager.terminal.clone(),
         };
         let json = serde_json::to_string_pretty(&saved).map_err(|source| StoreError::Corrupt {
             path: self.path.display().to_string(),
@@ -656,25 +669,82 @@ mod tests {
     fn where_the_editor_window_was_comes_back() {
         let (_d, s) = store();
         let mut m = manager();
-        m.current_mut().editor = Some(crate::EditorWindow {
-            dir: "/Users/x/prj/thing".into(),
-            x: -1512,
-            y: 38,
-            width: 1210,
-            height: 1000,
-        });
+        let mut w = crate::EditorWindow::new("/Users/x/prj/thing");
+        // The office and the laptop, each with its own place.
+        w.record(
+            "-3440,32,3440,1408|0,32,1512,944",
+            crate::Placed {
+                x: -1512,
+                y: 38,
+                width: 1210,
+                height: 1000,
+                screen: Some((-3440, 30, 3440, 1410)),
+            },
+        );
+        w.record(
+            "0,32,1512,944",
+            crate::Placed {
+                x: 20,
+                y: 60,
+                width: 1400,
+                height: 880,
+                screen: Some((0, 38, 1512, 944)),
+            },
+        );
+        m.current_mut().editor = Some(w.clone());
+        // And the terminal, once per arrangement, beside them.
+        m.terminal.insert(
+            "0,32,1512,944".into(),
+            crate::Placed {
+                x: 0,
+                y: 38,
+                width: 1512,
+                height: 944,
+                screen: Some((0, 38, 1512, 944)),
+            },
+        );
         s.save(&m, true).expect("save");
 
         let (loaded, _) = s.load().expect("load").expect("some");
         assert_eq!(
-            loaded.current().editor,
-            m.current().editor,
-            "the coordinates have to come back exactly, or it is not the same window"
+            loaded.current().editor.as_ref().map(|e| &e.placements),
+            Some(&w.placements),
+            "every arrangement's place has to come back exactly, or the office is lost at home"
         );
+        assert_eq!(loaded.terminal, m.terminal);
         // A session that had none keeps none: nothing recorded, nothing opened.
         // (`manager()` leaves the *second* session current, which is the one
         // given a window above.)
         assert_eq!(loaded.all()[0].editor, None);
+    }
+
+    /// A file from before arrangements were remembered carried one rectangle
+    /// and no screen. It must still be read, and it must lose nothing.
+    #[test]
+    fn a_window_saved_before_arrangements_existed_still_comes_back() {
+        let (_d, s) = store();
+        std::fs::create_dir_all(s.path().parent().expect("parent")).expect("mkdir");
+        std::fs::write(
+            s.path(),
+            r#"{"version":1,"clean_exit":true,"current":0,"sessions":[
+                 {"name":"a","left":"/a","right":"/b",
+                  "editor":{"dir":"/a","x":100,"y":50,"width":1200,"height":800}}]}"#,
+        )
+        .expect("write");
+        let (loaded, _) = s.load().expect("load").expect("some");
+        let w = loaded.all()[0]
+            .editor
+            .as_ref()
+            .expect("the window was dropped");
+        let (p, exact) = w
+            .placement_for("any-arrangement")
+            .expect("nothing to fall back to");
+        assert!(
+            !exact,
+            "a placement with no arrangement cannot be exact for one"
+        );
+        assert_eq!((p.x, p.y, p.width, p.height), (100, 50, 1200, 800));
+        assert_eq!(p.screen, None);
     }
 
     /// A file claiming three levels was not written by this program. Honouring
