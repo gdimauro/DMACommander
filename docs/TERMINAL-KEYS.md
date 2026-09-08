@@ -79,6 +79,11 @@ The help page is the general answer: its rows already carry the actions their
 keys stand for, so it is a list of things to press as well as a list of things
 to read. If a key will not reach this program, open `F1` and click the row.
 
+And at the top of the help are the **tours**: pick one and the program
+demonstrates that part of itself on the real screen, keys lit as they are
+pressed, with a caption saying what is about to happen. See
+[docs/TOURS.md](TOURS.md).
+
 ## The two ways in
 
 ### `Ctrl-O` and one letter

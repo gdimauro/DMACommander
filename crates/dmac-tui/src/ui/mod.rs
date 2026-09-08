@@ -15,6 +15,10 @@ pub(crate) mod reattach;
 mod screen;
 pub(crate) mod shell;
 mod splash;
+// Drawn by `app.rs` once the tours are wired in; until then nothing calls it.
+// See docs/TOURS.md. Drop the allow with the wiring.
+#[allow(dead_code)]
+pub(crate) mod tour;
 pub(crate) mod view;
 
 pub use screen::draw_canvas;

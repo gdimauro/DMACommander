@@ -14,6 +14,7 @@ pub mod keymap;
 pub mod mcp;
 pub mod terminal;
 pub mod theme;
+pub mod tour;
 pub(crate) mod ui;
 pub mod utilities;
 
