@@ -212,7 +212,11 @@ pub const SECTIONS: &[Section] = &[
                 "the utilities, and every session by number",
                 &[UtilitiesMenu],
             ),
-            Row::panel("F10", "quit", &[Quit]),
+            Row::panel(
+                "F10",
+                "quit \u{2014} it asks first, and lets you say whether the windows come back and whether to remember where they are",
+                &[Quit],
+            ),
             Row::panel(
                 "F11",
                 "full screen: no frame, black behind everything",

@@ -486,6 +486,16 @@ pub struct SessionManager {
     /// monitors. Global rather than per session: there is one terminal window,
     /// whichever session is showing in it.
     pub terminal: std::collections::BTreeMap<String, Placed>,
+    /// The two answers the quit dialog asks for, kept between runs so they are
+    /// offered pre-ticked the way they were last left rather than reset every
+    /// evening.
+    ///
+    /// `restore_windows`: on the next start, put the editor windows and the
+    /// terminal back. `remember_positions`: on the way out, write down where
+    /// they are *for this arrangement of monitors* — untick it to leave with a
+    /// layout you have made a mess of without that mess becoming the memory.
+    pub restore_windows: bool,
+    pub remember_positions: bool,
 }
 
 /// The two widths of the session rail, in columns.
@@ -520,6 +530,8 @@ impl SessionManager {
             history: dmac_core::history::History::default(),
             rail: RailWidths::default(),
             terminal: std::collections::BTreeMap::new(),
+            restore_windows: true,
+            remember_positions: true,
         }
     }
 

@@ -175,6 +175,11 @@ pub(crate) enum Mode {
     },
     /// F8 asked, and is waiting to be told yes.
     ConfirmDelete,
+    /// F10 asked. Two things are decided on the way out — see `ui::quit` —
+    /// and `selected` is which of them the cursor is on.
+    ConfirmQuit {
+        selected: usize,
+    },
     /// A file operation stopped on something already in the way.
     Conflict,
     /// The directory history. Which of the three orders is showing lives on
@@ -1296,7 +1301,13 @@ impl App {
                 self.open_context_menu((area.x + 2, area.y.saturating_add(row).saturating_add(1)));
             }
 
-            Quit => self.should_quit = true,
+            // Asked, not done. Leaving decides two things that cannot be
+            // decided later — whether these windows come back, and whether
+            // where they are now is worth keeping for this set of monitors —
+            // so it is a dialog and not an exit. `request_quit` is the one way
+            // out that does not ask: the terminal has gone, and so has anyone
+            // to answer.
+            Quit => self.mode = Mode::ConfirmQuit { selected: 0 },
 
             // Typing replaces a selection the way every editor does, rather
             // than appending past it and leaving a highlight over stale text.
@@ -1475,11 +1486,14 @@ impl App {
         // one whose window the user has most likely just moved. The others were
         // read when they were last entered.
         let here = self.sessions.current_index();
-        if let Some(cwd) = self
-            .sessions
-            .get(here)
-            .map(|s| s.cwd[Self::idx(s.active)].clone())
-            .filter(dmac_vfs::VfsPath::is_local)
+        // Only if asked to. Unticked, the layout you are leaving with — one you
+        // may have made a mess of — does not become this arrangement's memory.
+        if self.sessions.remember_positions
+            && let Some(cwd) = self
+                .sessions
+                .get(here)
+                .map(|s| s.cwd[Self::idx(s.active)].clone())
+                .filter(dmac_vfs::VfsPath::is_local)
         {
             let (key, placed) = read_placement(cwd.as_path());
             let dir = cwd.as_path().display().to_string();
@@ -2192,6 +2206,10 @@ impl App {
             .filter(|w| w.dir == dir.display().to_string());
         let id = self.sessions.current().id;
         let tx = self.tx.clone();
+        // Whether a window that is *not* open should be reopened at all — the
+        // quit dialog's first tick. Raising one that is open is not gated: that
+        // moves nothing and opens nothing.
+        let reopen = self.sessions.restore_windows;
         // Off the render thread, and only when there is one to be off: a test
         // switches sessions too, and it has no runtime to spawn onto.
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
@@ -2209,7 +2227,7 @@ impl App {
                     });
                     return;
                 }
-                let Some(w) = remembered else {
+                let Some(w) = remembered.filter(|_| reopen) else {
                     return;
                 };
                 let screens = dmac_desktop::screens();
@@ -2283,7 +2301,7 @@ impl App {
     /// reason. That is also why this is exact and never fitted.
     pub(crate) fn restore_terminal(&mut self) {
         let remembered = self.sessions.terminal.clone();
-        if remembered.is_empty() {
+        if remembered.is_empty() || !self.sessions.restore_windows {
             return;
         }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
@@ -3026,6 +3044,7 @@ impl App {
             Mode::View { scroll, hex } => return self.view_key(k, scroll, hex),
             Mode::UserMenu { selected } => return self.user_menu_key(k, selected),
             Mode::ConfirmDelete => return self.confirm_delete_key(k),
+            Mode::ConfirmQuit { selected } => return self.confirm_quit_key(k, selected),
             Mode::Conflict => return self.conflict_key(k),
             Mode::Context { selected, anchor } => return self.context_key(k, selected, anchor),
             Mode::Rail { selected } => return self.rail_key(k, selected),
@@ -3434,6 +3453,53 @@ impl App {
     pub(crate) fn delete_count(&self) -> usize {
         let session = self.ses();
         session.panels[Self::idx(session.active)].operands().len()
+    }
+
+    /// Driving the quit dialog. The two ticks are the session manager's own
+    /// preferences, so toggling one here is what the next start reads.
+    fn confirm_quit_key(&mut self, k: KeyEvent, selected: usize) {
+        let rows = crate::ui::quit::ROWS;
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('n' | 'N') => self.mode = Mode::Normal,
+            KeyCode::Enter | KeyCode::Char('y' | 'Y') => self.should_quit = true,
+            KeyCode::Up => {
+                self.mode = Mode::ConfirmQuit {
+                    selected: (selected + rows - 1) % rows,
+                }
+            }
+            KeyCode::Down => {
+                self.mode = Mode::ConfirmQuit {
+                    selected: (selected + 1) % rows,
+                }
+            }
+            KeyCode::Char(' ') => self.toggle_quit_answer(selected),
+            _ => {}
+        }
+    }
+
+    fn toggle_quit_answer(&mut self, row: usize) {
+        match row {
+            0 => self.sessions.restore_windows = !self.sessions.restore_windows,
+            1 => self.sessions.remember_positions = !self.sessions.remember_positions,
+            _ => return,
+        }
+        self.touch_sessions();
+    }
+
+    /// The quit dialog, with the pointer: a click on a row toggles it, and one
+    /// outside the dialog is "stay".
+    fn mouse_confirm_quit(&mut self, m: MouseEvent) {
+        if !matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+        match Self::row_at(self.layout.menu, &m) {
+            Some(row) if row < crate::ui::quit::ROWS => {
+                self.toggle_quit_answer(row);
+                self.mode = Mode::ConfirmQuit { selected: row };
+            }
+            Some(_) => {}
+            None => self.mode = Mode::Normal,
+        }
     }
 
     fn confirm_delete_key(&mut self, k: KeyEvent) {
@@ -4780,6 +4846,9 @@ impl App {
         if let Mode::UserMenu { .. } = self.mode {
             return self.mouse_user_menu(m);
         }
+        if let Mode::ConfirmQuit { .. } = self.mode {
+            return self.mouse_confirm_quit(m);
+        }
         if let Mode::Help { scroll } = self.mode {
             return self.mouse_help(m, scroll);
         }
@@ -5775,11 +5844,73 @@ mod tests {
     }
 
     #[test]
-    fn f10_quits() {
+    fn f10_asks_and_enter_quits() {
         let mut app = fixture();
         assert!(!app.should_quit);
         app.handle(Action::Quit);
+        assert!(
+            matches!(app.mode, Mode::ConfirmQuit { .. }),
+            "leaving has two things to decide, so it asks: {:?}",
+            app.mode
+        );
+        assert!(!app.should_quit, "it left before being told to");
+        app.on_key(key(KeyCode::Enter));
         assert!(app.should_quit);
+    }
+
+    /// The two ticks are real preferences: they change what the next start
+    /// does, they are remembered, and `n` leaves everything exactly as it was.
+    #[test]
+    fn the_quit_dialogs_ticks_are_preferences_and_n_changes_nothing() {
+        // With a store, because the assertion at the end is that a changed
+        // answer gets *written* — and the fixture, having nowhere to write,
+        // marks nothing dirty.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = fixture();
+        app.store = Some(SessionStore::at(dir.path().join("sessions.json")));
+        assert!(app.sessions.restore_windows && app.sessions.remember_positions);
+        app.handle(Action::Quit);
+
+        // Space on the first row, Down, Space on the second.
+        app.on_key(key(KeyCode::Char(' ')));
+        assert!(
+            !app.sessions.restore_windows,
+            "space did not untick the first row"
+        );
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char(' ')));
+        assert!(
+            !app.sessions.remember_positions,
+            "space did not untick the second row"
+        );
+        // Wrapping, so Up from the top is the bottom.
+        app.on_key(key(KeyCode::Up));
+        app.on_key(key(KeyCode::Up));
+        assert!(matches!(app.mode, Mode::ConfirmQuit { selected: 1 }));
+
+        // Staying keeps the answers — they are how the dialog opens next time —
+        // and quits nothing.
+        app.on_key(key(KeyCode::Char('n')));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(!app.should_quit);
+        assert!(!app.sessions.restore_windows && !app.sessions.remember_positions);
+        assert!(app.dirty_at.is_some(), "a changed answer has to be written");
+    }
+
+    /// Unticking "remember their positions" is the way to leave with a layout
+    /// you have made a mess of without that mess becoming the memory.
+    #[test]
+    fn unticking_remember_leaves_this_arrangements_memory_alone() {
+        let mut app = fixture();
+        app.merge_placement(0, "/prj/thing", "office", Some(placed(-1500, 40)));
+        app.sessions.remember_positions = false;
+        app.save_on_exit();
+        let w = app.ses().editor.as_ref().expect("the window record");
+        assert_eq!(
+            w.placements.get("office").map(|p| p.x),
+            Some(-1500),
+            "the exit overwrote a place it was told not to"
+        );
     }
 
     #[test]
@@ -5986,7 +6117,10 @@ mod tests {
     fn clicking_the_last_cell_of_the_fkey_bar_quits() {
         let mut app = with_layout(fixture());
         app.on_mouse(click(MouseButton::Left, 79, 23));
-        assert!(app.should_quit, "the rightmost cell is F10");
+        assert!(
+            matches!(app.mode, Mode::ConfirmQuit { .. }),
+            "the rightmost cell is F10, which asks"
+        );
     }
 
     #[test]
@@ -6170,15 +6304,21 @@ mod tests {
             "Quit belongs last, where an exit is looked for"
         );
 
-        // Its letter, from the menu.
+        // Its letter, from the menu: it asks, like F10 does everywhere.
         app.on_key(key(KeyCode::Char('x')));
-        assert!(app.should_quit, "x did not quit");
+        assert!(
+            matches!(app.mode, Mode::ConfirmQuit { .. }),
+            "x did not ask to quit"
+        );
 
         // And F10, which is what the row says.
         let mut app = fixture();
         app.handle(Action::UtilitiesMenu);
         app.on_key(key(KeyCode::F(10)));
-        assert!(app.should_quit, "F10 in the menu did not quit");
+        assert!(
+            matches!(app.mode, Mode::ConfirmQuit { .. }),
+            "F10 in the menu did not ask"
+        );
     }
 
     // ---- windows, per arrangement of monitors ----

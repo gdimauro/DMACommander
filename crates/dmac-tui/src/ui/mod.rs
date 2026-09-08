@@ -9,6 +9,7 @@ pub(crate) mod menu;
 mod panel;
 pub(crate) mod picker;
 pub(crate) mod prompt;
+pub(crate) mod quit;
 pub(crate) mod rail;
 pub(crate) mod reattach;
 mod screen;
@@ -367,6 +368,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
         crate::app::Mode::Reattach { selected } => {
             reattach::draw(frame, area, &app.pending, selected, theme);
+        }
+        crate::app::Mode::ConfirmQuit { selected } => {
+            // The rows' rect goes where every other overlay's does, so the
+            // same click arithmetic finds the row that was pressed.
+            app.layout.menu = quit::draw(
+                frame,
+                area,
+                app.sessions.restore_windows,
+                app.sessions.remember_positions,
+                selected,
+                theme,
+            );
         }
         crate::app::Mode::Rail { .. } | crate::app::Mode::Normal => {
             app.layout.picker = ratatui::layout::Rect::default();

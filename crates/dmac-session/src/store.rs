@@ -67,6 +67,17 @@ struct Persisted {
     /// Where the terminal window was, per arrangement of monitors.
     #[serde(default)]
     terminal: std::collections::BTreeMap<String, crate::Placed>,
+    /// The quit dialog's two answers. Absent in older files, which reads as
+    /// "yes" to both: that was the only behaviour there was.
+    #[serde(default = "yes")]
+    restore_windows: bool,
+    #[serde(default = "yes")]
+    remember_positions: bool,
+}
+
+/// What an absent boolean means in a file written before it existed.
+fn yes() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -245,6 +256,8 @@ impl SessionStore {
         manager.history = dmac_core::history::History::from_visits(saved.history);
         manager.rail = saved.rail;
         manager.terminal = saved.terminal;
+        manager.restore_windows = saved.restore_windows;
+        manager.remember_positions = saved.remember_positions;
         // A file written before arrangements were remembered carries one
         // rectangle per editor window. Folded into the new shape here, once,
         // so nothing above has to know there were ever two shapes.
@@ -282,6 +295,8 @@ impl SessionStore {
             history: manager.history.visits().to_vec(),
             rail: manager.rail,
             terminal: manager.terminal.clone(),
+            restore_windows: manager.restore_windows,
+            remember_positions: manager.remember_positions,
         };
         let json = serde_json::to_string_pretty(&saved).map_err(|source| StoreError::Corrupt {
             path: self.path.display().to_string(),
@@ -716,6 +731,32 @@ mod tests {
         // (`manager()` leaves the *second* session current, which is the one
         // given a window above.)
         assert_eq!(loaded.all()[0].editor, None);
+    }
+
+    /// The quit dialog's answers survive, and an older file that never had
+    /// them reads as "yes" to both — the only behaviour there used to be.
+    #[test]
+    fn the_quit_dialogs_answers_are_remembered_and_default_to_yes() {
+        let (_d, s) = store();
+        let mut m = manager();
+        m.restore_windows = false;
+        m.remember_positions = true;
+        s.save(&m, true).expect("save");
+        let (loaded, _) = s.load().expect("load").expect("some");
+        assert!(!loaded.restore_windows);
+        assert!(loaded.remember_positions);
+
+        std::fs::write(
+            s.path(),
+            r#"{"version":1,"clean_exit":true,"current":0,"sessions":[
+                 {"name":"a","left":"/a","right":"/b"}]}"#,
+        )
+        .expect("write");
+        let (old, _) = s.load().expect("load").expect("some");
+        assert!(
+            old.restore_windows && old.remember_positions,
+            "an old file must mean yes"
+        );
     }
 
     /// A file from before arrangements were remembered carried one rectangle
