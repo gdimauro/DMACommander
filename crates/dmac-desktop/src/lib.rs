@@ -149,7 +149,35 @@ pub fn editor_windows() -> usize {
     0
 }
 
-/// Open `dir` in the editor and put the two windows side by side, as one act.
+/// Which side of the screen the editor takes when the two windows are put
+/// side by side. The terminal gets whatever is left of the row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Left,
+    Right,
+}
+
+impl Side {
+    /// As the placement script and the status line say it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+}
+
+/// Open `dir` in the editor and put the two windows side by side, as one act:
+/// the editor on the left, the terminal on the right.
+pub fn open_beside(dir: &Path, share: u32, of: u32) -> Result<Opened, DesktopError> {
+    dock(dir, Side::Left, share, of)
+}
+
+/// Open `dir` in the editor — or have the editor bring its window forward, if
+/// it already has one for that folder — and put it on `side` of the screen
+/// this terminal is on, `share`/`of` of it, with the terminal filling the rest
+/// of the row. The docking a Windows desktop does with a key, on purpose and
+/// on request.
 ///
 /// One at a time, process-wide. Three of these at once are three scripts
 /// moving the same two windows, each undoing the last and each retrying
@@ -157,20 +185,36 @@ pub fn editor_windows() -> usize {
 /// requests produce one window placed twice and two left at their default
 /// size. Serialising them costs the third request the time of the first two,
 /// and that is the correct price.
-pub fn open_beside(dir: &Path, share: u32, of: u32) -> Result<Opened, DesktopError> {
+pub fn dock(dir: &Path, side: Side, share: u32, of: u32) -> Result<Opened, DesktopError> {
     let _one_at_a_time = placing()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Counted inside the lock: a count taken before waiting for someone else's
     // placement is a count of a different world.
     let before = editor_windows();
+    // The title the folder's window already has, if it has one. It tells the
+    // script when the editor has finished bringing that window forward — and
+    // nothing else: what is placed is still the front window, which the editor
+    // put there. Without it a folder that was already at the front would be
+    // waited on for the full six seconds a new window is allowed to take.
+    let expect = existing_title(dir);
     open_editor(dir)?;
-    match tile_after(before, share, of) {
+    match tile_with(before, side, share, of, &expect) {
         Ok(()) => Ok(Opened::Placed),
         // It opened. That is what was asked for, and the windows not moving is
         // worth a line but is not a failure.
         Err(e) => Ok(Opened::NotPlaced(e.to_string())),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn existing_title(dir: &Path) -> String {
+    window_for(&editor_titles(), dir).unwrap_or("").to_string()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn existing_title(_dir: &Path) -> String {
+    String::new()
 }
 
 /// What [`open_beside`] managed. Launching and placing fail separately.
@@ -918,7 +962,7 @@ pub fn host_application() -> Option<String> {
 /// been launched a moment ago — so never call it on the render thread.
 #[cfg(target_os = "macos")]
 pub fn tile(share: u32, of: u32) -> Result<(), DesktopError> {
-    tile_after(usize::MAX, share, of)
+    tile_with(usize::MAX, Side::Left, share, of, "")
 }
 
 /// The same, waiting for a window the editor does not have yet.
@@ -929,7 +973,21 @@ pub fn tile(share: u32, of: u32) -> Result<(), DesktopError> {
 /// to be at the front. `usize::MAX` means "do not wait", for a caller that has
 /// no before to compare against.
 #[cfg(target_os = "macos")]
-pub fn tile_after(existing: usize, share: u32, of: u32) -> Result<(), DesktopError> {
+pub fn tile_after(existing: usize, side: Side, share: u32, of: u32) -> Result<(), DesktopError> {
+    tile_with(existing, side, share, of, "")
+}
+
+/// The placement itself. `expect` is the title the editor's window for the
+/// folder already carries, or empty: it lets the script stop waiting the
+/// moment that window is at the front, and decides nothing else.
+#[cfg(target_os = "macos")]
+fn tile_with(
+    existing: usize,
+    side: Side,
+    share: u32,
+    of: u32,
+    expect: &str,
+) -> Result<(), DesktopError> {
     let terminal = host_application().ok_or_else(|| {
         DesktopError::Placement("cannot tell which terminal this is running in".into())
     })?;
@@ -946,6 +1004,8 @@ pub fn tile_after(existing: usize, share: u32, of: u32) -> Result<(), DesktopErr
         .arg(share.to_string())
         .arg(of.to_string())
         .arg(existing.to_string())
+        .arg(side.name())
+        .arg(expect)
         .output()
         .map_err(|e| DesktopError::Placement(format!("osascript: {e}")))?;
 
@@ -989,7 +1049,23 @@ pub fn tile(_share: u32, _of: u32) -> Result<(), DesktopError> {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn tile_after(_existing: usize, _share: u32, _of: u32) -> Result<(), DesktopError> {
+pub fn tile_after(
+    _existing: usize,
+    _side: Side,
+    _share: u32,
+    _of: u32,
+) -> Result<(), DesktopError> {
+    Err(DesktopError::Unsupported)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn tile_with(
+    _existing: usize,
+    _side: Side,
+    _share: u32,
+    _of: u32,
+    _expect: &str,
+) -> Result<(), DesktopError> {
     Err(DesktopError::Unsupported)
 }
 
@@ -1006,6 +1082,13 @@ function run(argv) {
   // How many windows the editor had before it was asked for another one.
   var existing = parseInt(argv[4], 10);
   if (isNaN(existing)) existing = -1;
+  // Which side of the screen the editor takes. The terminal gets the rest.
+  var side = argv[5] === 'right' ? 'right' : 'left';
+  // The title the editor's window for this folder already has, if any. It says
+  // when the editor has finished bringing that window forward, so the wait
+  // below can end; it never says which window to move — that is the front
+  // one, which the editor put there.
+  var expect = argv.length > 6 ? String(argv[6]) : '';
   var se = Application('System Events');
 
   // A specifier, resolved again on every use. A window object held across a
@@ -1030,7 +1113,11 @@ function run(argv) {
   }
   var wanted = existing < 0 ? 1 : existing + 1;
   var was = frontTitle();
-  for (var i = 0; i < 60 && windows(editorName) < wanted && frontTitle() === was; i++) {
+  function settled() {
+    var now = frontTitle();
+    return windows(editorName) >= wanted || now !== was || (expect !== '' && now === expect);
+  }
+  for (var i = 0; i < 60 && !settled(); i++) {
     // Foundation, not the scripting additions: `delay` belongs to Standard
     // Additions, which `osascript -l JavaScript -e` does not always have.
     $.NSThread.sleepForTimeInterval(0.1);
@@ -1114,19 +1201,24 @@ function run(argv) {
     if (cx >= r.x && cx < r.x + r.w && cy >= r.y && cy < r.y + r.h) { scr = r; break; }
   }
 
-  var left = Math.round(scr.w * share / of);
-  var why = place(editorName, scr.x, scr.y, left, scr.h);
+  var edW = Math.round(scr.w * share / of);
+  var edX = side === 'right' ? scr.x + scr.w - edW : scr.x;
+  var why = place(editorName, edX, scr.y, edW, scr.h);
   if (why !== null) return why;
 
   // Where the editor actually landed, rather than where it was asked to go:
   // a screen's usable rectangle is not quite what `visibleFrame` says — a
   // second display carries its own menu bar, and the window server clamps to
-  // it. Fitting the terminal to the editor's own top, height and right edge
+  // it. Fitting the terminal to the editor's own top, height and near edge
   // takes that out of the arithmetic: whatever the first window was allowed,
   // the second one gets the rest of the row, exactly adjacent to it.
   var edP = win(editorName).position(), edS = win(editorName).size();
-  var x = edP[0] + edS[0];
-  why = place(termName, x, edP[1], scr.x + scr.w - x, edS[1]);
+  if (side === 'right') {
+    why = place(termName, scr.x, edP[1], edP[0] - scr.x, edS[1]);
+  } else {
+    var x = edP[0] + edS[0];
+    why = place(termName, x, edP[1], scr.x + scr.w - x, edS[1]);
+  }
   if (why !== null) return why;
   return 'ok';
 }
@@ -1301,6 +1393,43 @@ mod tests {
                 "the script has an interpolation hole in it"
             );
         }
+    }
+
+    /// A side is a word the script and the status line agree on.
+    #[test]
+    fn a_side_names_itself() {
+        assert_eq!(Side::Left.name(), "left");
+        assert_eq!(Side::Right.name(), "right");
+    }
+
+    /// The editor goes on the side it is told, and the terminal takes the rest
+    /// of the row on the other: docking, Windows-style, on request.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_tiling_script_puts_the_editor_on_the_side_it_is_told() {
+        assert!(TILE_SCRIPT.contains("argv[5]"), "no side argument");
+        assert!(TILE_SCRIPT.contains("side === 'right' ? scr.x + scr.w - edW : scr.x"));
+        // On the right, the terminal is fitted to the editor's *left* edge.
+        assert!(TILE_SCRIPT.contains("place(termName, scr.x, edP[1], edP[0] - scr.x, edS[1])"));
+    }
+
+    /// A folder's existing window title shortens the wait and does nothing
+    /// else. After the wait it must not appear again: from there on the only
+    /// window the script knows is the front one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_known_title_ends_the_wait_and_never_picks_a_window() {
+        let (before, after) = TILE_SCRIPT
+            .split_once("for (var i = 0; i < 60 && !settled(); i++)")
+            .expect("the wait loop");
+        assert!(
+            before.contains("now === expect"),
+            "the title does not end the wait"
+        );
+        assert!(
+            !after.contains("expect"),
+            "the title is used after the wait, where it could choose a window"
+        );
     }
 
     /// `ps` right-aligns its columns, so the fields are a run of spaces apart.

@@ -140,6 +140,10 @@ pub struct Session {
     /// Whether this session's children are folded away in the rail and the
     /// menu. Meaningless on a session that has none.
     pub collapsed: bool,
+    /// Made for a moment and never written down: the session a guided tour
+    /// plays in, on a scratch tree that will not exist next time. The store
+    /// skips it, so a crash mid-tour does not bring back a folder that is gone.
+    pub transient: bool,
     /// Whether this session's panels have been listed yet.
     ///
     /// Restored sessions start `false`: listing every panel of every session at
@@ -294,6 +298,7 @@ impl Session {
             parent_conversation: None,
             parent: None,
             collapsed: false,
+            transient: false,
             // A session made now is listed by whoever made it.
             loaded: true,
             reattach: None,

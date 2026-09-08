@@ -110,6 +110,11 @@ want this morning and press `y`. Saying no forgets nothing.
 `F10` asks two things on the way out: reopen the same windows next time, and
 remember their positions on this set of monitors. Both are pre-ticked the way
 you last left them, so the common case is `F10`, `Enter`.
+
+And when you want them *arranged* rather than remembered: `F9` then `r` docks
+the editor on the right of the screen with this terminal on the left, `l` the
+other way round, and the same key again narrows the editor — four fifths, two
+thirds, half. The snap key Windows has, on request and never on its own.
 See [docs/DESKTOP.md](docs/DESKTOP.md).
 
 ### Agents are hosted, not wrapped
@@ -149,6 +154,17 @@ F-key bar, every row of the help, the menus — and whatever the pointer is over
 is lit, so it looks pressable before it is pressed. If a key will not reach this
 program, open `F1` and click the row.
 See [docs/TERMINAL-KEYS.md](docs/TERMINAL-KEYS.md).
+
+### The help shows you
+
+`F1` opens the help, and at the top of it are the tours. Pick one and the
+program demonstrates that part of itself — on the real screen, through the same
+keys and clicks a hand would use — with a caption saying what is about to
+happen and the keys lit as they go down. The tours that copy, move and delete
+run in a scratch folder made for them and removed after; the keys that would
+start an agent or open your editor are shown, never pressed; and no tour can
+quit. `Esc` stops one at any point.
+See [docs/TOURS.md](docs/TOURS.md).
 
 ### The shell
 

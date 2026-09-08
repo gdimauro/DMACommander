@@ -6,6 +6,37 @@ Notable changes, newest first. Versions follow the policy in
 ## Unreleased
 
 ### Added
+- **Guided tours: the help that shows you.** `F1`, then `t` — or click a row
+  at the top of the help — and the program demonstrates one part of itself on
+  the real screen: the same keys through the same input path, a caption saying
+  what is about to happen, the key caps lit as they are pressed, a cross where
+  a click is about to land. Eleven tours, from moving between the panels to
+  what F10 asks on the way out.
+
+  A tour runs in a session of its own on a scratch tree it makes and removes,
+  so F8 in a demonstration deletes nothing of yours; the keys that would start
+  an agent or open the editor are shown and not pressed; and no tour ends
+  inside the quit dialog — two tests refuse one that would. `Esc` stops a tour
+  at any point, and every other key is held back while one plays. Every tour
+  is also a test that replays it end to end.
+- **Dock the editor beside this terminal, from the menu.** `F9` then `r` puts
+  the editor for this panel's directory on the right of the screen and the
+  terminal on the left; `l` the other way round. The same key again narrows the
+  editor a step — four fifths, two thirds, half, round again — the one habit
+  worth borrowing from a Windows snap key. Switching sides keeps the share.
+
+  On request only. Entering a session still only raises; the startup dialog
+  still only puts back; nothing docks by itself, because a window that moves
+  on its own is a window you have to go and find. Dock, then quit with
+  "remember the positions" ticked, and that layout is what this arrangement of
+  monitors comes back to.
+
+  Which window moves is decided as it is everywhere here: the editor is asked
+  to open the folder, and the window it brings forward is the one placed. A
+  folder whose window is already at the front used to be waited on for the
+  full six seconds a new window may take; its title now ends that wait — and
+  chooses nothing, which a test enforces.
+
 - **F1 is the help.** A page over the panels with every key and what it does,
   section by section — panels, marking, sorting, the command line, the F-keys,
   sessions, the shell, screensavers, the mouse, and which of it your terminal

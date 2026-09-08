@@ -251,9 +251,6 @@ impl Step {
 pub struct Scenario {
     pub name: &'static str,
     pub about: &'static str,
-    /// Whether it needs the scratch session. Everything that touches files
-    /// does; a tour of the help does not.
-    pub sandboxed: bool,
     pub steps: &'static [Step],
 }
 
@@ -274,12 +271,16 @@ const fn press(chord: Chord, caption: &'static str) -> Step {
 const fn key(k: Key, caption: &'static str) -> Step {
     press(Chord::plain(k), caption)
 }
-const fn quick(k: Key) -> Step {
+/// The same key again, saying nothing new.
+const fn again(chord: Chord) -> Step {
     Step::Press {
-        chord: Chord::plain(k),
+        chord,
         caption: "",
         hold: 450,
     }
+}
+const fn quick(k: Key) -> Step {
+    again(Chord::plain(k))
 }
 const fn type_in(text: &'static str, caption: &'static str) -> Step {
     Step::Type {
@@ -313,22 +314,34 @@ pub const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "The panels",
         about: "two panels, and how to move between and inside them",
-        sandboxed: true,
         steps: &[
             say(
-                "Two panels. The left one is active: its border is brighter, and the cursor bar is in it.",
+                "Two panels, on a scratch folder made for this tour. The left one is active: its border is brighter, and the cursor bar is in it.",
             ),
-            key(Key::Down, "The arrows move the cursor. Down, twice."),
+            key(
+                Key::Down,
+                "The arrows move the cursor. Down, twice, onto the photos folder.",
+            ),
             quick(Key::Down),
             key(
                 Key::Tab,
-                "Tab switches to the other panel. Watch the border.",
+                "Tab moves the keyboard on: to the other panel first. Watch the border.",
             ),
-            key(Key::Tab, "And back."),
+            key(
+                Key::Tab,
+                "Again, and it is on the command line — the prompt brightens.",
+            ),
+            key(
+                Key::Tab,
+                "Once more, and it is back on the left panel, where it was.",
+            ),
             key(Key::Enter, "Enter on a folder goes into it."),
             say("The title on the border is where you are now."),
             key(Key::Backspace, "Backspace goes back up."),
-            key(Key::End, "End and Home jump to the last and first entry."),
+            key(
+                Key::End,
+                "End and Home jump to the last entry and the first.",
+            ),
             quick(Key::Home),
             say("That is the whole of moving around. Everything else is a key on top of this."),
         ],
@@ -336,24 +349,25 @@ pub const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "Marking files",
         about: "Space and Shift, and what the footer says about it",
-        sandboxed: true,
         steps: &[
             say("Marking is how you say which files an operation is about."),
-            key(Key::Down, "Onto a file."),
+            key(Key::Down, "Down, twice, onto the photos folder."),
+            quick(Key::Down),
             key(
                 Key::Space,
                 "Space marks it — and moves on, so a run of files is one key held down.",
             ),
-            quick(Key::Space),
             say(
-                "Look at the bottom border: how many are marked, and for marked folders, how many files sit inside them.",
+                "Look at the bottom border: how many are marked, and in brackets, how many files the marked folders hold.",
             ),
             press(
                 Chord::shift(Key::Down),
                 "Shift with an arrow extends a selection as you go.",
             ),
-            quick(Key::Down),
-            say("Ins does what Space does, for the orthodox hand."),
+            again(Chord::shift(Key::Down)),
+            say(
+                "Ins does what Space does, for the orthodox hand. * inverts, + marks everything, - clears.",
+            ),
             key(
                 Key::Esc,
                 "Esc clears the marks. It is a ladder: it undoes the most recent thing first.",
@@ -364,22 +378,24 @@ pub const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "Copying and moving",
         about: "F5 and F6, and why the other panel is already filled in",
-        sandboxed: true,
         steps: &[
             say("This runs in a scratch folder made for the tour. Nothing of yours is touched."),
-            key(Key::Down, "Mark two files."),
-            quick(Key::Space),
+            key(Key::Down, "Down to the files, past the three folders."),
+            quick(Key::Down),
+            quick(Key::Down),
+            quick(Key::Down),
+            key(Key::Space, "Mark two of them."),
             quick(Key::Space),
             key(
                 Key::F(5),
                 "F5 copies. It asks where — and the other panel's folder is already filled in.",
             ),
             say(
-                "That is what having two panels means: one is the source, the other the destination. You can still edit it.",
+                "That is what two panels are for: one is the source, the other the destination. The answer can still be edited.",
             ),
             key(
                 Key::Enter,
-                "Enter, and the copy runs on its own thread. The status line reports as it goes.",
+                "Enter, and the copy runs on its own thread; the status line reports as it goes.",
             ),
             say(
                 "A copy verifies what it wrote. A move verifies with a hash before it deletes the original — always, whatever the options say.",
@@ -393,10 +409,9 @@ pub const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "Deleting, carefully",
         about: "F8 asks, and goes to the trash",
-        sandboxed: true,
         steps: &[
             say("Still in the scratch folder."),
-            key(Key::Down, "Onto a file, and mark it."),
+            key(Key::End, "End: onto the last file, and mark it."),
             quick(Key::Space),
             key(
                 Key::F(8),
@@ -406,31 +421,27 @@ pub const SCENARIOS: &[Scenario] = &[
                 "It goes to the trash, not to nothing. A delete you can undo is worth the seconds it costs.",
             ),
             key(Key::Char('y'), "y confirms."),
-            say(
-                "If you had marked a folder, the question would have said so, and the whole tree would have gone together.",
-            ),
+            say("A marked folder would have gone as a whole, and the question would have said so."),
         ],
     },
     Scenario {
         name: "Making a folder",
-        about: "F7, and a name several levels deep",
-        sandboxed: true,
+        about: "F7, a name, Enter",
         steps: &[
             key(Key::F(7), "F7 asks for a name."),
-            type_in(
-                "notes/2026",
-                "Type a path with a slash and you get every level — that is what every file manager does.",
-            ),
+            type_in("notes", "Type it."),
             key(Key::Enter, "Enter."),
-            say("The panel reloads and the new folder is there."),
+            say("The panel reloads, and the new folder is in it."),
         ],
     },
     Scenario {
         name: "Looking at a file",
         about: "F3, the viewer: text, hex, and finding things",
-        sandboxed: true,
         steps: &[
-            key(Key::Down, "Onto README.md."),
+            type_in(
+                "readme",
+                "Just type, and the cursor finds the name: a quick search, live while a panel has the keyboard.",
+            ),
             key(
                 Key::F(3),
                 "F3 views it. Never all of it: there is a cap, and a file past it says so on the frame.",
@@ -439,7 +450,7 @@ pub const SCENARIOS: &[Scenario] = &[
             type_in("scratch", "Type what you are looking for."),
             key(
                 Key::Enter,
-                "Enter lands on the first match, highlighted inside the line — not the whole line.",
+                "Enter lands on the first match, lit inside its line — not the whole line.",
             ),
             key(Key::Char('n'), "n walks to the next, and wraps."),
             key(
@@ -456,7 +467,6 @@ pub const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "Sessions",
         about: "Ctrl-T, typing to find one, and groups",
-        sandboxed: false,
         steps: &[
             press(
                 Chord::ctrl(Key::Char('t')),
@@ -465,7 +475,7 @@ pub const SCENARIOS: &[Scenario] = &[
             say("Just start typing to find one. No key to press first."),
             type_in(
                 "tou",
-                "The cursor goes to the closest match. The list keeps its order, so the digits stay true.",
+                "The cursor goes to the closest match — here, the tour's own session. The list keeps its order, so the digits stay true.",
             ),
             key(
                 Key::Esc,
@@ -485,7 +495,6 @@ pub const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "The shell",
         about: "Ctrl-O, and the four keys that still reach the commander from inside",
-        sandboxed: true,
         steps: &[
             press(
                 Chord::ctrl(Key::Char('o')),
@@ -511,7 +520,6 @@ pub const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "Your own commands",
         about: "F2, and why a project's commands do not run until you say so",
-        sandboxed: true,
         steps: &[
             key(
                 Key::F(2),
@@ -532,21 +540,20 @@ pub const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "Agents and the editor",
         about: "F9: an agent that can see the panels, and the editor beside them",
-        sandboxed: false,
         steps: &[
             key(
                 Key::F(9),
                 "F9 is the utilities: things to insert, and things to do.",
             ),
-            say(
-                "c starts claude in this session's shell, already connected — it can see both panels, the history and the screen it runs in. Not pressed: it would start one.",
-            ),
             show(
                 Chord::plain(Key::Char('c')),
+                "c starts claude in this session's shell, already connected: it can see both panels, the history and the screen it runs in. Not pressed — it would start one.",
+            ),
+            say(
                 "It rejoins the same conversation every time, and is watched while it runs, so a crash does not lose the way back.",
             ),
             say(
-                "o opens this folder in your editor, beside the commander. Windows come back where you left them — per set of monitors.",
+                "o opens this folder in your editor, beside the commander; r and l dock it right or left. Windows come back where you left them — per set of monitors.",
             ),
             key(Key::Esc, "Esc. And x, or F10, is the way out."),
         ],
@@ -554,14 +561,13 @@ pub const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "Leaving, and coming back",
         about: "F10 asks two things; the next start asks one",
-        sandboxed: false,
         steps: &[
             key(Key::F(10), "F10 does not leave. It asks."),
             say(
                 "Two ticks. Reopen the same windows next time — and remember their positions on this set of monitors.",
             ),
             say(
-                "Untick the second one to leave with a layout you made a mess of, without it becoming the memory. Both are kept as you leave them.",
+                "Untick the second to leave with a layout you made a mess of, without it becoming the memory. Both are kept as you leave them.",
             ),
             say(
                 "On the next start, one list: every agent and every window the last run had, each ticked. Untick what you do not want that morning.",
@@ -618,6 +624,20 @@ impl Tour {
 
     pub fn finished(&self) -> bool {
         self.step >= self.scenario.steps.len()
+    }
+
+    /// The caption to show: the current step's, or — for a repeat that says
+    /// nothing of its own — the last one that said something, so the box never
+    /// goes blank between two presses of the same key.
+    pub fn caption(&self) -> &'static str {
+        let steps = self.scenario.steps;
+        let upto = (self.step + 1).min(steps.len());
+        steps[..upto]
+            .iter()
+            .rev()
+            .map(|s| s.caption())
+            .find(|c| !c.is_empty())
+            .unwrap_or("")
     }
 
     /// `(this step, of how many)`, 1-based for a person.
@@ -743,6 +763,9 @@ impl Tour {
 /// Small and legible on purpose: a handful of files with names a caption can
 /// point at, a folder to enter, a second folder to copy into, and a
 /// `.dmac-menu.toml` so the F2 tour has something to be untrusting about.
+/// The scenarios count on its order in a panel — folders first, then files
+/// by name: `..`, `out`, `photos`, `src`, `README.md`, `recipe.txt`,
+/// `todo.md` — so a step that says "Down, twice" lands where its caption says.
 /// Removed on drop, so a tour stopped with Esc halfway through still cleans up.
 #[derive(Debug)]
 pub struct Sandbox {
@@ -753,7 +776,11 @@ impl Sandbox {
     /// Make the tree. `None` if the temp directory cannot be written, in which
     /// case the file tours are simply not offered rather than run on nothing.
     pub fn create() -> Option<Self> {
-        let root = std::env::temp_dir().join(format!("dmac-tour-{}", std::process::id()));
+        // Unique per instance, not per process: two tours in one process —
+        // which is what a test suite is — must not remove each other's tree.
+        static NTH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nth = NTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("dmac-tour-{}-{nth}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("src")).ok()?;
         std::fs::create_dir_all(root.join("photos")).ok()?;
@@ -763,7 +790,7 @@ impl Sandbox {
                 "README.md",
                 "# A scratch folder\n\nMade by the tour, removed when it ends.\nNothing here is yours.\n\nThis is a scratch tree with a few files in it,\nso the keys have something to act on.\n",
             ),
-            ("notes.txt", "one\ntwo\nthree\n"),
+            ("recipe.txt", "flour, water, salt, time\n"),
             ("todo.md", "- try F5\n- try F8\n"),
             ("src/main.rs", "fn main() {}\n"),
             ("src/lib.rs", "pub fn hello() {}\n"),
@@ -965,7 +992,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(seen, "notes/2026");
+        assert_eq!(seen, "notes");
     }
 
     /// Every key labels itself the way a person would say it, and builds the

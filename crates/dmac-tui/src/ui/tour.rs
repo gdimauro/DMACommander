@@ -116,6 +116,27 @@ pub fn draw(frame: &mut Frame, area: Rect, view: &View, theme: &Theme) -> Rect {
     popup
 }
 
+/// The tours as a menu: one row each, with a letter to press.
+pub fn items() -> Vec<crate::ui::menu::Item<'static>> {
+    crate::tour::SCENARIOS
+        .iter()
+        .enumerate()
+        .map(|(i, s)| crate::ui::menu::Item::new(s.name, key_of(i)))
+        .collect()
+}
+
+/// The letter that picks tour `i` in the menu.
+pub fn key_of(i: usize) -> &'static str {
+    const LETTERS: &str = "abcdefghijklmnopqrstuvwxyz";
+    LETTERS.get(i..i + 1).unwrap_or("")
+}
+
+/// Which tour a letter picks, if any.
+pub fn accelerator(c: char) -> Option<usize> {
+    let i = (c as u32 as usize).checked_sub('a' as u32 as usize)?;
+    (i < crate::tour::SCENARIOS.len()).then_some(i)
+}
+
 /// How many lines `text` takes when wrapped to `width`, for sizing the box.
 fn wrapped_height(text: &str, width: usize) -> usize {
     let width = width.max(1);
@@ -197,6 +218,22 @@ mod tests {
             })
             .unwrap();
         }
+    }
+
+    /// The menu lists every tour, each with the letter that picks it, and
+    /// the letter picks the same tour back.
+    #[test]
+    fn the_menu_lists_every_tour_and_its_letter_picks_it() {
+        let items = items();
+        assert_eq!(items.len(), crate::tour::SCENARIOS.len());
+        for (i, (item, s)) in items.iter().zip(crate::tour::SCENARIOS).enumerate() {
+            assert_eq!(item.label, s.name);
+            assert_eq!(item.hint, key_of(i));
+            let c = key_of(i).chars().next().expect("a letter");
+            assert_eq!(accelerator(c), Some(i));
+        }
+        assert_eq!(accelerator('z'), None);
+        assert_eq!(accelerator('1'), None);
     }
 
     #[test]

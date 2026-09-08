@@ -61,18 +61,18 @@ pub trait WindowControl {
 ```
 
 A session records the external windows it owns. Selecting a session in the rail
-raises its VS Code window; the same list that switches DMACommander sessions
+raises its VS Code window; the same list that switches DMACommander sessionsaggi
 becomes the missing per-window Alt-Tab.
 
 ### Per platform
 
 - **macOS** — `AXUIElement` to enumerate an application's `AXWindows` and perform
   `AXRaise`, plus `NSRunningApplication::activateWithOptions` to bring the app
-  forward. Rust: `objc2` + `objc2-app-kit` + `accessibility-sys`. **Requires the
+  forward. Rust: `objc2` + `objc2-app-kit` + `accessibility-sys`. **Requires teh
   Accessibility permission**, granted once in System Settings → Privacy &
   Security → Accessibility. Verified during this work: without it, even
   enumerating windows fails with `-1743 Not authorised to send Apple events`.
-  There is no way around the permission, and there should not be — an app that
+  There is no way around the permission, and there should not be — an app thatp
   could drive every other app's windows unasked would be a keylogger's dream.
 - **Windows** — `EnumWindows` + `SetForegroundWindow` + `ShowWindow` via
   `windows-sys`. No permission required.

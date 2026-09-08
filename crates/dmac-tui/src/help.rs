@@ -22,6 +22,10 @@ pub struct Row {
     pub actions: &'static [Action],
     /// Where the keyboard is when the key means this.
     pub focus: Focus,
+    /// A row that plays rather than binds: its key works on this page only,
+    /// so the keymap is not asked about it, and a row with no key at all is
+    /// chosen by clicking it.
+    pub demo: bool,
 }
 
 impl Row {
@@ -32,6 +36,7 @@ impl Row {
             what,
             actions,
             focus: Focus::Panel,
+            demo: false,
         }
     }
 
@@ -42,6 +47,7 @@ impl Row {
             what,
             actions,
             focus: Focus::CommandLine,
+            demo: false,
         }
     }
 
@@ -53,6 +59,21 @@ impl Row {
             what,
             actions: &[],
             focus: Focus::Panel,
+            demo: false,
+        }
+    }
+}
+
+impl Row {
+    /// A row of the tours. `keys` is a key that works on the help page, or
+    /// nothing, for a row that is there to be clicked.
+    pub const fn play(keys: &'static str, what: &'static str, actions: &'static [Action]) -> Self {
+        Self {
+            keys,
+            what,
+            actions,
+            focus: Focus::Panel,
+            demo: true,
         }
     }
 }
@@ -66,6 +87,70 @@ use Action::*;
 use dmac_core::SortKey;
 
 pub const SECTIONS: &[Section] = &[
+    // First, because it is the part of the help that does the explaining for
+    // you. One row per tour, in the tours' own order — a test holds the two
+    // lists together.
+    Section {
+        title: "Tours \u{2014} the help that shows you",
+        rows: &[
+            Row::play(
+                "t",
+                "the tours as a menu; or click one below. Esc stops a tour at any point",
+                &[Tours],
+            ),
+            Row::play(
+                "",
+                "The panels \u{2014} two panels, and how to move between and inside them",
+                &[Tour(0)],
+            ),
+            Row::play(
+                "",
+                "Marking files \u{2014} Space and Shift, and what the footer says about it",
+                &[Tour(1)],
+            ),
+            Row::play(
+                "",
+                "Copying and moving \u{2014} F5 and F6, and why the other panel is already filled in",
+                &[Tour(2)],
+            ),
+            Row::play(
+                "",
+                "Deleting, carefully \u{2014} F8 asks, and goes to the trash",
+                &[Tour(3)],
+            ),
+            Row::play("", "Making a folder \u{2014} F7, a name, Enter", &[Tour(4)]),
+            Row::play(
+                "",
+                "Looking at a file \u{2014} F3, the viewer: text, hex, and finding things",
+                &[Tour(5)],
+            ),
+            Row::play(
+                "",
+                "Sessions \u{2014} Ctrl-T, typing to find one, and groups",
+                &[Tour(6)],
+            ),
+            Row::play(
+                "",
+                "The shell \u{2014} Ctrl-O, and the four keys that still reach the commander from inside",
+                &[Tour(7)],
+            ),
+            Row::play(
+                "",
+                "Your own commands \u{2014} F2, and why a project's commands do not run until you say so",
+                &[Tour(8)],
+            ),
+            Row::play(
+                "",
+                "Agents and the editor \u{2014} F9: an agent that can see the panels, and the editor beside them",
+                &[Tour(9)],
+            ),
+            Row::play(
+                "",
+                "Leaving, and coming back \u{2014} F10 asks two things; the next start asks one",
+                &[Tour(10)],
+            ),
+        ],
+    },
     Section {
         title: "Panels",
         rows: &[
@@ -318,6 +403,25 @@ pub const SECTIONS: &[Section] = &[
         ],
     },
     Section {
+        title: "The editor",
+        rows: &[
+            Row::note(
+                "F9 o",
+                "open this panel's directory in the editor, beside the commander",
+            ),
+            Row::note(
+                "F9 r / F9 l",
+                "dock the editor on the right, or the left, of this terminal \u{2014} the \
+                 same key again narrows it: 4/5 of the screen, then 2/3, then 1/2",
+            ),
+            Row::note("F5, in the history", "open that directory in the editor"),
+            Row::note(
+                "F10",
+                "remembers where the windows are, for this set of monitors",
+            ),
+        ],
+    },
+    Section {
         title: "Screensavers",
         rows: &[
             Row::note(
@@ -461,7 +565,7 @@ mod tests {
         let mut checked = 0;
         for section in SECTIONS {
             for row in section.rows {
-                if row.actions.is_empty() {
+                if row.actions.is_empty() || row.demo {
                     continue;
                 }
                 let spellings: Vec<&str> = row.keys.split(" / ").collect();
@@ -495,6 +599,41 @@ mod tests {
         assert!(
             checked > 60,
             "only {checked} keys checked — the page shrank?"
+        );
+    }
+
+    /// The tours the page lists are the tours there are: the same number, in
+    /// the same order, each row starting with its tour's name and carrying
+    /// its index. One list in two places, held together here, so the page
+    /// can neither offer a tour that does not exist nor hide one that does.
+    #[test]
+    fn the_page_lists_every_tour_by_its_name() {
+        let rows: Vec<&Row> = SECTIONS
+            .iter()
+            .flat_map(|s| s.rows)
+            .filter(|r| matches!(r.actions, [Tour(_)]))
+            .collect();
+        assert_eq!(rows.len(), crate::tour::SCENARIOS.len());
+        for (i, (row, scenario)) in rows.iter().zip(crate::tour::SCENARIOS).enumerate() {
+            assert_eq!(row.actions, &[Tour(i)][..], "{}", scenario.name);
+            assert!(
+                row.what.starts_with(scenario.name),
+                "{:?} does not start with {:?}",
+                row.what,
+                scenario.name
+            );
+            assert!(
+                row.what.contains(scenario.about),
+                "{}: the page says something else",
+                scenario.name
+            );
+        }
+        assert!(
+            SECTIONS
+                .iter()
+                .flat_map(|s| s.rows)
+                .any(|r| r.keys == "t" && r.actions == [Tours]),
+            "no row says how to open the tours"
         );
     }
 

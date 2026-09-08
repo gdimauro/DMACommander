@@ -114,7 +114,7 @@ pub fn draw(
         .border_style(theme.border(true))
         .title(Span::styled(" Help ", theme.border(true)))
         .title_bottom(Span::styled(
-            " \u{2191}\u{2193} PgUp PgDn scroll \u{b7} esc close ",
+            " \u{2191}\u{2193} PgUp PgDn scroll \u{b7} t tours \u{b7} esc close ",
             theme.border(false),
         ))
         .style(theme.panel());

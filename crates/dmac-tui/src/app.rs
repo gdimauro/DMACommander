@@ -201,6 +201,11 @@ pub(crate) enum Mode {
     Reattach {
         selected: usize,
     },
+    /// The tours, as a menu, with the highlighted row. Opened from the help
+    /// with `t`; a letter or Enter starts one.
+    Tours {
+        selected: usize,
+    },
 }
 
 /// An agent the last run was hosting, waiting to be resumed.
@@ -584,6 +589,10 @@ pub struct App {
     backend: BackendRef,
     screensaver: Screensaver,
     pub(crate) mode: Mode,
+    /// Where the editor was last docked, and which of [`App::DOCK_SHARES`] it
+    /// got, so the same key pressed again narrows it a step.
+    dock_side: Option<dmac_desktop::Side>,
+    dock_share: usize,
     pub(crate) layout: LayoutCache,
     /// Incremental-search buffer, filled while a panel has focus. Cleared after
     /// a pause so an unrelated later keystroke does not extend an old search.
@@ -599,6 +608,12 @@ pub struct App {
     right_dragged: bool,
     /// Where the pointer is, so it can be drawn the way DOS text mode did.
     pub(crate) mouse: Option<(u16, u16)>,
+    /// A guided tour, while one plays. It owns the scratch session and tree
+    /// it runs on; dropping it is what takes them away.
+    tour: Option<Playing>,
+    /// Set while the tour itself is pressing a key, so the hold-back in
+    /// `on_key` lets the tour's own presses through and nobody else's.
+    tour_driving: bool,
     /// When the splash stops showing. `None` means it was never shown or has
     /// already gone, and contributes no timer either way.
     splash_until: Option<std::time::Instant>,
@@ -783,6 +798,8 @@ impl App {
             backend: Arc::new(LocalBackend::new()),
             screensaver,
             mode: Mode::Normal,
+            dock_side: None,
+            dock_share: 0,
             layout: LayoutCache::default(),
             quick_search: String::new(),
             last_search: std::time::Instant::now(),
@@ -790,6 +807,8 @@ impl App {
             last_click: None,
             right_dragged: false,
             mouse: None,
+            tour: None,
+            tour_driving: false,
             splash_until: splash
                 .then(|| std::time::Instant::now() + std::time::Duration::from_millis(1800)),
             should_quit: false,
@@ -1443,6 +1462,8 @@ impl App {
                 self.mode = Mode::Help { scroll: 0 };
                 self.begin_help_entrance();
             }
+            Tours => self.open_tours(),
+            Tour(i) => self.start_tour(i),
 
             // Everything below is claimed by the keymap but owned by an agent
             // that has not built it yet. Say so out loud rather than doing nothing.
@@ -2189,6 +2210,7 @@ impl App {
     /// It is also the throttle: while the flag stays set the reader thread stays
     /// quiet, because a repaint has been asked for and not yet given.
     pub(crate) fn before_frame(&mut self) {
+        self.tour_tick(std::time::Instant::now());
         self.expire_rail_search();
         if self.ses().view != View::Shell || self.last_shell_frame.elapsed() < SHELL_FRAME_FLOOR {
             return;
@@ -3269,7 +3291,7 @@ impl App {
             // dropping it, which is what used to happen, is the whole of "paste
             // does not work": the user presses the key their terminal handles,
             // and nothing at all comes out.
-            Event::Paste(text) => self.paste_text(&text),
+            Event::Paste(text) if self.tour.is_none() => self.paste_text(&text),
             // A resize is picked up by the next draw; a focus change counts as
             // activity so the screensaver does not start under a window the user
             // is actively looking at.
@@ -3281,6 +3303,15 @@ impl App {
     }
 
     fn on_key(&mut self, k: KeyEvent) {
+        // While a tour plays the keyboard is held back — all but Esc, which
+        // stops it. The tour's own presses arrive through `inject_key` and
+        // are let past: they are the demonstration.
+        if self.tour.is_some() && !self.tour_driving {
+            if k.code == KeyCode::Esc {
+                self.stop_tour("stopped");
+            }
+            return;
+        }
         if self.dismiss_splash() {
             return;
         }
@@ -3319,6 +3350,7 @@ impl App {
             Mode::Utilities { selected } => return self.utilities_key(k, selected),
             Mode::History { selected } => return self.history_key(k, selected),
             Mode::Reattach { selected } => return self.reattach_key(k, selected),
+            Mode::Tours { selected } => return self.tours_key(k, selected),
             Mode::Normal => {}
         }
 
@@ -3550,6 +3582,7 @@ impl App {
             self.mode = Mode::Normal;
             match deed {
                 crate::utilities::Deed::OpenEditorHere => self.open_editor_here(),
+                crate::utilities::Deed::Dock(side) => self.dock_editor(side),
                 crate::utilities::Deed::StartAgentHere => self.start_agent_here(),
                 crate::utilities::Deed::StartAgentBeside => self.start_agent_beside(),
                 crate::utilities::Deed::Quit => self.handle(Action::Quit),
@@ -4404,6 +4437,7 @@ impl App {
             KeyCode::PageDown | KeyCode::Char(' ') => self.mode = at(scroll + visible),
             KeyCode::Home => self.mode = at(0),
             KeyCode::End => self.mode = at(max),
+            KeyCode::Char('t') => self.open_tours(),
             _ => {}
         }
     }
@@ -4716,6 +4750,10 @@ impl App {
     }
 
     fn on_mouse(&mut self, m: MouseEvent) {
+        // The pointer is held back while a tour plays, like the keyboard.
+        if self.tour.is_some() && !self.tour_driving {
+            return;
+        }
         // Never let mouse motion end a game; the idle clock still resets.
         self.screensaver.on_activity();
         self.mouse = Some((m.column, m.row));
@@ -5109,6 +5147,9 @@ impl App {
         }
         if let Mode::Utilities { .. } = self.mode {
             return self.mouse_utilities(m);
+        }
+        if let Mode::Tours { .. } = self.mode {
+            return self.mouse_tours(m);
         }
         if let Mode::UserMenu { .. } = self.mode {
             return self.mouse_user_menu(m);
@@ -5569,6 +5610,66 @@ impl App {
         }
     }
 
+    /// The editor's share of the screen when docked, in the order the same key
+    /// walks through them: most of it first — what `F5` in the history gives —
+    /// then two thirds, then half, and round again.
+    const DOCK_SHARES: [(u32, u32); 3] = [(4, 5), (2, 3), (1, 2)];
+
+    /// Put this panel's directory in the editor, docked on `side` of the
+    /// screen with this terminal filling the rest. Windows does this with a
+    /// key; here it is the menu — on request, and never on its own, because a
+    /// window that moves by itself is a window somebody has to go and find.
+    ///
+    /// Off the render thread: the editor may have to start, and placing waits
+    /// for its window.
+    fn dock_editor(&mut self, side: dmac_desktop::Side) {
+        let (dir, (share, of)) = match self.dock_plan(side) {
+            Ok(plan) => plan,
+            Err(why) => {
+                self.status = why;
+                return;
+            }
+        };
+        let next = Self::DOCK_SHARES[(self.dock_share + 1) % Self::DOCK_SHARES.len()];
+        self.status = format!("docking the editor on the {} \u{2026}", side.name());
+        let tx = self.tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let shown = dir.display().to_string();
+            let update = match dmac_desktop::dock(&dir, side, share, of) {
+                Err(e) => Update::Editor(Err(format!("{e}"))),
+                Ok(dmac_desktop::Opened::Placed) => Update::Editor(Ok(format!(
+                    "editor on the {}, {share}/{of} of the screen \u{b7} again for {}/{}",
+                    side.name(),
+                    next.0,
+                    next.1
+                ))),
+                // It opened. That is most of what was asked for, and the
+                // windows not moving is worth a line but is not a failure.
+                Ok(dmac_desktop::Opened::NotPlaced(why)) => {
+                    Update::Editor(Ok(format!("opened {shown} \u{2014} {why}")))
+                }
+            };
+            let _ = tx.send(update);
+        });
+    }
+
+    /// What docking would do, without doing it: the directory, and the share
+    /// of the screen the editor gets. The same side twice narrows the editor a
+    /// step — the way a Windows key pressed again walks a window through its
+    /// sizes — and the other side keeps the share, so switching sides is only
+    /// switching. Split out so it can be tested without starting an editor.
+    pub(crate) fn dock_plan(
+        &mut self,
+        side: dmac_desktop::Side,
+    ) -> Result<(std::path::PathBuf, (u32, u32)), String> {
+        let dir = self.editor_here_target()?;
+        if self.dock_side == Some(side) {
+            self.dock_share = (self.dock_share + 1) % Self::DOCK_SHARES.len();
+        }
+        self.dock_side = Some(side);
+        Ok((dir, Self::DOCK_SHARES[self.dock_share]))
+    }
+
     /// Where the utilities menu would open the editor. Split out from the
     /// launching so it can be tested without starting anything.
     pub(crate) fn editor_here_target(&self) -> Result<std::path::PathBuf, String> {
@@ -5909,6 +6010,7 @@ pub async fn run(mut start: Startup) -> anyhow::Result<()> {
             app.shell_deadline(),
             app.help_deadline(),
             app.rail_search_deadline(),
+            app.tour_deadline(),
             save_due,
         ]
         .into_iter()
@@ -6041,6 +6143,255 @@ fn first_error(stderr: &str) -> String {
         .chars()
         .take(200)
         .collect()
+}
+
+/// A guided tour while it plays: the script, and what it is playing on.
+///
+/// The scratch session and tree are owned here, so however the tour ends —
+/// its last step, Esc, the program going down — dropping this is what takes
+/// them away.
+struct Playing {
+    tour: crate::tour::Tour,
+    sandbox: crate::tour::Sandbox,
+    /// The session the tour was started from, to go back to.
+    home: dmac_session::SessionId,
+    /// The scratch session it plays in.
+    session: dmac_session::SessionId,
+    /// Where the current step's click is going to land, while it is a click.
+    pointer: Option<(u16, u16)>,
+}
+
+/// The guided tours: see `crate::tour` for what one is and docs/TOURS.md for
+/// what it promises. This is the wiring — the menu, the scratch session, the
+/// hold-back, the beat before every frame.
+impl App {
+    /// The tours as a menu. From the help's `t`, and from the action.
+    fn open_tours(&mut self) {
+        self.help_entrance = None;
+        self.mode = Mode::Tours { selected: 0 };
+    }
+
+    fn tours_key(&mut self, k: KeyEvent, selected: usize) {
+        let items = crate::ui::tour::items();
+        match k.code {
+            // Back to the page it was opened from, not to the panels.
+            KeyCode::Esc | KeyCode::F(1) => self.mode = Mode::Help { scroll: 0 },
+            KeyCode::Up => {
+                if let Some(i) = crate::ui::menu::next_selectable(&items, selected, -1) {
+                    self.mode = Mode::Tours { selected: i };
+                }
+            }
+            KeyCode::Down => {
+                if let Some(i) = crate::ui::menu::next_selectable(&items, selected, 1) {
+                    self.mode = Mode::Tours { selected: i };
+                }
+            }
+            KeyCode::Enter => self.start_tour(selected),
+            KeyCode::Char(c) => {
+                if let Some(i) = crate::ui::tour::accelerator(c.to_ascii_lowercase()) {
+                    self.start_tour(i);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn mouse_tours(&mut self, m: MouseEvent) {
+        let area = self.layout.menu;
+        match m.kind {
+            MouseEventKind::Moved => {
+                if let Some(row) = Self::row_at(area, &m)
+                    && row < crate::tour::SCENARIOS.len()
+                {
+                    self.mode = Mode::Tours { selected: row };
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => match Self::row_at(area, &m) {
+                Some(row) => self.start_tour(row),
+                None => self.mode = Mode::Help { scroll: 0 },
+            },
+            _ => {}
+        }
+    }
+
+    /// Start a tour: a scratch tree, a session of its own on it, and the
+    /// script from its first step. Every tour runs there — the ones that only
+    /// look as well as the ones that copy and delete — so no tour can touch a
+    /// session of yours, and the one the rail's search finds is its own.
+    fn start_tour(&mut self, index: usize) {
+        let Some(scenario) = crate::tour::SCENARIOS.get(index) else {
+            return;
+        };
+        if self.tour.is_some() {
+            return;
+        }
+        let Some(sandbox) = crate::tour::Sandbox::create() else {
+            self.status = "tour: could not make a scratch folder".into();
+            return;
+        };
+        let home = self.sessions.current().id;
+        let i = self.sessions.create(
+            "tour",
+            VfsPath::local(sandbox.left().to_path_buf()),
+            VfsPath::local(sandbox.right()),
+        );
+        // Never written down: its tree will not exist next time.
+        self.sessions.at_mut(i).transient = true;
+        let session = self.sessions.all()[i].id;
+        self.help_entrance = None;
+        self.mode = Mode::Normal;
+        self.after_session_switch();
+        self.reload(PanelId::Left);
+        self.reload(PanelId::Right);
+        self.status = format!("tour: {} \u{b7} Esc stops", scenario.name);
+        self.tour = Some(Playing {
+            tour: crate::tour::Tour::start(scenario, std::time::Instant::now()),
+            sandbox,
+            home,
+            session,
+            pointer: None,
+        });
+    }
+
+    /// End a tour, however it ended: the scratch session closed, its tree
+    /// removed, the session it started from back on screen.
+    fn stop_tour(&mut self, how: &str) {
+        let Some(p) = self.tour.take() else {
+            return;
+        };
+        self.tour_driving = false;
+        // Whatever the tour left open — a prompt, a question — belonged to
+        // the scratch session and goes with it.
+        self.mode = Mode::Normal;
+        self.help_entrance = None;
+        if let Some(i) = self.sessions.index_of_id(p.session) {
+            let _ = self.sessions.close(i);
+        }
+        if let Some(h) = self.sessions.index_of_id(p.home) {
+            self.sessions.switch_to(h);
+        }
+        self.after_session_switch();
+        // The pointer the tour parked on its targets.
+        self.mouse = None;
+        self.status = format!("tour {how}: {}", p.tour.scenario.name);
+        // Removes the scratch tree: a dozen small files, well under the frame
+        // budget, and the one moment it is certain to happen.
+        drop(p.sandbox);
+    }
+
+    /// Move the tour on to `now`, pressing what is due. Before every frame;
+    /// nothing at all when no tour plays.
+    pub(crate) fn tour_tick(&mut self, now: std::time::Instant) {
+        let Some(p) = self.tour.as_ref() else {
+            return;
+        };
+        if p.tour.finished() {
+            self.stop_tour("over");
+            return;
+        }
+        // A click's target is lit before it is pressed: the pointer goes there
+        // during the caption, so the thing about to be clicked lights up the
+        // way it would under a hand.
+        let target = match p.tour.current() {
+            Some(crate::tour::Step::Click { at, .. }) => Some(*at),
+            _ => None,
+        };
+        let cell = target.and_then(|t| self.locate(t));
+        if let Some(p) = self.tour.as_mut() {
+            p.pointer = cell;
+        }
+        if cell.is_some() {
+            self.mouse = cell;
+        }
+
+        let input = self.tour.as_mut().and_then(|p| p.tour.tick(now));
+        match input {
+            Some(crate::tour::Input::Key(k)) => self.inject_key(k),
+            Some(crate::tour::Input::Click(t)) => match self.locate(t) {
+                Some((column, row)) => self.inject_mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column,
+                    row,
+                    modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+                }),
+                None => self.status = "tour: nothing to click there".into(),
+            },
+            None => {}
+        }
+        if self.tour.as_ref().is_some_and(|p| p.tour.finished()) {
+            self.stop_tour("over");
+        }
+    }
+
+    /// The tour's own press, through the same path as anyone's.
+    fn inject_key(&mut self, k: KeyEvent) {
+        self.tour_driving = true;
+        self.on_key(k);
+        self.tour_driving = false;
+    }
+
+    fn inject_mouse(&mut self, m: MouseEvent) {
+        self.tour_driving = true;
+        self.on_mouse(m);
+        self.tour_driving = false;
+    }
+
+    /// When the loop should wake to move a tour on, so it plays without
+    /// anyone pressing anything.
+    pub(crate) fn tour_deadline(&self) -> Option<std::time::Instant> {
+        self.tour.as_ref().and_then(|p| p.tour.deadline())
+    }
+
+    /// What the overlay shows, while a tour plays.
+    pub(crate) fn tour_view(&self) -> Option<crate::ui::tour::View> {
+        let p = self.tour.as_ref()?;
+        let (step, of) = p.tour.progress();
+        Some(crate::ui::tour::View {
+            title: p.tour.scenario.name,
+            caption: p.tour.caption(),
+            caps: p.tour.caps(),
+            step,
+            of,
+            pointer: p.pointer,
+        })
+    }
+
+    /// Where a tour's click lands, by the same arithmetic the hit-tests use —
+    /// so the cross is drawn on exactly the cell that gets pressed, and a test
+    /// can ask the hit-test whether it agrees.
+    fn locate(&self, target: crate::tour::Target) -> Option<(u16, u16)> {
+        use crate::tour::Target;
+        match target {
+            Target::FKey(n) => {
+                let area = self.layout.fkeys;
+                let keys = crate::ui::fkeybar::NORMAL.len();
+                let i = (n as usize).checked_sub(1)?;
+                if area.width == 0 || i >= keys {
+                    return None;
+                }
+                let cell = (area.width as usize / keys).max(4);
+                let x = area.x + (i * cell + cell / 2) as u16;
+                (x < area.x + area.width).then_some((x, area.y))
+            }
+            Target::ShellCommand(label) => {
+                let area = self.layout.shell;
+                if area.width == 0 {
+                    return None;
+                }
+                let (_, spans) = crate::ui::shell::command_line();
+                let (from, to) = crate::ui::shell::COMMANDS
+                    .iter()
+                    .zip(spans)
+                    .find(|((l, _), _)| *l == label)
+                    .map(|(_, span)| span)?;
+                Some((area.x + ((from + to) / 2) as u16, area.y + area.height))
+            }
+            Target::PanelRow(r) => {
+                let a = self.layout.panels[Self::idx(self.ses().active)];
+                (a.width > 0 && (r as u16) < a.height).then(|| (a.x + a.width / 2, a.y + r as u16))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -7034,7 +7385,12 @@ mod tests {
         let action = crate::ui::help::action_at(width, row).expect("an action");
 
         app.on_mouse(click(MouseButton::Left, area.x + 2, area.y + row as u16));
-        assert_eq!(app.mode, Mode::Normal, "the help stayed open on {action:?}");
+        // Acted on: the page is gone and the action's own screen is what is
+        // there — the panels for most rows, the tours' menu for theirs.
+        assert!(
+            !matches!(app.mode, Mode::Help { .. }),
+            "the help stayed open on {action:?}"
+        );
 
         // A title or a blank promises nothing and must do nothing.
         let inert = (0..area.height as usize)
@@ -9616,9 +9972,10 @@ run = "echo pwned"
             text.push('\n');
         }
         assert!(text.contains(" Help "), "no title on the border");
+        assert!(text.contains("Tours"), "the tours are not at the top");
         assert!(text.contains("Panels"), "no section title");
         assert!(
-            text.contains("Ctrl-R"),
+            text.contains("Up / Down"),
             "no key on the first screen of the body"
         );
     }
@@ -9784,5 +10141,330 @@ run = "echo pwned"
             text.contains("Panels"),
             "the cannon is not shooting at the help:\n{text}"
         );
+    }
+    // ---- docking the editor ----
+
+    /// The same side again narrows the editor a step and wraps; the other
+    /// side keeps the share, so switching sides is only switching.
+    #[test]
+    fn docking_cycles_the_share_on_the_same_side_and_keeps_it_across_sides() {
+        use dmac_desktop::Side;
+        let mut app = fixture();
+        let mut share = |side| app.dock_plan(side).map(|(_, s)| s);
+        assert_eq!(share(Side::Right), Ok((4, 5)), "most of the screen first");
+        assert_eq!(share(Side::Right), Ok((2, 3)));
+        assert_eq!(
+            share(Side::Left),
+            Ok((2, 3)),
+            "changing side must keep the share"
+        );
+        assert_eq!(share(Side::Left), Ok((1, 2)));
+        assert_eq!(share(Side::Left), Ok((4, 5)), "and round again");
+    }
+
+    /// Docking is the panel's directory in the editor, like `F9` `o`: the same
+    /// target, so the two entries never disagree about which folder is meant.
+    #[test]
+    fn docking_targets_the_same_directory_as_opening_the_editor() {
+        let mut app = fixture();
+        let opened = app.editor_here_target().unwrap();
+        let (docked, _) = app.dock_plan(dmac_desktop::Side::Right).unwrap();
+        assert_eq!(docked, opened);
+    }
+
+    // ---- Guided tours ---------------------------------------------------
+
+    /// Play tour `index` against the real program: a synthetic clock steps
+    /// it, every beat is drawn so the layout the clicks need exists, and the
+    /// listings and jobs it starts are pumped back in as they arrive. `probe`
+    /// is asked every beat; the first time it says yes the tour is stopped
+    /// there — with Esc, the way a person would — and `true` comes back.
+    async fn replay(
+        index: usize,
+        mut probe: impl FnMut(&App) -> bool,
+    ) -> (App, bool, std::path::PathBuf) {
+        let mut app = fixture();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.tx = tx;
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        app.start_tour(index);
+        let root = app
+            .tour
+            .as_ref()
+            .expect("the tour started")
+            .sandbox
+            .root
+            .clone();
+        let mut now = std::time::Instant::now();
+        let mut seen = false;
+        let mut beats = 0;
+        while app.tour.is_some() {
+            now += std::time::Duration::from_millis(250);
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            while let Ok(u) = rx.try_recv() {
+                app.apply(u);
+            }
+            app.tour_tick(now);
+            term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+            if probe(&app) {
+                seen = true;
+                app.on_key(key(KeyCode::Esc));
+                break;
+            }
+            beats += 1;
+            assert!(beats < 4000, "tour {index} never ends");
+        }
+        // Whatever the last step started, let it land — or be dropped.
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            while let Ok(u) = rx.try_recv() {
+                app.apply(u);
+            }
+        }
+        (app, seen, root)
+    }
+
+    /// What every tour must leave behind: nothing.
+    fn back_home(app: &App, root: &std::path::Path, name: &str) {
+        assert!(app.tour.is_none(), "{name}: still playing");
+        assert_eq!(
+            app.sessions.len(),
+            1,
+            "{name}: the scratch session outlived the tour"
+        );
+        assert_eq!(app.sessions.current().name, "test", "{name}: not back home");
+        assert_eq!(app.mode, Mode::Normal, "{name}: left a dialog open");
+        assert!(!app.should_quit, "{name}: a tour quit the program");
+        assert!(!root.exists(), "{name}: the scratch tree outlived the tour");
+    }
+
+    /// Every tour plays through against the real program and leaves nothing
+    /// behind — no session, no tree, no dialog, and the program still running.
+    /// The deleting tour is the one exception, stopped at its question below.
+    #[tokio::test]
+    async fn every_tour_plays_to_the_end_and_leaves_no_trace() {
+        for (i, s) in crate::tour::SCENARIOS.iter().enumerate() {
+            if s.name == "Deleting, carefully" {
+                continue;
+            }
+            let (app, _, root) = replay(i, |_| false).await;
+            back_home(&app, &root, s.name);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_panels_tour_really_enters_the_folder() {
+        let (app, seen, root) = replay(0, |a| a.ses().cwd[0].display().ends_with("photos")).await;
+        assert!(seen, "Enter never went into photos");
+        back_home(&app, &root, "The panels");
+    }
+
+    #[tokio::test]
+    async fn the_marking_tour_really_marks() {
+        let (app, seen, root) = replay(1, |a| a.ses().panels[0].marked() > 0).await;
+        assert!(seen, "Space marked nothing");
+        back_home(&app, &root, "Marking files");
+    }
+
+    #[tokio::test]
+    async fn the_copying_tour_really_copies_into_the_other_panel() {
+        let (app, seen, root) = replay(2, |a| {
+            a.tour
+                .as_ref()
+                .is_some_and(|p| p.sandbox.right().join("README.md").is_file())
+        })
+        .await;
+        assert!(seen, "F5 copied nothing into out/");
+        back_home(&app, &root, "Copying and moving");
+    }
+
+    /// Stopped at the question: past it, F8 would put a scratch file in the
+    /// real trash on every run of this suite. That it asks is the point.
+    #[tokio::test]
+    async fn the_deleting_tour_asks_before_anything_goes() {
+        let (app, seen, root) = replay(3, |a| a.mode == Mode::ConfirmDelete).await;
+        assert!(seen, "F8 never asked");
+        back_home(&app, &root, "Deleting, carefully");
+    }
+
+    #[tokio::test]
+    async fn the_folder_tour_really_makes_the_folder() {
+        let (app, seen, root) = replay(4, |a| {
+            a.tour
+                .as_ref()
+                .is_some_and(|p| p.sandbox.root.join("notes").is_dir())
+        })
+        .await;
+        assert!(seen, "F7 made no folder");
+        back_home(&app, &root, "Making a folder");
+    }
+
+    #[tokio::test]
+    async fn the_viewer_tour_really_opens_the_viewer() {
+        let (app, seen, root) = replay(5, |a| matches!(a.mode, Mode::View { .. })).await;
+        assert!(seen, "F3 opened nothing");
+        back_home(&app, &root, "Looking at a file");
+    }
+
+    #[tokio::test]
+    async fn the_sessions_tour_really_opens_the_rail() {
+        let (app, seen, root) = replay(6, |a| matches!(a.mode, Mode::Rail { .. })).await;
+        assert!(seen, "Ctrl-T opened no rail");
+        back_home(&app, &root, "Sessions");
+    }
+
+    #[tokio::test]
+    async fn the_shell_tour_really_shows_the_shell() {
+        let (app, seen, root) = replay(7, |a| a.ses().view == View::Shell).await;
+        assert!(seen, "Ctrl-O showed no shell");
+        back_home(&app, &root, "The shell");
+    }
+
+    #[tokio::test]
+    async fn the_menu_tours_really_open_their_menus() {
+        let (app, seen, root) = replay(8, |a| matches!(a.mode, Mode::UserMenu { .. })).await;
+        assert!(seen, "F2 opened no menu");
+        back_home(&app, &root, "Your own commands");
+        let (app, seen, root) = replay(9, |a| matches!(a.mode, Mode::Utilities { .. })).await;
+        assert!(seen, "F9 opened no menu");
+        back_home(&app, &root, "Agents and the editor");
+        let (app, seen, root) = replay(10, |a| matches!(a.mode, Mode::ConfirmQuit { .. })).await;
+        assert!(seen, "F10 never asked");
+        back_home(&app, &root, "Leaving, and coming back");
+    }
+
+    /// A stray key or click during a tour must not wander into it; Esc, and
+    /// only Esc, ends it — and ending it takes the scratch session away.
+    #[tokio::test]
+    async fn while_a_tour_plays_the_keyboard_and_mouse_are_held_back() {
+        let mut app = fixture();
+        app.start_tour(0);
+        assert_eq!(app.sessions.len(), 2);
+        assert_eq!(app.sessions.current().name, "tour");
+        app.on_key(key(KeyCode::F(10)));
+        assert_eq!(app.mode, Mode::Normal, "a key got through to the program");
+        app.on_mouse(click(MouseButton::Left, 40, 23));
+        assert_eq!(app.mode, Mode::Normal, "a click got through to the program");
+        assert!(app.tour.is_some());
+        let root = app
+            .tour
+            .as_ref()
+            .map(|p| p.sandbox.root.clone())
+            .expect("root");
+        app.on_key(key(KeyCode::Esc));
+        back_home(&app, &root, "The panels");
+    }
+
+    /// The cross is drawn on the cell the hit-test answers for, and pressed
+    /// there: one arithmetic, asked both ways.
+    #[test]
+    fn a_tours_click_lands_on_the_cell_the_hit_test_answers_for() {
+        let mut app = fixture();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        for n in 1..=10u8 {
+            let (x, y) = app.locate(crate::tour::Target::FKey(n)).expect("a cell");
+            assert_eq!(
+                crate::ui::fkeybar::cell_at(app.layout.fkeys, 10, x, y),
+                Some(n as usize - 1),
+                "F{n}"
+            );
+        }
+        assert_eq!(app.locate(crate::tour::Target::FKey(11)), None);
+        // No shell on screen: nothing to click on its border.
+        assert_eq!(
+            app.locate(crate::tour::Target::ShellCommand("F12 history")),
+            None
+        );
+    }
+
+    /// The help page is where the tours live: `t` opens them as a menu, a
+    /// letter picks one, Esc goes back to the page rather than to the panels.
+    #[tokio::test]
+    async fn t_on_the_help_page_opens_the_tours_and_a_letter_picks_one() {
+        let mut app = fixture();
+        app.handle(Action::Help);
+        app.on_key(key(KeyCode::Char('t')));
+        assert!(matches!(app.mode, Mode::Tours { selected: 0 }));
+        app.on_key(key(KeyCode::Down));
+        assert!(matches!(app.mode, Mode::Tours { selected: 1 }));
+        app.on_key(key(KeyCode::Esc));
+        assert!(
+            matches!(app.mode, Mode::Help { .. }),
+            "Esc should go back to the page"
+        );
+        app.on_key(key(KeyCode::Char('t')));
+        app.on_key(key(KeyCode::Char('b')));
+        assert_eq!(
+            app.tour.as_ref().map(|p| p.tour.scenario.name),
+            Some("Marking files")
+        );
+        let root = app
+            .tour
+            .as_ref()
+            .map(|p| p.sandbox.root.clone())
+            .expect("root");
+        app.stop_tour("test");
+        back_home(&app, &root, "Marking files");
+    }
+
+    /// And a row of the page starts its tour when clicked, like every other
+    /// row that does something.
+    #[tokio::test]
+    async fn clicking_a_tour_on_the_help_page_starts_it() {
+        let mut app = fixture();
+        let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        app.handle(Action::Help);
+        app.help_entrance = None;
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let area = app.layout.help;
+        let line = (0..area.height as usize)
+            .find(|&l| crate::ui::help::action_at(area.width as usize, l) == Some(Action::Tour(0)))
+            .expect("the first tour's row on the page");
+        app.on_mouse(click(MouseButton::Left, area.x + 2, area.y + line as u16));
+        assert_eq!(
+            app.tour.as_ref().map(|p| p.tour.scenario.name),
+            Some("The panels")
+        );
+        let root = app
+            .tour
+            .as_ref()
+            .map(|p| p.sandbox.root.clone())
+            .expect("root");
+        app.stop_tour("test");
+        back_home(&app, &root, "The panels");
+    }
+
+    /// The overlay is on screen while a tour plays: its name, its caption,
+    /// and the key it is about to press.
+    #[tokio::test]
+    async fn the_tour_overlay_narrates_on_screen() {
+        let mut app = fixture();
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        app.start_tour(0);
+        let t0 = std::time::Instant::now();
+        // Past the opening caption, onto the first press, and past its lead.
+        let opening = crate::tour::SCENARIOS[0].steps[0].hold();
+        app.tour_tick(t0 + std::time::Duration::from_millis(opening));
+        app.tour_tick(t0 + std::time::Duration::from_millis(opening) + crate::tour::LEAD);
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let mut s = String::new();
+        for y in 0..30 {
+            for x in 0..100 {
+                s.push_str(buf[(x, y)].symbol());
+            }
+            s.push('\n');
+        }
+        assert!(s.contains("Tour \u{b7} The panels"), "{s}");
+        assert!(s.contains("The arrows move the cursor"), "{s}");
+        assert!(s.contains(" \u{2193} "), "the pressed key is not lit: {s}");
+        let root = app
+            .tour
+            .as_ref()
+            .map(|p| p.sandbox.root.clone())
+            .expect("root");
+        app.stop_tour("test");
+        back_home(&app, &root, "The panels");
     }
 }

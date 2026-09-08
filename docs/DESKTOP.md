@@ -90,6 +90,32 @@ Files written before any of this carried one rectangle and no screen. They are
 still read; that rectangle becomes the fallback for arrangements that have no
 place of their own.
 
+## Docking, on request
+
+`F9` then `r` puts the editor on the right of the screen and this terminal on
+the left; `F9` then `l` the other way round. The editor is the one for the
+active panel's directory — opened if it has no window yet, brought forward by
+the editor itself if it has — and the terminal takes whatever the editor left
+of the row, exactly adjacent to it, on the screen the terminal is on.
+
+The same key again narrows the editor a step: four fifths of the screen, then
+two thirds, then half, then four fifths again. That is the one habit borrowed
+from Windows, where a snap key pressed twice walks a window through its sizes.
+Switching sides keeps the share, so `r` after `l` is only a swap.
+
+Nothing docks by itself. Entering a session raises a window; the startup dialog
+puts windows back where they were; docking happens when you ask for it and not
+otherwise, because a window that moves on its own is a window you have to go
+and find. Dock, then leave with `F10` and "remember the positions" ticked, and
+the docked layout is what this arrangement of monitors remembers.
+
+Which window moves is decided the way it is everywhere here: the editor is
+asked to open the folder, and the window it brings to the front is the one
+that is placed. A window title is read only so the placement can stop waiting
+the moment that window is at the front, never to choose one — a wrong guess
+about what to raise brings the wrong project forward, which is visible and
+undone by looking away; a wrong guess about what to move rearranges your desk.
+
 ## The permission
 
 Moving another application's windows needs **Accessibility**, and macOS refuses

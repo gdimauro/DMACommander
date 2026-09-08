@@ -26,6 +26,11 @@ pub enum Utility {
     Base64Decode,
     QuoteLine,
     EditorHere,
+    /// The editor on one side of the screen, this terminal on the other. The
+    /// docking a Windows desktop does with a key, here on request from the
+    /// menu — and never on its own.
+    DockRight,
+    DockLeft,
     AgentHere,
     AgentBeside,
     /// Leave. Last in the menu, where an exit belongs, and on the key it
@@ -40,6 +45,9 @@ pub enum Utility {
 pub enum Deed {
     /// Open the active panel's directory in the editor, beside the commander.
     OpenEditorHere,
+    /// Put the editor for the active panel's directory on this side of the
+    /// screen, and the terminal on the other.
+    Dock(dmac_desktop::Side),
     /// Start this session's agent in its shell, and show the shell.
     StartAgentHere,
     /// Open a session beside this one, in its group, and start an agent in it.
@@ -88,6 +96,8 @@ impl Utility {
         Some(Self::QuoteLine),
         None,
         Some(Self::EditorHere),
+        Some(Self::DockRight),
+        Some(Self::DockLeft),
         Some(Self::AgentHere),
         Some(Self::AgentBeside),
         None,
@@ -110,6 +120,8 @@ impl Utility {
             Self::Base64Decode => "Base64-decode the line",
             Self::QuoteLine => "Shell-quote the line",
             Self::EditorHere => "Open this panel in the editor",
+            Self::DockRight => "Dock the editor on the right",
+            Self::DockLeft => "Dock the editor on the left",
             Self::AgentHere => "Start claude in this session",
             Self::AgentBeside => "New claude beside this one",
             Self::Quit => "Quit DMACommander",
@@ -134,6 +146,8 @@ impl Utility {
             Self::Base64Decode => 'd',
             Self::QuoteLine => 'q',
             Self::EditorHere => 'o',
+            Self::DockRight => 'r',
+            Self::DockLeft => 'l',
             Self::AgentHere => 'c',
             Self::AgentBeside => 'a',
             Self::Quit => 'x',
@@ -317,6 +331,8 @@ fn hint_of(u: Utility) -> &'static str {
         'd' => "d",
         'q' => "q",
         'o' => "o",
+        'r' => "r",
+        'l' => "l",
         'c' => "c",
         'a' => "a",
         'x' => "x",
@@ -375,6 +391,8 @@ pub fn run(u: Utility, cx: &Context<'_>) -> Outcome {
         Utility::SelectedNames => join_quoted(&cx.selected, "nothing is selected"),
         Utility::SelectedPaths => join_quoted(&cx.selected_paths, "nothing is selected"),
         Utility::EditorHere => Outcome::Do(Deed::OpenEditorHere),
+        Utility::DockRight => Outcome::Do(Deed::Dock(dmac_desktop::Side::Right)),
+        Utility::DockLeft => Outcome::Do(Deed::Dock(dmac_desktop::Side::Left)),
         Utility::AgentHere => Outcome::Do(Deed::StartAgentHere),
         Utility::AgentBeside => Outcome::Do(Deed::StartAgentBeside),
         Utility::Quit => Outcome::Do(Deed::Quit),
@@ -698,5 +716,35 @@ mod tests {
     fn a_selection_is_trimmed_before_being_decoded() {
         let sel = with_selection("", "  Y2lhbw==  \n");
         assert!(matches!(run(Utility::Base64Decode, &sel), Outcome::Insert(ref s) if s == "ciao"));
+    }
+    /// Docking is a deed and names its side; `r` and `l` are its keys, next to
+    /// the entry that opens the editor.
+    #[test]
+    fn docking_is_a_deed_with_a_side_and_a_key() {
+        use dmac_desktop::Side;
+        assert!(matches!(
+            run(Utility::DockRight, &cx("")),
+            Outcome::Do(Deed::Dock(Side::Right))
+        ));
+        assert!(matches!(
+            run(Utility::DockLeft, &cx("")),
+            Outcome::Do(Deed::Dock(Side::Left))
+        ));
+        assert_eq!(from_key('r', &[]), Some(Choice::Do(Utility::DockRight)));
+        assert_eq!(from_key('l', &[]), Some(Choice::Do(Utility::DockLeft)));
+        // Shown beside the editor entry, and each hint is its own key.
+        let items = items(&[]);
+        let labels: Vec<&str> = items.iter().map(|i| i.label).collect();
+        let at = |l: &str| labels.iter().position(|x| *x == l).unwrap();
+        assert_eq!(
+            at("Dock the editor on the right"),
+            at("Open this panel in the editor") + 1
+        );
+        assert_eq!(
+            at("Dock the editor on the left"),
+            at("Dock the editor on the right") + 1
+        );
+        assert_eq!(items[at("Dock the editor on the right")].hint, "r");
+        assert_eq!(items[at("Dock the editor on the left")].hint, "l");
     }
 }

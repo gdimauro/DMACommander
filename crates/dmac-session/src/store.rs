@@ -279,9 +279,27 @@ impl SessionStore {
         let saved = Persisted {
             version: FORMAT_VERSION,
             clean_exit,
-            current: manager.current_index(),
+            // The visible session, by its position among the sessions that
+            // are written. A transient one that is current has no position
+            // there; the one before it stands in.
+            current: manager
+                .all()
+                .iter()
+                .take(manager.current_index())
+                .filter(|s| !s.transient)
+                .count()
+                .min(
+                    manager
+                        .all()
+                        .iter()
+                        .filter(|s| !s.transient)
+                        .count()
+                        .saturating_sub(1),
+                ),
             sessions: {
-                let all = manager.all();
+                // A transient session is not written, and positions — which is
+                // how a parent is named on disk — are counted without it.
+                let all: Vec<&Session> = manager.all().iter().filter(|s| !s.transient).collect();
                 let at = |id: crate::SessionId| all.iter().position(|s| s.id == id);
                 all.iter()
                     .map(|s| {
@@ -474,6 +492,52 @@ mod tests {
         assert_eq!(loaded.current().panels[0].sort_key, SortKey::Size);
         assert!(loaded.current().panels[0].show_hidden);
         assert_eq!(loaded.current().cwd[0].display(), "/c");
+    }
+
+    /// A session made for a tour is never written: it lives on a scratch tree
+    /// that will not exist next time. The sessions after it keep their
+    /// parents — which are named by position on disk — and the visible session
+    /// is still the visible session.
+    #[test]
+    fn a_transient_session_is_not_written_and_shifts_nothing() {
+        let (_d, s) = store();
+        let mut m = manager();
+        let t = m.create(
+            "tour",
+            VfsPath::local("/tmp/tour"),
+            VfsPath::local("/tmp/tour/out"),
+        );
+        m.at_mut(t).transient = true;
+        // A group made after the transient one: its parent is named by position.
+        let a = m.create("a", VfsPath::local("/a"), VfsPath::local("/b"));
+        let b = m.create_sibling(a, "b", VfsPath::local("/a"), VfsPath::local("/b"));
+        let a_id = m.get(a).map(|s| s.id).expect("a");
+        assert_eq!(m.get(b).and_then(|s| s.parent), Some(a_id));
+        m.switch_to(b);
+        s.save(&m, true).expect("save");
+
+        let (loaded, _) = s.load().expect("load").expect("some");
+        let names: Vec<&str> = loaded.all().iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["work", "build", "a", "b"],
+            "the tour session was written"
+        );
+        assert_eq!(loaded.current().name, "b", "the visible session shifted");
+        let a_id = loaded.all()[2].id;
+        assert_eq!(
+            loaded.all()[3].parent,
+            Some(a_id),
+            "b lost its parent to the shift"
+        );
+
+        // And while the transient one is the visible session, the next start
+        // opens on a real one rather than on nothing.
+        m.switch_to(t);
+        s.save(&m, true).expect("save");
+        let (loaded, _) = s.load().expect("load").expect("some");
+        assert_eq!(loaded.len(), 4);
+        assert!(loaded.current_index() < 4);
     }
 
     /// An unclean exit has to be visible, or a stale layout looks like a bug.

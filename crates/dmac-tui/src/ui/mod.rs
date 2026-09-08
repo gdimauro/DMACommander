@@ -15,9 +15,6 @@ pub(crate) mod reattach;
 mod screen;
 pub(crate) mod shell;
 mod splash;
-// Drawn by `app.rs` once the tours are wired in; until then nothing calls it.
-// See docs/TOURS.md. Drop the allow with the wiring.
-#[allow(dead_code)]
 pub(crate) mod tour;
 pub(crate) mod view;
 
@@ -403,6 +400,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 theme,
             );
         }
+        crate::app::Mode::Tours { selected } => {
+            // Near where the help sits, since that is where it was opened from.
+            let items = tour::items();
+            let anchor = (area.x + area.width / 4, area.y + 2);
+            app.layout.menu = menu::draw(frame, area, anchor, &items, selected, theme);
+        }
         crate::app::Mode::Rail { .. } | crate::app::Mode::Normal => {
             app.layout.picker = ratatui::layout::Rect::default();
             app.layout.menu = ratatui::layout::Rect::default();
@@ -420,6 +423,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // sprite — it inverted the attribute of the cell under the mouse, and that
     // is exactly what this does.
     draw_mouse_pointer(frame, area, app);
+
+    // Over even that: a tour's narration, while one plays. The program
+    // underneath is the demonstration; this is the box saying what to watch.
+    if let Some(view) = app.tour_view() {
+        tour::draw(frame, area, &view, theme);
+    }
 }
 
 /// The bottom command line: a prompt, whatever the user has typed, and — when

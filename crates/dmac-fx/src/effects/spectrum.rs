@@ -121,14 +121,15 @@ impl Spectrum {
 
         for i in 0..n {
             let hi_hz = lo_hz * ratio;
-            let lo = ((lo_hz / bin_hz) as usize).max(1);
-            let hi = ((hi_hz / bin_hz) as usize).clamp(lo + 1, nyquist_bin);
 
             // Peak within the band, not the mean: a mean over a wide high band
-            // buries a single strong tone in the noise around it.
+            // buries a single strong tone in the noise around it. A band this
+            // device cannot hear at all is silent.
             let mut peak = 0.0f32;
-            for c in &self.scratch[lo..hi] {
-                peak = peak.max(c.norm());
+            if let Some((lo, hi)) = band_bins(lo_hz, hi_hz, bin_hz, nyquist_bin) {
+                for c in &self.scratch[lo..hi] {
+                    peak = peak.max(c.norm());
+                }
             }
 
             // dB, because hearing is logarithmic in amplitude too. The floor is
@@ -325,9 +326,51 @@ fn hsv(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
     ((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
 }
 
+/// The FFT bins a band covers, `[lo, hi)`, or `None` for a band that lies
+/// above what the device can hear.
+///
+/// The bands run up to [`F_MAX`] whatever the device; a 16 kHz microphone —
+/// a Bluetooth headset, a conference speaker — stops at 8 kHz, so its top
+/// bands start past the last bin there is. Those are silent, not a panic:
+/// this used to clamp with a floor above its ceiling, which is one.
+fn band_bins(lo_hz: f32, hi_hz: f32, bin_hz: f32, nyquist_bin: usize) -> Option<(usize, usize)> {
+    let lo = ((lo_hz / bin_hz) as usize).max(1);
+    if lo + 1 > nyquist_bin {
+        return None;
+    }
+    let hi = ((hi_hz / bin_hz) as usize).clamp(lo + 1, nyquist_bin);
+    Some((lo, hi))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A device whose Nyquist frequency is below the top band must not take
+    /// the effect down with it: the bands it cannot hear are silent, a band
+    /// straddling its limit is cut at the limit, and a band narrower than a
+    /// bin still covers one. 16 kHz is what a Bluetooth headset reports.
+    #[test]
+    fn bands_above_what_the_device_hears_are_silent_not_fatal() {
+        let bin_hz = 16_000.0 / WINDOW as f32;
+        let nyquist = WINDOW / 2;
+        // The top band of the display, on a device that stops at 8 kHz.
+        assert_eq!(band_bins(14_800.0, F_MAX, bin_hz, nyquist), None);
+        // Straddling: cut, not dropped.
+        let (lo, hi) = band_bins(7_900.0, 8_500.0, bin_hz, nyquist).expect("a band");
+        assert!(lo < hi && hi == nyquist, "{lo}..{hi}");
+        // Well below: as before.
+        let (lo, hi) = band_bins(100.0, 200.0, bin_hz, nyquist).expect("a band");
+        assert!(lo >= 1 && hi > lo && hi < nyquist, "{lo}..{hi}");
+        // Narrower than a bin: still one bin wide, never empty.
+        let (lo, hi) = band_bins(30.0, 31.0, bin_hz, nyquist).expect("a band");
+        assert_eq!(hi, lo + 1);
+        // And the very last bin there is.
+        assert_eq!(
+            band_bins(7_990.0, 8_000.0, bin_hz, nyquist),
+            Some((1022, 1024))
+        );
+    }
 
     /// Everything except opening the microphone, which CI has none of.
     fn offline() -> Spectrum {

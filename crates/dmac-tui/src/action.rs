@@ -130,4 +130,9 @@ pub enum Action {
     /// Something is bound but not implemented yet; reported in the status line
     /// rather than silently ignored, so gaps are visible instead of confusing.
     Unimplemented(&'static str),
+
+    /// The tours, as a menu: the help that shows you rather than tells you.
+    Tours,
+    /// Play one tour. The index is into `tour::SCENARIOS`, which the help lists.
+    Tour(usize),
 }

@@ -1,8 +1,9 @@
 # Guided tours — the help that shows you
 
-`F1` opens the help. At the top of it is a list of tours: pick one and the
-program demonstrates that part of itself, on the real screen, with a caption
-saying what is about to happen and the keys lit up as they are pressed.
+`F1` opens the help. At the top of it is the list of tours: click one, or
+press `t` for them as a menu and a letter to pick. The program then
+demonstrates that part of itself, on the real screen, with a caption saying
+what is about to happen and the keys lit up as they are pressed.
 
 ```
 ╭ Tour · Marking files · 3/10 ──────────────────────╮
@@ -21,10 +22,11 @@ thing, and it is why every tour is also a test that replays end to end.
 
 ## What a tour will not do
 
-**Touch your files.** The tours that copy, move, delete and make folders run in
-a session of their own, on a scratch tree the tour creates in the temp directory
-— a README, a few files, a `src/`, a `photos/`, an `out/` to copy into — and
-removes when it ends. Stop a tour with Esc halfway through and the tree is still
+**Touch your files.** Every tour runs in a session of its own, on a scratch
+tree the tour creates in the temp directory — a README, a few files, a `src/`,
+a `photos/`, an `out/` to copy into — and removes when it ends. That session is
+never written to disk: a crash mid-tour does not bring back a folder that is
+gone. Stop a tour with Esc halfway through and the tree is still
 removed: the cleanup is on drop, not on a step. A demonstration of F8 that
 deleted something of yours would be a demonstration of why people do not trust
 demonstrations.
@@ -68,10 +70,12 @@ that start things.
 ## Adding one
 
 A tour is data: `crates/dmac-tui/src/tour.rs`, `SCENARIOS`. A scenario is a
-name, a line about it, whether it needs the scratch session, and a list of
-steps — `say` a caption, `key` a press, `type_in` some text, `click` a target,
-`show` a key without pressing it. Add one there and it appears in the help,
-plays, and is replayed by the tests.
+name, a line about it, and a list of steps — `say` a caption, `key` a press,
+`type_in` some text, `click` a target, `show` a key without pressing it. Add
+one there, and a row for it in the help's first section (a test holds the two
+lists together), and it plays, and is replayed by the tests. The scratch tree
+lists as `..`, `out`, `photos`, `src`, `README.md`, `recipe.txt`, `todo.md`;
+a step that says "Down, twice" counts on that.
 
 Two tests will refuse a tour that is unsafe: one that ends inside the quit
 dialog, or one that presses a key that launches something. Write the caption in
