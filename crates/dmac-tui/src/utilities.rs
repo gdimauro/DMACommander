@@ -28,6 +28,9 @@ pub enum Utility {
     EditorHere,
     AgentHere,
     AgentBeside,
+    /// Leave. Last in the menu, where an exit belongs, and on the key it
+    /// has everywhere else.
+    Quit,
 }
 
 /// Something for the application to do. The utilities name it; performing it —
@@ -46,6 +49,8 @@ pub enum Deed {
     /// panels — drawn nested under the one it came from, so a group of them
     /// reads as a group rather than as five entries that happen to be adjacent.
     StartAgentBeside,
+    /// Quit the program, as F10 does from the panels.
+    Quit,
 }
 
 /// What choosing an entry does to the command line.
@@ -85,6 +90,8 @@ impl Utility {
         Some(Self::EditorHere),
         Some(Self::AgentHere),
         Some(Self::AgentBeside),
+        None,
+        Some(Self::Quit),
     ];
 
     pub fn label(self) -> &'static str {
@@ -105,6 +112,7 @@ impl Utility {
             Self::EditorHere => "Open this panel in the editor",
             Self::AgentHere => "Start claude in this session",
             Self::AgentBeside => "New claude beside this one",
+            Self::Quit => "Quit DMACommander",
         }
     }
 
@@ -128,6 +136,7 @@ impl Utility {
             Self::EditorHere => 'o',
             Self::AgentHere => 'c',
             Self::AgentBeside => 'a',
+            Self::Quit => 'x',
         }
     }
 
@@ -286,6 +295,13 @@ pub fn from_key(c: char, sessions: &[SessionRow]) -> Option<Choice> {
 /// takes static strings and there are thirteen possible values, so a table is
 /// both simpler and cheaper than leaking a string per frame.
 fn hint_of(u: Utility) -> &'static str {
+    // Quit shows `F10` rather than its letter. That is the key the whole
+    // program quits on, it is what someone scanning this menu for a way out
+    // will look for, and the menu answers to it while open — so the hint is
+    // not a lie, which is the one thing a hint must not be.
+    if u == Utility::Quit {
+        return "F10";
+    }
     match u.key() {
         'u' => "u",
         't' => "t",
@@ -303,6 +319,7 @@ fn hint_of(u: Utility) -> &'static str {
         'o' => "o",
         'c' => "c",
         'a' => "a",
+        'x' => "x",
         _ => "",
     }
 }
@@ -360,6 +377,7 @@ pub fn run(u: Utility, cx: &Context<'_>) -> Outcome {
         Utility::EditorHere => Outcome::Do(Deed::OpenEditorHere),
         Utility::AgentHere => Outcome::Do(Deed::StartAgentHere),
         Utility::AgentBeside => Outcome::Do(Deed::StartAgentBeside),
+        Utility::Quit => Outcome::Do(Deed::Quit),
         Utility::Base64Encode => {
             let (text, from_sel) = cx.subject();
             if text.is_empty() {
@@ -464,7 +482,15 @@ mod tests {
     #[test]
     fn every_entry_shows_its_key() {
         for u in Utility::MENU.iter().flatten() {
-            assert_eq!(hint_of(*u), u.key().to_string(), "{:?}", u);
+            let hint = hint_of(*u);
+            assert!(!hint.is_empty(), "{u:?} has no hint");
+            // Quit advertises F10 — the key the whole program quits on — and
+            // the frontend answers to it while the menu is open. Everything
+            // else shows its own letter.
+            match u {
+                Utility::Quit => assert_eq!(hint, "F10"),
+                _ => assert_eq!(hint, u.key().to_string(), "{u:?}"),
+            }
             assert!(!u.label().is_empty());
         }
     }

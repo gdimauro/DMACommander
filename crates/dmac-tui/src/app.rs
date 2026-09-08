@@ -3169,6 +3169,10 @@ impl App {
         let sessions = self.session_menu_rows();
         let items = crate::utilities::items(&sessions);
         match k.code {
+            // The menu's last row says `F10`, so F10 has to mean it here and not
+            // merely close the menu: a hint that does something different from
+            // the key it names is the one lie a menu must not tell.
+            KeyCode::F(10) => self.handle(Action::Quit),
             KeyCode::Esc => self.mode = Mode::Normal,
             KeyCode::Up => {
                 if let Some(i) = crate::ui::menu::next_selectable(&items, selected, -1) {
@@ -3262,6 +3266,7 @@ impl App {
                 crate::utilities::Deed::OpenEditorHere => self.open_editor_here(),
                 crate::utilities::Deed::StartAgentHere => self.start_agent_here(),
                 crate::utilities::Deed::StartAgentBeside => self.start_agent_beside(),
+                crate::utilities::Deed::Quit => self.handle(Action::Quit),
             }
             return;
         }
@@ -6148,6 +6153,32 @@ mod tests {
             app.ses().hosted().is_none(),
             "nothing may be running before the answer"
         );
+    }
+
+    // ---- a way out, in the menu people reach for ----
+
+    /// The F9 menu ends with Quit, advertised as F10, and both ways of taking
+    /// it have to leave — the letter, and the key the row names.
+    #[test]
+    fn the_utilities_menu_offers_a_way_out_and_it_works_both_ways() {
+        let mut app = fixture();
+        app.handle(Action::UtilitiesMenu);
+        assert!(matches!(app.mode, Mode::Utilities { .. }));
+        assert!(
+            crate::utilities::Utility::MENU.last().copied().flatten()
+                == Some(crate::utilities::Utility::Quit),
+            "Quit belongs last, where an exit is looked for"
+        );
+
+        // Its letter, from the menu.
+        app.on_key(key(KeyCode::Char('x')));
+        assert!(app.should_quit, "x did not quit");
+
+        // And F10, which is what the row says.
+        let mut app = fixture();
+        app.handle(Action::UtilitiesMenu);
+        app.on_key(key(KeyCode::F(10)));
+        assert!(app.should_quit, "F10 in the menu did not quit");
     }
 
     // ---- windows, per arrangement of monitors ----
