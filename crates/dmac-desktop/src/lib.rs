@@ -451,6 +451,18 @@ pub fn editor_placement_for(dir: &Path) -> Option<Placement> {
     placement_of(EDITOR_PROCESS, title)
 }
 
+/// The same for several folders at once: the editor's window titles are
+/// listed once, and only the folders that have a window are asked where it
+/// is. What asking about every session on the way out needs — the cost is one
+/// listing plus one read per *open window*, not one per session.
+#[cfg(target_os = "macos")]
+pub fn editor_placements_for(dirs: &[PathBuf]) -> Vec<Option<Placement>> {
+    let titles = editor_titles();
+    dirs.iter()
+        .map(|dir| window_for(&titles, dir).and_then(|title| placement_of(EDITOR_PROCESS, title)))
+        .collect()
+}
+
 /// Where the terminal this program runs in has its front window.
 ///
 /// The front window and not one matched by title: a terminal's title is
@@ -483,6 +495,11 @@ pub fn editor_frame_for(_dir: &Path) -> Option<Frame> {
 #[cfg(not(target_os = "macos"))]
 pub fn editor_placement_for(_dir: &Path) -> Option<Placement> {
     None
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn editor_placements_for(dirs: &[PathBuf]) -> Vec<Option<Placement>> {
+    dirs.iter().map(|_| None).collect()
 }
 
 #[cfg(not(target_os = "macos"))]

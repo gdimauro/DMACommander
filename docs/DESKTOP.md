@@ -35,8 +35,8 @@ space instead of being covered.
 
 ## Coming back to a different set of monitors
 
-A session remembers where its editor window was, and puts it back when you
-return to the session. The first version of that remembered one rectangle —
+A session remembers where its editor window was, and the next start puts it
+back. The first version of that remembered one rectangle —
 which turned out to be a rectangle in the coordinate space of one particular
 arrangement of monitors. `x = -3412` means "the display to the left" only while
 there is one. Come back with the laptop alone and the window is restored
@@ -85,6 +85,30 @@ panels and nothing else.
 
 Closing the editor at home forgets home's place and nothing else. The office's
 is still a fact about the office.
+
+### Written once, on the way out
+
+Where the windows are is written at exactly one moment: `F10`, with "remember
+their positions" ticked. Every session's window is asked about then — not only
+the visible session's — and what each is found to be, at that moment, under
+the arrangement of monitors of that moment, is what the next start puts back.
+The terminal itself goes under the same key. A window not open at that moment
+loses this arrangement's entry and no other.
+
+Nothing is written while the program runs: not when you enter a session, not
+when you leave one, not when a window is docked from `F9`. That used to be
+otherwise — the window was read on every entry and exit of a session, and the
+final write only re-read the session on screen — and it meant two wrong
+things at once. A window moved while you were looking at another session came
+back where it had been when its session was last left, not where you put it;
+and unticking "remember" on the way out could not take back what switching
+sessions had already written an hour earlier. What you see as you leave is
+what you get when you come back, and the tick is the whole of the decision.
+
+The window asked about is the one the session recorded, on the folder it was
+opened for — not wherever its panel has wandered since. A session with no
+record is asked about the folder its panel is on, so a window you opened by
+hand is found and written down the first time you leave with it open.
 
 Files written before any of this carried one rectangle and no screen. They are
 still read; that rectangle becomes the fallback for arrangements that have no

@@ -76,20 +76,6 @@ pub(crate) enum Update {
         generation: u64,
         files: u64,
     },
-    /// Where a session's editor window is, read off the window server away from
-    /// the render loop. `None` means it has none open any more.
-    EditorFrame {
-        session: SessionId,
-        /// The folder the window is about.
-        dir: String,
-        /// Which arrangement of monitors this was seen in — see
-        /// `dmac_desktop::arrangement_key`. Always known, even when there is
-        /// no window: a window that has been closed in *this* arrangement must
-        /// stop being restored in this arrangement, and only in this one.
-        key: String,
-        /// Where it is, or `None` if the editor has no window for that folder.
-        placed: Option<dmac_session::Placed>,
-    },
     /// A hosted shell changed what is on its screen. Carries nothing: the
     /// message exists only to break the event loop out of its wait, and the
     /// frame that follows reads the emulator directly.
@@ -377,21 +363,6 @@ pub(crate) struct HelpEntrance {
     last: std::time::Instant,
 }
 
-/// Where the editor's window for `dir` is, and which arrangement of monitors
-/// we are in — the two facts a session needs to put it back later.
-///
-/// The key is always returned, window or no window. A window that has been
-/// closed has to stop being restored *in this arrangement*, and saying "no
-/// window" without saying where is saying nothing a map can act on.
-///
-/// `None` for the window is the ordinary case and not a failure: most
-/// directories have no editor open on them.
-fn read_placement(dir: &std::path::Path) -> (String, Option<dmac_session::Placed>) {
-    let key = dmac_desktop::arrangement_key(&dmac_desktop::screens());
-    let placed = dmac_desktop::editor_placement_for(dir).map(placed_from);
-    (key, placed)
-}
-
 /// A desktop placement as the session store keeps it.
 fn placed_from(p: dmac_desktop::Placement) -> dmac_session::Placed {
     dmac_session::Placed {
@@ -486,9 +457,6 @@ pub struct App {
     /// syscall per shell; reading the process table is a fork, and this is what
     /// keeps the second from happening on a timer.
     agent_fg: Vec<(dmac_session::SessionId, i32)>,
-    /// The session that was on screen last time we looked. Kept only so that
-    /// leaving one can write down where its editor window was.
-    last_session: Option<dmac_session::SessionId>,
     /// The help arriving. `Some` only while it is flying in; the page itself
     /// takes over the moment it settles.
     pub(crate) help_entrance: Option<HelpEntrance>,
@@ -777,7 +745,6 @@ impl App {
             store,
             dirty_at: None,
             agent_fg: Vec::new(),
-            last_session: None,
             help_entrance: None,
             document: None,
             view_search: String::new(),
@@ -1122,20 +1089,6 @@ impl App {
                 }
             }
             Update::Agents(seen) => self.record_agents(&seen),
-            Update::EditorFrame {
-                session,
-                dir,
-                key,
-                placed,
-            } => {
-                if let Some(i) = self.sessions.index_of_id(session)
-                    && self.merge_placement(i, &dir, &key, placed)
-                {
-                    // At once, like the agent: it is what a restart needs, and
-                    // the debounce is exactly the window a `kill -9` falls into.
-                    self.save_now();
-                }
-            }
             Update::Rebuilt(Ok(())) => self.restart_in_place(),
             // A failed build changes nothing: the point of building first is
             // that a broken tree costs you a message, not your session.
@@ -1598,28 +1551,28 @@ impl App {
         // table for every session, not one per session — and through the same
         // path the running commander uses, so a clean exit and a crash leave
         // the same kind of record rather than two that can disagree.
-        // Where the editor window is, asked once and here: this is the last
-        // moment it can be observed, and the session that is on screen is the
-        // one whose window the user has most likely just moved. The others were
-        // read when they were last entered.
-        let here = self.sessions.current_index();
-        // Only if asked to. Unticked, the layout you are leaving with — one you
-        // may have made a mess of — does not become this arrangement's memory.
-        if self.sessions.remember_positions
-            && let Some(cwd) = self
-                .sessions
-                .get(here)
-                .map(|s| s.cwd[Self::idx(s.active)].clone())
-                .filter(dmac_vfs::VfsPath::is_local)
-        {
-            let (key, placed) = read_placement(cwd.as_path());
-            let dir = cwd.as_path().display().to_string();
-            self.merge_placement(here, &dir, &key, placed);
-            // And the terminal itself, under the same key. One window for the
-            // whole program, so it lives on the manager rather than a session.
-            if let Some(p) = dmac_desktop::terminal_placement() {
-                self.sessions.terminal.insert(key, placed_from(p));
-            }
+        // Where every window is, asked once and only here. This is the one
+        // moment that counts: what is on screen as you leave is what comes
+        // back, for this arrangement of monitors — not where a window was
+        // when its session was last entered, and not where it was before you
+        // dragged it while looking at another session. Nothing is written
+        // while the program runs, so "remember" unticked really does leave
+        // the memory alone: there is nothing earlier for it to fail to undo.
+        if self.sessions.remember_positions {
+            let asked = self.windows_to_ask_about();
+            let dirs: Vec<std::path::PathBuf> = asked
+                .iter()
+                .map(|(_, d)| std::path::PathBuf::from(d))
+                .collect();
+            let key = dmac_desktop::arrangement_key(&dmac_desktop::screens());
+            let seen = dmac_desktop::editor_placements_for(&dirs);
+            let windows = asked
+                .into_iter()
+                .zip(seen)
+                .map(|((i, dir), p)| (i, dir, p.map(placed_from)))
+                .collect();
+            let terminal = dmac_desktop::terminal_placement().map(placed_from);
+            self.record_positions_at_exit(&key, windows, terminal);
         }
         #[cfg(unix)]
         {
@@ -2466,16 +2419,16 @@ impl App {
 
     /// Bring this session's editor window forward, if it has one.
     ///
-    /// Raised, never moved: the placement is a thing you asked for once, when
-    /// you opened the directory, and a window you have since dragged somewhere
-    /// is where you wanted it. Switching session is not a request to rearrange
-    /// the screen — only to see the right project on it.
+    /// Raised, never moved, and never written down: the placement is a thing
+    /// you asked for once, when you opened the directory, and a window you
+    /// have since dragged somewhere is where you wanted it. Switching session
+    /// is not a request to rearrange the screen — only to see the right
+    /// project on it — and where the window is gets recorded on the way out,
+    /// not here.
     fn raise_editor_here(&mut self) {
         let Ok(dir) = self.editor_here_target() else {
             return;
         };
-        let id = self.sessions.current().id;
-        let tx = self.tx.clone();
         // Raise only. Reopening a window that is not there happens in one
         // place — the dialog at startup, where every window the last run had
         // is offered and any can be left unticked. Reopening here as well
@@ -2486,19 +2439,61 @@ impl App {
         // switches sessions too, and it has no runtime to spawn onto.
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn_blocking(move || {
-                // Bring it forward and leave it exactly where the user put it,
-                // and take the chance to write down where that is.
-                if matches!(dmac_desktop::raise_editor_for(&dir), Ok(true)) {
-                    let (key, placed) = read_placement(&dir);
-                    let _ = tx.send(Update::EditorFrame {
-                        session: id,
-                        dir: dir.display().to_string(),
-                        key,
-                        placed,
-                    });
-                }
+                let _ = dmac_desktop::raise_editor_for(&dir);
             });
         }
+    }
+
+    /// Which folder each session's editor window is about, for asking where
+    /// it is on the way out: the folder the window was recorded on, or — for
+    /// a session that has none recorded, whose window was opened by hand —
+    /// the folder its active panel is on. Sessions on a remote path have no
+    /// window to ask about.
+    fn windows_to_ask_about(&self) -> Vec<(usize, String)> {
+        self.sessions
+            .all()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| {
+                if let Some(w) = &s.editor {
+                    return Some((i, w.dir.clone()));
+                }
+                let cwd = &s.cwd[Self::idx(s.active)];
+                cwd.is_local()
+                    .then(|| (i, cwd.as_path().display().to_string()))
+            })
+            .collect()
+    }
+
+    /// Write down where the windows are, as they are at this moment, under
+    /// this arrangement of monitors. Called once, on the way out, and only
+    /// when asked: see `save_on_exit`.
+    ///
+    /// Every session's window, not only the visible session's: the one you
+    /// moved an hour ago while looking at something else is exactly the one
+    /// a "current session only" read would miss. A window not found is gone
+    /// from this arrangement's memory and no other, the way `merge_placement`
+    /// has always done it. The terminal is one window for the whole program
+    /// and lives on the manager. Returns whether anything changed.
+    fn record_positions_at_exit(
+        &mut self,
+        key: &str,
+        windows: Vec<(usize, String, Option<dmac_session::Placed>)>,
+        terminal: Option<dmac_session::Placed>,
+    ) -> bool {
+        let mut changed = false;
+        for (i, dir, placed) in windows {
+            if i < self.sessions.len() {
+                changed |= self.merge_placement(i, &dir, key, placed);
+            }
+        }
+        if let Some(t) = terminal
+            && self.sessions.terminal.get(key) != Some(&t)
+        {
+            self.sessions.terminal.insert(key.to_string(), t);
+            changed = true;
+        }
+        changed
     }
 
     /// Fold one observation into a session's memory of its editor window.
@@ -2566,37 +2561,6 @@ impl App {
                     let frame = dmac_desktop::fit(&placement_from(p), &screens);
                     let _ = dmac_desktop::place_terminal(frame);
                 }
-            });
-        }
-    }
-
-    /// Write down where this session's editor window is, if it has one.
-    ///
-    /// Off the render loop, because asking the window server costs a fork and
-    /// an Apple Event round trip. Asked when leaving a session and again on the
-    /// way out, which between them covers every way a window's position stops
-    /// being observable — the alternative, polling it, spends the idle budget
-    /// watching a rectangle that changes twice a day.
-    pub(crate) fn capture_editor_frame(&mut self, index: usize) {
-        let Some(session) = self.sessions.get(index) else {
-            return;
-        };
-        let id = session.id;
-        let cwd = session.cwd[Self::idx(session.active)].clone();
-        if !cwd.is_local() {
-            return;
-        }
-        let dir = cwd.as_path().to_path_buf();
-        let tx = self.tx.clone();
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn_blocking(move || {
-                let (key, placed) = read_placement(&dir);
-                let _ = tx.send(Update::EditorFrame {
-                    session: id,
-                    dir: dir.display().to_string(),
-                    key,
-                    placed,
-                });
             });
         }
     }
@@ -3111,18 +3075,10 @@ impl App {
     /// point of holding them all live. Only the transient, per-view state that
     /// belonged to the session we just left is cleared.
     pub(crate) fn after_session_switch(&mut self) {
-        // Where the session we just left had its editor window. Asked here
-        // rather than at the moment of switching because the switch happens in
-        // half a dozen places — a key, a click, the rail, an agent's tool call —
-        // and a capture that has to be remembered at each of them is a capture
-        // that will be forgotten at one.
-        if let Some(left) = self.last_session.take()
-            && let Some(i) = self.sessions.index_of_id(left)
-            && i != self.sessions.current_index()
-        {
-            self.capture_editor_frame(i);
-        }
-        self.last_session = Some(self.sessions.current().id);
+        // Nothing about window positions happens here. Where a window is gets
+        // written once, on the way out — see `save_on_exit` — so switching
+        // sessions all day changes nothing that F10's "remember" would then be
+        // unable to take back.
         self.raise_editor_here();
         self.ensure_loaded(self.sessions.current_index());
         self.touch_sessions();
@@ -10466,5 +10422,114 @@ run = "echo pwned"
             .expect("root");
         app.stop_tour("test");
         back_home(&app, &root, "The panels");
+    }
+
+    // ---- Where windows are is written on the way out, and only then --------
+
+    /// What is on screen as you leave is what comes back: every session's
+    /// window is asked about, the one that moved is recorded where it is now,
+    /// the one that is closed loses this arrangement's entry and no other,
+    /// and the terminal goes under the same key.
+    #[tokio::test]
+    async fn leaving_records_every_window_where_it_is_at_that_moment() {
+        let mut app = fixture();
+        app.handle(Action::NewSession);
+        app.handle(Action::NewSession);
+        app.merge_placement(0, "/prj/one", "office", Some(placed(10, 10)));
+        app.merge_placement(1, "/prj/two", "office", Some(placed(20, 20)));
+        app.merge_placement(1, "/prj/two", "home", Some(placed(5, 5)));
+        app.sessions.switch_to(2);
+
+        // On the way out: one moved, one closed, one never had a window; the
+        // terminal is where it is.
+        let changed = app.record_positions_at_exit(
+            "office",
+            vec![
+                (0, "/prj/one".into(), Some(placed(300, 40))),
+                (1, "/prj/two".into(), None),
+                (2, "/prj/three".into(), None),
+            ],
+            Some(placed(0, 0)),
+        );
+        assert!(changed);
+        let one = app.sessions.all()[0].editor.as_ref().expect("one's window");
+        assert_eq!(
+            one.placements.get("office"),
+            Some(&placed(300, 40)),
+            "not where it was left"
+        );
+        let two = app.sessions.all()[1].editor.as_ref().expect("two's window");
+        assert_eq!(
+            two.placements.get("office"),
+            None,
+            "a closed window is still remembered here"
+        );
+        assert_eq!(
+            two.placements.get("home"),
+            Some(&placed(5, 5)),
+            "home's place was forgotten at the office"
+        );
+        assert!(
+            app.sessions.all()[2].editor.is_none(),
+            "a window that never was got a record"
+        );
+        assert_eq!(app.sessions.terminal.get("office"), Some(&placed(0, 0)));
+
+        // Asked again with nothing moved: nothing to write.
+        assert!(!app.record_positions_at_exit(
+            "office",
+            vec![(0, "/prj/one".into(), Some(placed(300, 40)))],
+            Some(placed(0, 0)),
+        ));
+    }
+
+    /// Nothing is written while the program runs. Entering and leaving
+    /// sessions all day leaves every window's record exactly as it was, so
+    /// unticking "remember" at F10 has nothing earlier it cannot undo.
+    #[tokio::test]
+    async fn switching_sessions_writes_no_position() {
+        let mut app = fixture();
+        app.handle(Action::NewSession);
+        app.merge_placement(0, "/prj/one", "office", Some(placed(10, 10)));
+        app.merge_placement(1, "/prj/two", "office", Some(placed(20, 20)));
+        let before: Vec<_> = app
+            .sessions
+            .all()
+            .iter()
+            .map(|s| s.editor.clone())
+            .collect();
+        let terminal = app.sessions.terminal.clone();
+
+        for _ in 0..3 {
+            app.sessions.switch_to(0);
+            app.after_session_switch();
+            app.sessions.switch_to(1);
+            app.after_session_switch();
+        }
+        let after: Vec<_> = app
+            .sessions
+            .all()
+            .iter()
+            .map(|s| s.editor.clone())
+            .collect();
+        assert_eq!(before, after, "switching sessions wrote a position");
+        assert_eq!(terminal, app.sessions.terminal);
+    }
+
+    /// The window asked about is the one that was recorded, not wherever the
+    /// panel has wandered since — and a session with no record is asked about
+    /// the folder it is on, so a window opened by hand is found too.
+    #[tokio::test]
+    async fn the_window_asked_about_on_the_way_out_is_the_recorded_one() {
+        let mut app = fixture();
+        app.handle(Action::NewSession);
+        app.merge_placement(0, "/prj/one", "office", Some(placed(10, 10)));
+        app.sessions.at_mut(0).cwd[0] = VfsPath::local("/prj/one/src/deep");
+        app.sessions.at_mut(1).cwd[0] = VfsPath::local("/prj/by-hand");
+        let asked = app.windows_to_ask_about();
+        assert_eq!(
+            asked,
+            vec![(0, "/prj/one".to_string()), (1, "/prj/by-hand".to_string())]
+        );
     }
 }

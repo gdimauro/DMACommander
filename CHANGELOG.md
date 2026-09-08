@@ -166,6 +166,15 @@ Notable changes, newest first. Versions follow the policy in
   Ctrl-H is now the history.
 
 ### Changed
+- **Window positions are written once, on the way out.** `F10` with
+  "remember their positions" ticked asks every session's window where it is —
+  not only the visible one's — and that, for this arrangement of monitors, is
+  what the next start puts back. Nothing is written while the program runs any
+  more: entering or leaving a session used to read the window and write it at
+  once, so a window moved while you looked at another session came back where
+  its session was last left, and unticking "remember" could not undo a write
+  that had already happened. See docs/DESKTOP.md, "Written once, on the way
+  out".
 - **`Shift-Tab` belongs to the hosted program.** In the panels it still opens
   the rail; inside a shell it now goes to the child, where it is how `claude`
   cycles its permission modes and how a dozen other programs move backwards
@@ -218,6 +227,10 @@ Notable changes, newest first. Versions follow the policy in
   conversation and command line, and waits. Saying no loses nothing.
 
 ### Fixed
+- **The spectrum screensaver no longer crashes on a 16 kHz microphone.** A
+  headset that stops at 8 kHz has bands above what it can hear; those used to
+  clamp with a floor above their ceiling. They are silent now, and a band
+  straddling the limit is cut at it.
 - **A second project was opened and then not placed.** Since the editor stopped
   reusing its window, asking for another one produces another window — and the
   placement was not waiting for it. It took the editor's front window the
