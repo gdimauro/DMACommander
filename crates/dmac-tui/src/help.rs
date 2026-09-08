@@ -240,12 +240,18 @@ pub const SECTIONS: &[Section] = &[
         rows: &[
             Row::panel(
                 "Ctrl-T / Shift-Tab",
-                "the session rail: enter switch, n new, r rename, d close, a beside",
+                "the session rail \u{2014} just start typing to find one; Enter enters it",
                 &[ToggleRail],
             ),
             Row::note(
-                "Ctrl-F, in the rail",
-                "search the sessions \u{2014} space folds a group, Esc clears then closes",
+                "in the rail",
+                "F2 rename \u{b7} Del close \u{b7} Ctrl-N new \u{b7} Ctrl-A a session beside \
+                 this one \u{b7} Space folds a group \u{b7} Esc clears the search, then closes",
+            ),
+            Row::note(
+                "at startup",
+                "what the last run left open \u{2014} agents and editor windows \u{2014} is \
+                 listed, every row ticked; untick what you do not want and press y",
             ),
             Row::panel("Ctrl-N", "a new session on this directory", &[NewSession]),
             Row::panel("Ctrl-W", "close this session", &[CloseSession]),

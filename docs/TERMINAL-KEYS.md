@@ -160,21 +160,29 @@ it is open.
 
 ```
 Ctrl-T  or  Shift-Tab    open the rail (it takes the keyboard)
-  Ctrl-F                 search it; type a name, Esc clears before it closes
-  Space                  fold a group away, or open it
-  a                      a session beside this one, with an agent that
+  type                   search it — no key to press first; Enter enters
+  Esc                    clears the search; a second Esc closes the rail
+  F2                     rename the highlighted session
+  Del  or  F8            close it (and the group hanging off it)
+  Ctrl-N                 a new session on this directory
+  Ctrl-A                 a session beside this one, with an agent that
                          starts knowing what this one knows
-  Enter / n / r / d      switch · new · rename · close
-  Left / Right, - / +    make it narrower or wider
+  Space                  fold a group away, or open it
+  Left / Right           make it narrower or wider
 drag its right-hand edge  the same, with the pointer, open or not
 ```
 
-The search narrows and never reorders: the digit beside each session is its
-`Alt`+digit shortcut, and sorting by how well a row matched would make every one
-of those digits point somewhere else while you are reading them. The letters it
-matched are picked out inside the name, because saying only *that* a row matched
-hides *where* — which is the half you want when two sessions are called almost
-the same thing.
+Typing searches. That is why the rail's commands are on keys that cannot be
+letters: a search for "read" must not rename something on the way. A search
+left alone for ten seconds is cleared — the person who typed `gre` and looked
+away did not mean the next `p` as a fourth letter.
+
+The cursor goes to the *closest* match, the way a quick-open does, while the
+list keeps its order: the digit beside each session is its `Alt`+digit shortcut,
+and sorting by score would make every one of those digits point somewhere else
+while you are reading them. The letters it matched are picked out inside the
+name, because saying only *that* a row matched hides *where* — which is the half
+you want when two sessions are called almost the same thing.
 
 `Shift-Tab` opens it **from the panels only**. Inside a shell that key belongs to
 whatever is hosted — it is how `claude` cycles its permission modes — so it goes

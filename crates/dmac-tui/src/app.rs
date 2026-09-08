@@ -319,6 +319,13 @@ struct Drag {
     toggling: bool,
 }
 
+/// How long a rail search survives being left alone.
+///
+/// Ten seconds is what was asked for, and it sits where an incremental search
+/// should: long enough to read the list you narrowed, short enough that the
+/// next thing you type after looking away starts fresh.
+pub(crate) const RAIL_SEARCH_IDLE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// One row of the F2 menu, ready to draw.
 ///
 /// Built when the menu opens and kept until it closes, so the drawing, the
@@ -498,6 +505,11 @@ pub struct App {
     /// you type — the rail's other keys are single letters, and `n` has to mean
     /// "new session" until you have asked for a search.
     pub(crate) rail_filter: Option<String>,
+    /// When the search was last typed into. A search left alone for
+    /// [`RAIL_SEARCH_IDLE`] is cleared: the person who typed `gre` ten
+    /// seconds ago and then looked away did not mean the next `p` as a
+    /// fourth letter, they meant it as the first of something else.
+    pub(crate) rail_filter_at: Option<std::time::Instant>,
     /// The file operation running, if one is. One at a time on purpose: two
     /// jobs writing into the same directory is a conflict neither of them can
     /// see, and a queue is a feature to add once anyone wants it.
@@ -751,6 +763,7 @@ impl App {
             trust: dmac_config::menu::TrustStore::load(),
             menu_rows: Vec::new(),
             rail_filter: None,
+            rail_filter_at: None,
             job: None,
             job_progress: None,
             conflict: None,
@@ -1629,6 +1642,7 @@ impl App {
         // still holding last week's word, over a list that is missing most of
         // its sessions, reads as a rail that has lost them.
         self.rail_filter = None;
+        self.rail_filter_at = None;
         self.rail_open = false;
         if matches!(self.mode, Mode::Rail { .. }) {
             self.mode = Mode::Normal;
@@ -1714,33 +1728,90 @@ impl App {
     /// close to use.
     fn rail_search_key(&mut self, k: KeyEvent, selected: usize) -> Option<usize> {
         let typed = match k.code {
-            KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => Some(c),
+            // Not Space, which folds a group, and not anything with Ctrl or
+            // Alt on it, which is a command.
+            KeyCode::Char(c)
+                if c != ' '
+                    && !k
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                Some(c)
+            }
             _ => None,
         };
-        let filter = self.rail_filter.as_mut()?;
         match (typed, k.code) {
-            (Some(c), _) => filter.push(c),
+            (Some(c), _) => self.rail_filter.get_or_insert_with(String::new).push(c),
             (None, KeyCode::Backspace) => {
-                filter.pop();
+                self.rail_filter.as_mut()?.pop();
             }
             _ => return None,
         }
-        // Onto the first row that still matches. A cursor left on a row the
-        // search has just hidden is a cursor pointing at nothing, and `Enter`
-        // would switch to whatever slid into its place.
-        let rows = self.rail_rows();
-        Some(match rows.contains(&selected) {
-            true => selected,
-            false => rows.first().copied().unwrap_or(selected),
-        })
+        self.rail_filter_at = Some(std::time::Instant::now());
+        // Onto the closest match, the way a quick-open does — not the first
+        // row that happens to match. The list keeps its order, because the
+        // digit beside each session is a shortcut; the cursor is what moves.
+        Some(self.rail_best().unwrap_or(selected))
+    }
+
+    /// The row the search matches best, in tree order among equals.
+    pub(crate) fn rail_best(&self) -> Option<usize> {
+        let needle = self.rail_filter.as_deref().filter(|n| !n.is_empty())?;
+        self.rail_rows()
+            .into_iter()
+            .filter_map(|i| {
+                let s = self.sessions.get(i)?;
+                let best = [
+                    dmac_core::fuzzy::score(needle, &s.name),
+                    dmac_core::fuzzy::score(needle, &s.subtitle()),
+                ]
+                .into_iter()
+                .flatten()
+                .map(|m| m.score)
+                .max()?;
+                Some((i, best))
+            })
+            // The scorer counts matched letters and where they sit, and has no
+            // opinion about what is left over — so `green` and `greenhouse`
+            // score the same against "green". The shorter name is the closer
+            // match; among equals, the earlier row. `max_by_key` keeps the
+            // *last* maximum, hence the reverse.
+            .rev()
+            .max_by_key(|(i, score)| {
+                let len = self
+                    .sessions
+                    .get(*i)
+                    .map_or(usize::MAX, |s| s.name.chars().count());
+                (*score, std::cmp::Reverse(len))
+            })
+            .map(|(i, _)| i)
+    }
+
+    /// Clear a search that has been left alone too long. Called before every
+    /// frame; free when nothing is being searched.
+    pub(crate) fn expire_rail_search(&mut self) {
+        if let Some(at) = self.rail_filter_at
+            && at.elapsed() >= RAIL_SEARCH_IDLE
+        {
+            self.rail_filter = None;
+            self.rail_filter_at = None;
+        }
+    }
+
+    /// When the search will be cleared if nothing is typed, so the loop wakes
+    /// to redraw the full list rather than showing a stale narrowing until the
+    /// next keypress.
+    fn rail_search_deadline(&self) -> Option<std::time::Instant> {
+        self.rail_filter_at.map(|at| at + RAIL_SEARCH_IDLE)
     }
 
     fn rail_key(&mut self, k: KeyEvent, selected: usize) {
-        // While a search is open the rail's single-letter commands stand aside:
-        // you are typing a name, and `n` has to be an `n`.
-        if self.rail_filter.is_some()
-            && let Some(next) = self.rail_search_key(k, selected)
-        {
+        // Typing searches. No key to press first: the rail is a list of
+        // names, and the obvious thing to do with a list of names is start
+        // typing one — which is why its commands live on keys that cannot be
+        // letters (F2, Delete, Ctrl-N, Ctrl-A) rather than on `r`, `d`, `n`
+        // and `a`, where a search for "read" would have renamed something.
+        if let Some(next) = self.rail_search_key(k, selected) {
             self.mode = Mode::Rail { selected: next };
             return;
         }
@@ -1749,12 +1820,15 @@ impl App {
             // one open is right: the first undoes the narrowing you did, and
             // losing both to one keypress means retyping it to see the list
             // again.
-            KeyCode::Esc if self.rail_filter.take().is_some() => {}
+            KeyCode::Esc if self.rail_filter.take().is_some() => {
+                self.rail_filter_at = None;
+            }
             KeyCode::Esc => self.close_rail(),
-            // Ctrl-F, which everywhere else in this program still says it is
-            // not implemented. Here it is.
+            // Ctrl-F still opens an empty search box, for the hand that
+            // reaches for it; typing does the same without it.
             KeyCode::Char('f') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.rail_filter = Some(String::new());
+                self.rail_filter_at = Some(std::time::Instant::now());
             }
             // Through the rows that are drawn, not through the sessions: the
             // children of a folded group are not on screen, and a cursor that
@@ -1776,11 +1850,14 @@ impl App {
                 self.close_rail();
             }
             // Nothing to the left or right of a one-column list, so the
-            // horizontal arrows resize it. `-` and `+` do the same, for
-            // terminals that eat modified arrows.
-            KeyCode::Left | KeyCode::Char('-') => self.resize_rail(-1),
-            KeyCode::Right | KeyCode::Char('+' | '=') => self.resize_rail(1),
-            KeyCode::Char('n') => self.open_prompt(PromptIntent::NewSession, String::new()),
+            // horizontal arrows resize it. `-` and `+` used to as well, and no
+            // longer do: typing searches now, and a session called
+            // `time-pulse` has to be findable by its own name.
+            KeyCode::Left => self.resize_rail(-1),
+            KeyCode::Right => self.resize_rail(1),
+            KeyCode::Char('n') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.open_prompt(PromptIntent::NewSession, String::new())
+            }
             // Fold the group under this row away, or open it. Space because it
             // is what folds a row in every tree anyone has used, and because
             // the letters here are spoken for.
@@ -1795,14 +1872,16 @@ impl App {
             // A second agent on the same work, in its own session, drawn under
             // the one it came from. The same thing F9 offers, on the key that
             // is already about managing sessions.
-            KeyCode::Char('a') => {
+            KeyCode::Char('a') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.sessions.switch_to(selected) {
                     self.after_session_switch();
                 }
                 self.close_rail();
                 self.start_agent_beside();
             }
-            KeyCode::Char('r') => {
+            // F2, which is what renames things in every file manager anyone
+            // has used.
+            KeyCode::F(2) => {
                 let current = self
                     .sessions
                     .get(selected)
@@ -1810,7 +1889,7 @@ impl App {
                     .unwrap_or_default();
                 self.open_prompt(PromptIntent::RenameSession(selected), current);
             }
-            KeyCode::Char('d') | KeyCode::Delete => {
+            KeyCode::F(8) | KeyCode::Delete => {
                 // Asked before, not reported after: closing a group takes what
                 // hangs off it, and "closed 4 sessions" is a thing that has
                 // already happened to you.
@@ -2077,6 +2156,7 @@ impl App {
     /// It is also the throttle: while the flag stays set the reader thread stays
     /// quiet, because a repaint has been asked for and not yet given.
     pub(crate) fn before_frame(&mut self) {
+        self.expire_rail_search();
         if self.ses().view != View::Shell || self.last_shell_frame.elapsed() < SHELL_FRAME_FLOOR {
             return;
         }
@@ -5760,6 +5840,7 @@ pub async fn run(mut start: Startup) -> anyhow::Result<()> {
             app.cursor_deadline(),
             app.shell_deadline(),
             app.help_deadline(),
+            app.rail_search_deadline(),
             save_due,
         ]
         .into_iter()
@@ -6848,26 +6929,14 @@ mod tests {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
-    /// Ctrl-F narrows the rail, and until it is pressed the rail's own
-    /// single-letter keys keep their meaning — `n` has to be "new session"
-    /// until you have asked to type a name.
+    /// Typing searches, with nothing to press first: the rail is a list of
+    /// names and the obvious thing to do with one is start typing. Which is
+    /// why its commands are on keys that cannot be letters.
     #[test]
-    fn ctrl_f_opens_a_search_and_letters_only_type_once_it_is_open() {
+    fn typing_in_the_rail_searches_and_the_commands_are_on_other_keys() {
         let mut app = rail_with(&["work", "notes", "nightly"]);
-        // Before: `n` is the new-session prompt, not an `n`.
         app.on_key(key(KeyCode::Char('n')));
-        assert!(
-            matches!(app.mode, Mode::Prompt { .. }),
-            "the rail's own key stopped working: {:?}",
-            app.mode
-        );
-        app.mode = Mode::Rail { selected: 0 };
-
-        app.on_key(ctrl('f'));
-        assert_eq!(app.rail_filter.as_deref(), Some(""), "no search box");
-        // Now the same key is a letter.
-        app.on_key(key(KeyCode::Char('n')));
-        assert_eq!(app.rail_filter.as_deref(), Some("n"));
+        assert_eq!(app.rail_filter.as_deref(), Some("n"), "n did not search");
         assert!(matches!(app.mode, Mode::Rail { .. }), "{:?}", app.mode);
 
         let rows = app.rail_rows();
@@ -6877,9 +6946,81 @@ mod tests {
             .collect();
         assert_eq!(found, ["notes", "nightly"], "the search found {found:?}");
 
-        // Backspace widens it again.
+        // Backspace widens it again; Ctrl-F still opens an empty box.
         app.on_key(key(KeyCode::Backspace));
         assert_eq!(app.rail_rows().len(), 3);
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(ctrl('f'));
+        assert_eq!(app.rail_filter.as_deref(), Some(""));
+
+        // And the commands answer to their new keys, not to letters.
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(ctrl('n'));
+        assert!(matches!(
+            app.mode,
+            Mode::Prompt {
+                intent: PromptIntent::NewSession
+            }
+        ));
+        app.mode = Mode::Rail { selected: 1 };
+        app.on_key(key(KeyCode::F(2)));
+        assert!(matches!(
+            app.mode,
+            Mode::Prompt {
+                intent: PromptIntent::RenameSession(1)
+            }
+        ));
+    }
+
+    /// The cursor goes to the *closest* match, the way a quick-open does,
+    /// while the list keeps its order so the digits stay true. Enter then
+    /// enters what the search found.
+    #[test]
+    fn the_search_puts_the_cursor_on_the_best_match_and_enter_goes_there() {
+        let mut app = rail_with(&["work", "greenhouse", "green"]);
+        for c in "green".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        // Both match; the exact one scores higher and is the later row.
+        assert!(
+            matches!(app.mode, Mode::Rail { selected: 2 }),
+            "{:?}",
+            app.mode
+        );
+        let rows = app.rail_rows();
+        assert!(rows.windows(2).all(|w| w[0] < w[1]), "reordered: {rows:?}");
+
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.sessions.current_index(), 2);
+        assert_eq!(app.mode, Mode::Normal, "Enter enters and closes the rail");
+        assert!(app.rail_filter.is_none(), "the search outlived the rail");
+    }
+
+    /// A search left alone for ten seconds is over. The person who typed
+    /// `gre` and looked away did not mean the next `p` as a fourth letter.
+    #[test]
+    fn a_search_left_alone_is_cleared_and_the_rail_stays_open() {
+        let mut app = rail_with(&["work", "green"]);
+        app.on_key(key(KeyCode::Char('g')));
+        assert_eq!(app.rail_rows().len(), 1);
+        assert!(
+            app.rail_search_deadline().is_some(),
+            "nothing would wake the loop to clear it"
+        );
+
+        // Not yet.
+        app.expire_rail_search();
+        assert!(app.rail_filter.is_some(), "cleared too early");
+
+        // Ten seconds later.
+        app.rail_filter_at = std::time::Instant::now().checked_sub(RAIL_SEARCH_IDLE);
+        app.expire_rail_search();
+        assert!(
+            app.rail_filter.is_none(),
+            "the search survived being left alone"
+        );
+        assert!(matches!(app.mode, Mode::Rail { .. }), "the rail closed too");
+        assert_eq!(app.rail_rows().len(), 2, "the list did not come back");
     }
 
     /// The number beside each session is its `Alt`+digit shortcut. Sorting the
@@ -7055,7 +7196,7 @@ mod tests {
         assert_eq!(app.sessions.len(), 4);
 
         app.mode = Mode::Rail { selected: 0 };
-        app.on_key(key(KeyCode::Char('d')));
+        app.on_key(key(KeyCode::Delete));
         assert_eq!(app.sessions.len(), 1, "the children stayed behind");
         assert!(app.status.contains('3'), "how many went: {}", app.status);
     }
@@ -7960,7 +8101,7 @@ run = "echo pwned"
         app.close_rail();
         app.mode = Mode::Rail { selected: 0 };
         for _ in 0..5 {
-            app.on_key(key(KeyCode::Char('+')));
+            app.on_key(key(KeyCode::Right));
         }
         assert_eq!(app.sessions.rail.collapsed, start.collapsed + 5);
         assert_eq!(app.sessions.rail.expanded, start.expanded + 4);
