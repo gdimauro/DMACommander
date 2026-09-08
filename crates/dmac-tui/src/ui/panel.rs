@@ -18,6 +18,26 @@ const SIZE_W: usize = 8;
 /// dated row, which is subtle enough to ship by accident — the test below pins it.
 const DATE_W: usize = 14;
 
+/// The bottom-border text: how many entries, and — when any are marked — how
+/// many, with how many files sit inside the marked directories.
+///
+/// The second number arrives from a task. Until it does the footer says `…`
+/// rather than `0`: a zero there would be read as "the folders are empty",
+/// which is the one thing it is not allowed to claim before it knows.
+fn footer(panel: &Panel) -> String {
+    let marked = panel.marked();
+    if marked == 0 {
+        return format!(" {} items ", panel.len());
+    }
+    let inside = match (panel.marked_dirs().is_empty(), panel.marked_files) {
+        (true, _) => String::new(),
+        (false, None) => " (\u{2026})".to_string(),
+        (false, Some(n)) if n >= dmac_core::panel::MARKED_FILES_CAP => format!(" ({n}+ files)"),
+        (false, Some(n)) => format!(" ({n} files)"),
+    };
+    format!(" {} items \u{b7} {marked} selected{inside} ", panel.len())
+}
+
 pub fn draw(
     frame: &mut Frame,
     area: Rect,
@@ -50,10 +70,7 @@ pub fn draw(
         ))
         .style(theme.panel());
     let block = if bordered {
-        block.title_bottom(Span::styled(
-            format!(" {} items ", panel.len()),
-            theme.border(active),
-        ))
+        block.title_bottom(Span::styled(footer(panel), theme.border(active)))
     } else {
         block
     };

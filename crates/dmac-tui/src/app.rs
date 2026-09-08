@@ -67,6 +67,15 @@ pub(crate) enum Update {
     /// Something happened in a running file operation. Forwarded from the
     /// engine's own channel so the loop can wait on one thing rather than two.
     Job(Box<dmac_core::JobEvent>),
+    /// How many files sit inside a panel's marked directories, counted on a
+    /// task. Carries the generation of the marks it counted, so a count for a
+    /// selection the user has since changed is dropped rather than shown.
+    MarkedFiles {
+        session: SessionId,
+        panel: PanelId,
+        generation: u64,
+        files: u64,
+    },
     /// Where a session's editor window is, read off the window server away from
     /// the render loop. `None` means it has none open any more.
     EditorFrame {
@@ -1080,6 +1089,19 @@ impl App {
             } => self.apply_completion(session, generation, start, items),
             Update::Editor(Ok(message) | Err(message)) => self.status = message,
             Update::Job(event) => self.job_event(*event),
+            Update::MarkedFiles {
+                session,
+                panel,
+                generation,
+                files,
+            } => {
+                if let Some(i) = self.sessions.index_of_id(session) {
+                    let p = &mut self.sessions.at_mut(i).panels[Self::idx(panel)];
+                    if p.marks_generation() == generation {
+                        p.marked_files = Some(files);
+                    }
+                }
+            }
             Update::Agents(seen) => self.record_agents(&seen),
             Update::EditorFrame {
                 session,
@@ -1219,6 +1241,7 @@ impl App {
                     // costs the next F8 acting on files you forgot were ticked.
                     () if marked => {
                         self.ses_mut().active_panel_mut().clear_selection();
+                        self.after_marks_changed();
                         self.status = "selection cleared".into();
                     }
                     () if self.ses().focus == Focus::CommandLine => {
@@ -1319,13 +1342,23 @@ impl App {
             ClipboardPaste => self.paste_into_shell(),
             Refresh => self.reload(self.ses().active),
 
-            ToggleSelection => self.active_panel_mut().toggle_selection(),
-            InvertSelection => self.active_panel_mut().invert_selection(),
-            ClearSelection => self.active_panel_mut().clear_selection(),
+            ToggleSelection => {
+                self.active_panel_mut().toggle_selection();
+                self.after_marks_changed();
+            }
+            InvertSelection => {
+                self.active_panel_mut().invert_selection();
+                self.after_marks_changed();
+            }
+            ClearSelection => {
+                self.active_panel_mut().clear_selection();
+                self.after_marks_changed();
+            }
             SelectAll => {
                 let p = self.active_panel_mut();
                 p.clear_selection();
                 p.invert_selection();
+                self.after_marks_changed();
             }
 
             SortBy(key) => {
@@ -3013,6 +3046,41 @@ impl App {
         f(self.ses_mut().active_panel_mut());
         let n = self.ses().active_panel().operands().len();
         self.status = format!("{n} selected");
+        self.after_marks_changed();
+    }
+
+    /// The marks on the active panel changed: forget what was counted for the
+    /// old ones, and count the new ones — on a task, because a marked directory
+    /// can hold a million files and the render loop has sixteen milliseconds.
+    ///
+    /// The count carries the panel's marks generation. Hold Shift-Down across
+    /// twenty rows and twenty walks start; nineteen come back for marks that no
+    /// longer exist, and the generation is what tells them apart from the one
+    /// that counts.
+    fn after_marks_changed(&mut self) {
+        let session = self.sessions.current().id;
+        let panel_id = self.ses().active;
+        let cwd = self.ses().cwd[Self::idx(panel_id)].clone();
+        let p = self.ses_mut().active_panel_mut();
+        let generation = p.bump_marks();
+        let dirs = p.marked_dirs();
+        if dirs.is_empty() || !cwd.is_local() {
+            return;
+        }
+        let base = cwd.as_path().to_path_buf();
+        let paths: Vec<std::path::PathBuf> = dirs.iter().map(|d| base.join(d)).collect();
+        let tx = self.tx.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn_blocking(move || {
+                let files = dmac_core::panel::count_files_under(&paths);
+                let _ = tx.send(Update::MarkedFiles {
+                    session,
+                    panel: panel_id,
+                    generation,
+                    files,
+                });
+            });
+        }
     }
 
     /// Settle the UI after the visible session changes.
@@ -6519,6 +6587,135 @@ mod tests {
             matches!(app.mode, Mode::ConfirmQuit { .. }),
             "F10 in the menu did not ask"
         );
+    }
+
+    // ---- what the footer says about the marks ----
+
+    /// A count that comes back for marks the user has since changed is
+    /// dropped, not painted over the new selection. Hold Shift-Down across
+    /// twenty rows and twenty walks start; only the last one counts.
+    #[test]
+    fn a_stale_count_is_dropped_and_a_current_one_is_shown() {
+        let mut app = fixture();
+        let session = app.sessions.current().id;
+        app.ses_mut().panels[0].move_to(1);
+        app.on_key(key(KeyCode::Char(' ')));
+        let current = app.ses().panels[0].marks_generation();
+        assert!(current > 0, "marking did not move the generation");
+
+        app.apply(Update::MarkedFiles {
+            session,
+            panel: PanelId::Left,
+            generation: current - 1,
+            files: 999,
+        });
+        assert_eq!(
+            app.ses().panels[0].marked_files,
+            None,
+            "a stale count was shown"
+        );
+
+        app.apply(Update::MarkedFiles {
+            session,
+            panel: PanelId::Left,
+            generation: current,
+            files: 12,
+        });
+        assert_eq!(app.ses().panels[0].marked_files, Some(12));
+
+        // Changing the marks again forgets it.
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.ses().panels[0].marked_files, None);
+    }
+
+    /// The footer names the marks, and says `…` rather than `0` for a count
+    /// that has not arrived — zero would claim the folders are empty.
+    #[test]
+    fn the_footer_counts_the_marks_and_never_claims_zero_before_it_knows() {
+        let mut app = fixture();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let footer = |app: &mut App, term: &mut Terminal<TestBackend>| -> String {
+            term.draw(|f| crate::ui::draw(f, app)).unwrap();
+            let buf = term.backend().buffer();
+            let area = app.layout.panels[0];
+            let row = area.y + area.height; // the bottom border
+            (0..80)
+                .map(|x| buf[(x, row)].symbol().to_string())
+                .collect()
+        };
+        assert!(footer(&mut app, &mut term).contains("items"));
+        assert!(!footer(&mut app, &mut term).contains("selected"));
+
+        // Mark the directory `src` (row 1 of the fixture).
+        app.ses_mut().panels[0].move_to(1);
+        app.on_key(key(KeyCode::Char(' ')));
+        let f = footer(&mut app, &mut term);
+        assert!(f.contains("1 selected"), "{f:?}");
+        assert!(
+            f.contains('\u{2026}'),
+            "no count yet has to read as \u{2026}: {f:?}"
+        );
+        assert!(
+            !f.contains("(0"),
+            "claimed the folder is empty before counting: {f:?}"
+        );
+
+        let session = app.sessions.current().id;
+        let g = app.ses().panels[0].marks_generation();
+        app.apply(Update::MarkedFiles {
+            session,
+            panel: PanelId::Left,
+            generation: g,
+            files: 340,
+        });
+        let f = footer(&mut app, &mut term);
+        assert!(f.contains("(340 files)"), "{f:?}");
+    }
+
+    // ---- what the pointer is over is lit ----
+
+    /// The hovered command on the shell's border, the hovered F-key, and the
+    /// hovered help row are drawn lit — with the same arithmetic that decides
+    /// what a click there does, so the light cannot sit beside the thing.
+    #[test]
+    fn the_hit_test_and_the_highlight_agree() {
+        // The F-key bar: the cell arithmetic is one function.
+        let bar = Rect {
+            x: 0,
+            y: 23,
+            width: 80,
+            height: 1,
+        };
+        assert_eq!(
+            crate::ui::fkeybar::cell_at(bar, 10, 36, 23),
+            Some(4),
+            "36/8 is cell 4 -> F5"
+        );
+        assert_eq!(crate::ui::fkeybar::cell_at(bar, 10, 79, 23), Some(9));
+        assert_eq!(
+            crate::ui::fkeybar::cell_at(bar, 10, 5, 22),
+            None,
+            "the row above is not the bar"
+        );
+
+        // The shell border: the lit span is cut from the string the click reads.
+        let plain = ratatui::style::Style::default();
+        let lit = ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::REVERSED);
+        let (text, spans) = crate::ui::shell::command_line();
+        let line = crate::ui::shell::command_spans(Some("F9 utilities"), plain, lit);
+        let rebuilt: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(
+            rebuilt, text,
+            "the lit border is not the border that gets clicked"
+        );
+        let lit_text: String = line
+            .spans
+            .iter()
+            .filter(|s| s.style == lit)
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(lit_text, "F9 utilities");
+        let _ = spans;
     }
 
     // ---- picking up where you left off, windows included ----

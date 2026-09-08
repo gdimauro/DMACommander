@@ -33,7 +33,10 @@ cargo run -- . ~
   goes up. `Alt-U` swaps the two.
 - **Marking**: `Ins` or `Space` marks a file and moves on, so a run of files is
   one key held down. `Shift` with the arrows, page keys and `Home`/`End` extends
-  a selection. `Esc` clears it.
+  a selection. `Esc` clears it. The panel's footer says how many are marked and,
+  for marked folders, how many files sit inside them all the way down — counted
+  on a task, shown as `…` until it is known, never as a zero that would claim
+  the folders are empty.
 - **Quick search**: type a letter and the cursor jumps; keep typing to narrow.
 - `Shift-F3..F6` sort by name, extension, date, size.
 - **`Esc` is a ladder.** It undoes the most recent thing — a running copy, a
@@ -142,7 +145,8 @@ See [docs/USER-MENU.md](docs/USER-MENU.md).
 The pointer is the one input nothing intercepts — not a hosted program that has
 taken the keyboard, not a terminal that cannot spell a modifier. So every place
 a command is named is a place you can press it: the shell's bottom border, the
-F-key bar, every row of the help, the menus. If a key will not reach this
+F-key bar, every row of the help, the menus — and whatever the pointer is over
+is lit, so it looks pressable before it is pressed. If a key will not reach this
 program, open `F1` and click the row.
 See [docs/TERMINAL-KEYS.md](docs/TERMINAL-KEYS.md).
 

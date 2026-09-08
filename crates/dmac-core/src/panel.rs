@@ -59,6 +59,15 @@ pub struct Panel {
     pub show_hidden: bool,
     /// `Some` only while Shift+arrows are being held down.
     gesture: Option<SelectionGesture>,
+    /// How many files sit inside the marked directories, all of them, counted
+    /// on a task. `None` until counted — or while a count is in flight, which
+    /// the footer shows as "…" rather than as a number that is about to be
+    /// wrong.
+    pub marked_files: Option<u64>,
+    /// Bumped every time the marks change, so a count that comes back for a
+    /// selection the user has since changed is recognised and dropped instead
+    /// of being painted over the new one.
+    marks_generation: u64,
 }
 
 impl Panel {
@@ -73,6 +82,8 @@ impl Panel {
             sort_order: SortOrder::Ascending,
             show_hidden: false,
             gesture: None,
+            marked_files: None,
+            marks_generation: 0,
         }
     }
 
@@ -83,6 +94,34 @@ impl Panel {
         self.resort();
         self.cursor = 0;
         self.offset = 0;
+        // A new listing has no marks, so it has no count of what was marked.
+        self.marked_files = None;
+    }
+
+    /// How many entries are ticked.
+    pub fn marked(&self) -> usize {
+        self.entries.iter().filter(|e| e.selected).count()
+    }
+
+    /// The names of the ticked directories — what a recursive count walks.
+    pub fn marked_dirs(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter(|e| e.selected && e.kind == crate::entry::EntryKind::Dir)
+            .map(|e| e.name.clone())
+            .collect()
+    }
+
+    /// Note that the marks changed. Forgets the old count and hands back the
+    /// generation any new count must carry to be believed.
+    pub fn bump_marks(&mut self) -> u64 {
+        self.marked_files = None;
+        self.marks_generation += 1;
+        self.marks_generation
+    }
+
+    pub fn marks_generation(&self) -> u64 {
+        self.marks_generation
     }
 
     pub fn resort(&mut self) {
@@ -361,6 +400,48 @@ impl Entry {
     }
 }
 
+/// Where a count of files stops. A million is more than anyone reads off a
+/// footer, and a tree that large is a tree the walk must not spend the
+/// afternoon in.
+pub const MARKED_FILES_CAP: u64 = 1_000_000;
+
+/// How many files sit under these directories, all of them.
+///
+/// Symlinks are not followed: following one turns a count into an unbounded
+/// walk of the filesystem, and a directory that links to `/` is not a thing
+/// the footer should count. Unreadable directories count for nothing rather
+/// than failing the whole answer — a permissions error in one corner of a
+/// tree is not a reason to show no number at all.
+///
+/// Stops at [`MARKED_FILES_CAP`] and returns it, which the footer shows as
+/// `1000000+`. Runs on a task; never on the render loop.
+pub fn count_files_under(dirs: &[std::path::PathBuf]) -> u64 {
+    let mut total = 0u64;
+    let mut stack: Vec<std::path::PathBuf> = dirs.to_vec();
+    while let Some(dir) = stack.pop() {
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
+                stack.push(entry.path());
+            } else {
+                total += 1;
+                if total >= MARKED_FILES_CAP {
+                    return MARKED_FILES_CAP;
+                }
+            }
+        }
+    }
+    total
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -601,5 +682,45 @@ mod tests {
         p.set_viewport(3);
         let (start, rows) = p.visible();
         assert!((start..start + rows.len()).contains(&p.cursor()));
+    }
+
+    /// The count is of files, all the way down, and it does not follow a
+    /// symlink — a link to `/` is not a thing the footer should count.
+    #[test]
+    fn marked_files_are_counted_all_the_way_down_and_links_are_not_followed() {
+        let dir = std::env::temp_dir().join(format!("dmac-count-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("a/b/c")).unwrap();
+        for f in ["a/1", "a/2", "a/b/3", "a/b/c/4"] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/", dir.join("a/root")).unwrap();
+
+        assert_eq!(count_files_under(&[dir.join("a")]), 4);
+        assert_eq!(count_files_under(&[dir.join("a/b")]), 2);
+        assert_eq!(
+            count_files_under(&[dir.join("does-not-exist")]),
+            0,
+            "unreadable is zero"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A count that comes back for marks the user has since changed must be
+    /// recognisable as stale, or it is painted over the new selection.
+    #[test]
+    fn changing_the_marks_forgets_the_count_and_moves_the_generation() {
+        let mut p = panel_with(3);
+        p.marked_files = Some(42);
+        let g1 = p.bump_marks();
+        assert_eq!(p.marked_files, None, "the old count survived a change");
+        let g2 = p.bump_marks();
+        assert!(g2 > g1);
+        assert_eq!(p.marks_generation(), g2);
+        // And a new listing forgets it too.
+        p.marked_files = Some(7);
+        p.set_entries(Vec::new());
+        assert_eq!(p.marked_files, None);
     }
 }

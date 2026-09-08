@@ -2,7 +2,7 @@
 //! is stored in the widgets, which is what lets a second backend draw the exact
 //! same frame from the exact same state.
 
-mod fkeybar;
+pub(crate) mod fkeybar;
 pub(crate) mod help;
 pub(crate) mod history;
 pub(crate) mod menu;
@@ -42,6 +42,10 @@ const MIN_STACK_HEIGHT: u16 = 16;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+    // Where the pointer is, read once before anything below borrows the app:
+    // it decides what is drawn lit, and it is the same pair every hit-test
+    // reads on a click.
+    let pointer = app.mouse;
 
     // The screensaver owns the whole screen when it is running — no panels, no
     // F-key bar. Anything less is a screensaver that does not save the screen.
@@ -169,12 +173,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             // Only when they differ, which is only when something is running:
             // a shell at a prompt has already been sent after the panels.
             let pending = (here.as_deref() != Some(panel.as_str())).then_some(panel.as_str());
+            let hover = pointer.and_then(|(x, y)| shell::command_at(layout.shell, x, y));
             layout.shell = shell::draw(
                 frame,
                 body[1],
                 sh,
                 &shell::Chrome {
                     focused: true,
+                    hover,
                     bordered: !full,
                     software_cursor,
                     selection: shell_selection,
@@ -259,7 +265,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         } else {
             (&fkeybar::NORMAL[..], None)
         };
-        fkeybar::draw(frame, rows[2], keys, active, theme);
+        let hover = app
+            .mouse
+            .and_then(|(x, y)| fkeybar::cell_at(rows[2], keys.len(), x, y));
+        fkeybar::draw(frame, rows[2], keys, active, hover, theme);
     }
 
     match app.mode {
@@ -326,7 +335,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             // still flying in, what is drawn is the effect; the moment they
             // land, the real one takes over — scrollable, and exactly where the
             // animation left it.
-            app.layout.help = help::draw(frame, area, scroll, theme);
+            let help_area = app.layout.help;
+            let hover = app.mouse.and_then(|(x, y)| {
+                let inside = help_area.width > 0
+                    && x >= help_area.x
+                    && x < help_area.x + help_area.width
+                    && y >= help_area.y
+                    && y < help_area.y + help_area.height;
+                inside.then(|| (y - help_area.y) as usize)
+            });
+            app.layout.help = help::draw(frame, area, scroll, hover, theme);
             if let Some(canvas) = app.help_canvas(area.width, area.height) {
                 screen::draw_canvas(frame, area, canvas);
             }

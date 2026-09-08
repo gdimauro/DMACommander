@@ -81,7 +81,16 @@ pub fn page_len(width: usize) -> usize {
 
 /// Draw the page and return the interior rect, so the keys and the wheel can
 /// clamp their scrolling to what is actually on screen.
-pub fn draw(frame: &mut Frame, area: Rect, scroll: usize, theme: &Theme) -> Rect {
+pub fn draw(
+    frame: &mut Frame,
+    area: Rect,
+    scroll: usize,
+    // The visible row the pointer is over, if any. A row that does something
+    // is lit under it, so the page reads as pressable where it is — and a
+    // title or a note, which do nothing, stays as it is.
+    hover: Option<usize>,
+    theme: &Theme,
+) -> Rect {
     let width = if area.width < 24 {
         area.width
     } else {
@@ -136,13 +145,23 @@ pub fn draw(frame: &mut Frame, area: Rect, scroll: usize, theme: &Theme) -> Rect
         .bg(theme.panel_bg)
         .add_modifier(Modifier::BOLD);
     let key = base.add_modifier(Modifier::BOLD);
+    let lit = theme.cursor();
     let lines: Vec<Line> = entries
         .iter()
         .skip(scroll)
         .take(visible)
-        .map(|e| match e {
+        .enumerate()
+        .map(|(i, e)| match e {
             Entry::Blank => Line::from(Span::styled("", base)),
             Entry::Title(t) => Line::from(Span::styled(format!(" {t}"), title)),
+            Entry::Row {
+                keys,
+                prose,
+                actions,
+            } if hover == Some(i) && !actions.is_empty() => Line::from(vec![
+                Span::styled(format!("  {keys:<key_w$}  "), lit),
+                Span::styled(prose.clone(), lit),
+            ]),
             Entry::Row { keys, prose, .. } => Line::from(vec![
                 Span::styled(format!("  {keys:<key_w$}  "), key),
                 Span::styled(prose.clone(), base),

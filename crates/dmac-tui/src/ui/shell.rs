@@ -152,6 +152,10 @@ fn word_at(screen: &vt100::Screen, row: u16, col: u16) -> Option<(u16, u16)> {
 pub struct Chrome<'a> {
     /// Whether the shell has the keyboard, which decides the cursor.
     pub focused: bool,
+    /// The command on the bottom border the pointer is over, if any — see
+    /// [`command_at`]. It is drawn lit, so a border that can be pressed looks
+    /// like one before it is.
+    pub hover: Option<&'a str>,
     /// A border and titles, or bare contents for full screen.
     pub bordered: bool,
     /// `Some(on)` when the caller draws its own cursor because the terminal
@@ -265,6 +269,28 @@ pub fn command_line() -> (String, Vec<(usize, usize)>) {
     (text, spans)
 }
 
+/// The bottom border as spans, with `hover` lit.
+///
+/// Cut from the very string [`command_line`] lays out, at the boundaries it
+/// reports, so the lit segment is exactly the region [`command_at`] would
+/// answer for. Two layouts of the same border is how a highlight ends up one
+/// word to the left of the thing that gets pressed.
+pub fn command_spans(hover: Option<&str>, plain: Style, lit: Style) -> Line<'static> {
+    let (text, spans) = command_line();
+    let chars: Vec<char> = text.chars().collect();
+    let slice = |a: usize, b: usize| chars[a..b].iter().collect::<String>();
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut at = 0;
+    for ((label, _), (from, to)) in COMMANDS.iter().zip(spans) {
+        out.push(Span::styled(slice(at, from), plain));
+        let style = if hover == Some(*label) { lit } else { plain };
+        out.push(Span::styled(slice(from, to), style));
+        at = to;
+    }
+    out.push(Span::styled(slice(at, chars.len()), plain));
+    Line::from(out)
+}
+
 /// Which command the pointer is on, given where the border was drawn.
 ///
 /// `area` is the shell's interior; the border sits one row below it, and the
@@ -293,6 +319,7 @@ pub fn draw(frame: &mut Frame, area: Rect, shell: &Hosted, c: &Chrome<'_>, theme
         cwd,
         pending,
         session,
+        hover,
     } = *c;
     let title = title_for(
         shell.program(),
@@ -323,30 +350,39 @@ pub fn draw(frame: &mut Frame, area: Rect, shell: &Hosted, c: &Chrome<'_>, theme
             // The F-key bar is gone in this view, so this line is the only
             // documentation of the keys that still reach the commander from
             // inside a hosted program. It has to name all of them.
-            .title_bottom(Span::styled(
+            .title_bottom({
                 // Ctrl-O is in every one of them. The other hints belong to a
                 // state you are in for a moment — selecting, reading back — and
                 // they used to replace this line wholesale, so the one key that
                 // gets you out of a hosted program went missing exactly when
                 // someone lost in one would go looking for it.
+                let style = theme.border(back > 0 || selection.is_some());
                 match (selection.is_some(), back) {
-                    (true, 0) => " selecting \u{b7} Ctrl-Shift-C copy \u{b7} Esc clear \
-                                  \u{b7} Ctrl-O commander "
-                        .to_string(),
-                    (true, n) => format!(
-                        " \u{2191} {n} back \u{b7} Ctrl-Shift-C copy \u{b7} Esc clear \
-                         \u{b7} Ctrl-O commander "
-                    ),
+                    (true, 0) => Line::from(Span::styled(
+                        " selecting \u{b7} Ctrl-Shift-C copy \u{b7} Esc clear \
+                         \u{b7} Ctrl-O commander ",
+                        style,
+                    )),
+                    (true, n) => Line::from(Span::styled(
+                        format!(
+                            " \u{2191} {n} back \u{b7} Ctrl-Shift-C copy \u{b7} Esc clear \
+                             \u{b7} Ctrl-O commander "
+                        ),
+                        style,
+                    )),
                     // From the one list the click also reads, so a command
-                    // and the place you press it cannot drift apart.
-                    (false, 0) => command_line().0,
-                    (false, n) => format!(
-                        " \u{2191} {n} lines back \u{b7} Esc back to live \
-                         \u{b7} Ctrl-O commander "
-                    ),
-                },
-                theme.border(back > 0 || selection.is_some()),
-            ))
+                    // and the place you press it cannot drift apart — and
+                    // the one the pointer is over is lit.
+                    (false, 0) => command_spans(hover, style, theme.cursor()),
+                    (false, n) => Line::from(Span::styled(
+                        format!(
+                            " \u{2191} {n} lines back \u{b7} Esc back to live \
+                             \u{b7} Ctrl-O commander "
+                        ),
+                        style,
+                    )),
+                }
+            })
     } else {
         block
     };

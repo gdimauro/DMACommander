@@ -43,11 +43,26 @@ pub const HISTORY: [(&str, &str); 10] = [
 
 /// `active` marks the key whose mode is currently on — the bar doubles as the
 /// indicator, so there is no second place to look.
+/// Which cell of the bar a column falls in, with the same arithmetic the
+/// drawing uses. One function for both, so a highlight cannot sit one cell to
+/// the left of the key that gets pressed.
+pub fn cell_at(area: Rect, keys: usize, column: u16, row: u16) -> Option<usize> {
+    if row != area.y || column < area.x || column >= area.x + area.width || keys == 0 {
+        return None;
+    }
+    let cell = (area.width as usize / keys).max(4);
+    let i = (column - area.x) as usize / cell;
+    (i < keys).then_some(i)
+}
+
 pub fn draw(
     frame: &mut Frame,
     area: Rect,
     keys: &[(&str, &str)],
     active: Option<usize>,
+    // The cell the pointer is over. Lit, so the bar reads as pressable where
+    // it is; `active` is a state and keeps its own look underneath.
+    hover: Option<usize>,
     theme: &Theme,
 ) {
     let label = Style::default()
@@ -64,7 +79,9 @@ pub fn draw(
 
     let mut spans = Vec::with_capacity(keys.len() * 2);
     for (i, (k, n)) in keys.iter().enumerate() {
-        let name = if active == Some(i) {
+        let name = if hover == Some(i) {
+            theme.cursor()
+        } else if active == Some(i) {
             Style::default()
                 .fg(theme.fkey_name_bg)
                 .bg(theme.fkey_name_fg)

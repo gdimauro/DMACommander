@@ -67,6 +67,10 @@ your own menu (F2)          the same
 the session rail (Ctrl-T)   click a session, drag its edge to resize
 ```
 
+Whatever the pointer is over is lit, so a thing that can be pressed looks like
+one before it is — and it is lit by the same arithmetic that decides what a
+click there does, so the light cannot sit one word to the left of the thing.
+
 The shell's border matters most. Inside a hosted shell the keyboard belongs to
 the program running there — that is the whole point of hosting it — so for some
 terminals that line is not a reminder of the keys, it *is* the way in.
